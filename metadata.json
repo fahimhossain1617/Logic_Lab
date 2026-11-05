@@ -1,0 +1,6 @@
+{
+  "name": "Logic Lab",
+  "description": "Visual DSA & programming logic learning studio with real-time animations and line-by-line Bengali explanations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

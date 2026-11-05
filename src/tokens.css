@@ -1,0 +1,79 @@
+:root {
+  color-scheme: light;
+
+  /* Core Palette Tokens */
+  --ink-950: #070A1A;
+  --navy-900: #0D1330;
+  --navy-800: #16224A;
+  --navy-700: #233B6E;
+  --navy-600: #34528F;
+  --steel-500: #5B78B8;
+  --periwinkle-300: #A3C1FF;
+  --periwinkle-200: #C6D8FF;
+  --mist-50: #EEF3FF;
+
+  /* Semantic Colors */
+  --success: #4ADE9B;
+  --warning: #FFC46B;
+  --danger: #FF6B7D;
+  --violet: #B79CFF;
+  --peach: #FFB26B;
+
+  /* Radius Scale */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+
+  /* Motion Tokens */
+  --dur-micro: 120ms;
+  --dur-ui: 240ms;
+  --dur-panel: 480ms;
+  --dur-stage: 700ms;
+  --ease-entrance: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-move: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Theme-aware Surface Variables (Default: Daybreak Light when .dark is absent) */
+  --bg-app: linear-gradient(135deg, #EEF3FF 0%, #C6D8FF 55%, #A3C1FF 100%);
+  --bg-panel: rgba(255, 255, 255, 0.88);
+  --bg-panel-raised: rgba(238, 243, 255, 0.94);
+  --bg-select: #FFFFFF;
+  --bg-gutter: #E3ECFF;
+  --text-primary: #0D1330;
+  --text-secondary: #233B6E;
+  --text-muted: #456099;
+  --border-subtle: rgba(35, 59, 110, 0.16);
+  --border-active: #233B6E;
+  --accent-primary: #233B6E;
+  --shadow-panel: 0 24px 48px -20px rgba(13, 19, 48, 0.16);
+  --code-pill-bg: rgba(35, 59, 110, 0.08);
+  --code-pill-text: #16224A;
+  --text-accent: #1E3A8A;
+  --text-success: #0D7A4E;
+  --text-warning: #A35200;
+  --text-danger: #C81E3A;
+}
+
+.dark {
+  color-scheme: dark;
+
+  --bg-app: radial-gradient(1200px 700px at 0% 0%, rgba(163, 193, 255, 0.32), transparent 60%),
+    linear-gradient(135deg, #16224A 0%, #0D1330 55%, #070A1A 100%);
+  --bg-panel: linear-gradient(145deg, rgba(22, 34, 74, 0.92), rgba(13, 19, 48, 0.96));
+  --bg-panel-raised: #16224A;
+  --bg-select: #0D1330;
+  --bg-gutter: #070A1A;
+  --text-primary: #EEF3FF;
+  --text-secondary: #C6D8FF;
+  --text-muted: #7F9AD6;
+  --border-subtle: rgba(163, 193, 255, 0.16);
+  --border-active: #34528F;
+  --accent-primary: #A3C1FF;
+  --shadow-panel: 0 30px 60px -24px rgba(3, 6, 20, 0.7);
+  --code-pill-bg: rgba(163, 193, 255, 0.12);
+  --code-pill-text: #A3C1FF;
+  --text-accent: #A3C1FF;
+  --text-success: #4ADE9B;
+  --text-warning: #FFC46B;
+  --text-danger: #FF6B7D;
+}

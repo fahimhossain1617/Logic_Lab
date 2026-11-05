@@ -1,0 +1,193 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Reusable Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function parentUserExists(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid)) &&
+        get(/databases/$(database)/documents/users/$(uid)).data.uid == request.auth.uid;
+    }
+
+    // Validation Blueprints
+    function isValidUserProfile(data, uid) {
+      return data.keys().hasAll(['uid', 'displayName', 'createdAt', 'settings']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'createdAt', 'updatedAt', 'settings']) &&
+        data.uid is string && data.uid == uid && data.uid == request.auth.uid &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500)) &&
+        data.settings is map && data.settings.size() <= 10;
+    }
+
+    function isValidSnippet(data, uid) {
+      return data.keys().hasAll(['ownerUid', 'title', 'language', 'code', 'favorite', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerUid', 'title', 'language', 'code', 'favorite', 'problemId', 'createdAt', 'updatedAt']) &&
+        data.ownerUid is string && data.ownerUid == uid && data.ownerUid == request.auth.uid &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 140 &&
+        data.language is string && data.language in ['javascript', 'python', 'cpp', 'java'] &&
+        data.code is string && data.code.size() >= 1 && data.code.size() <= 6000 &&
+        data.favorite is bool &&
+        (!('problemId' in data) || (data.problemId is string && data.problemId.size() <= 100));
+    }
+
+    function isValidHistoryEntry(data, uid) {
+      return data.keys().hasAll(['ownerUid', 'title_bn', 'title_en', 'language', 'code', 'analogyType', 'verdictStatus', 'favorite', 'createdAt']) &&
+        data.keys().hasOnly(['ownerUid', 'snippetId', 'title_bn', 'title_en', 'language', 'code', 'codeHash', 'analogyType', 'verdictStatus', 'favorite', 'createdAt', 'updatedAt']) &&
+        data.ownerUid is string && data.ownerUid == uid && data.ownerUid == request.auth.uid &&
+        data.title_bn is string && data.title_bn.size() <= 200 &&
+        data.title_en is string && data.title_en.size() <= 200 &&
+        data.language is string && data.language in ['javascript', 'python', 'cpp', 'java'] &&
+        data.code is string && data.code.size() <= 6000 &&
+        data.analogyType is string && data.analogyType.size() <= 64 &&
+        data.verdictStatus is string && data.verdictStatus in ['ok', 'logic_error', 'runtime_error', 'infinite_loop', 'compile_error'] &&
+        data.favorite is bool;
+    }
+
+    function isValidUserProgress(data, uid) {
+      return data.keys().hasAll(['ownerUid', 'streak', 'lastActiveDate', 'completedProblemIds', 'badges', 'topicsCovered', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerUid', 'streak', 'lastActiveDate', 'completedProblemIds', 'badges', 'topicsCovered', 'updatedAt']) &&
+        data.ownerUid is string && data.ownerUid == uid && data.ownerUid == request.auth.uid &&
+        data.streak is int && data.streak >= 0 && data.streak <= 10000 &&
+        data.lastActiveDate is string && data.lastActiveDate.size() <= 32 &&
+        data.completedProblemIds is list && data.completedProblemIds.size() <= 50 &&
+        (data.completedProblemIds.size() == 0 || data.completedProblemIds[0] is string) &&
+        data.badges is list && data.badges.size() <= 30 &&
+        (data.badges.size() == 0 || data.badges[0] is string) &&
+        data.topicsCovered is list && data.topicsCovered.size() <= 30 &&
+        (data.topicsCovered.size() == 0 || data.topicsCovered[0] is string);
+    }
+
+    function isValidSharedRun(data) {
+      return data.keys().hasAll(['ownerUid', 'title_bn', 'title_en', 'language', 'code', 'createdAt']) &&
+        data.keys().hasOnly(['ownerUid', 'title_bn', 'title_en', 'language', 'code', 'createdAt']) &&
+        data.ownerUid is string && data.ownerUid == request.auth.uid &&
+        data.title_bn is string && data.title_bn.size() <= 200 &&
+        data.title_en is string && data.title_en.size() <= 200 &&
+        data.language is string && data.language in ['javascript', 'python', 'cpp', 'java'] &&
+        data.code is string && data.code.size() >= 1 && data.code.size() <= 6000;
+    }
+
+    // 1. User Profile (/users/{uid})
+    match /users/{uid} {
+      allow get: if isOwner(uid) && isValidId(uid);
+      allow list: if false;
+      allow create: if isOwner(uid) && isValidId(uid) &&
+        isValidUserProfile(incoming(), uid) &&
+        incoming().createdAt == request.time;
+      allow update: if isOwner(uid) && isValidId(uid) &&
+        isValidUserProfile(incoming(), uid) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'settings', 'updatedAt']);
+      allow delete: if false;
+
+      // 2. User Snippets (/users/{uid}/snippets/{snippetId})
+      match /snippets/{snippetId} {
+        allow get: if isOwner(uid) && isValidId(uid) && isValidId(snippetId) && parentUserExists(uid);
+        allow list: if isOwner(uid) && existing().ownerUid == request.auth.uid;
+        allow create: if isOwner(uid) && isValidId(uid) && isValidId(snippetId) &&
+          isValidSnippet(incoming(), uid) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(uid);
+        allow update: if isOwner(uid) && isValidId(uid) && isValidId(snippetId) &&
+          isValidSnippet(incoming(), uid) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['title', 'language', 'code', 'favorite', 'updatedAt']) &&
+          parentUserExists(uid);
+        allow delete: if isOwner(uid) && isValidId(uid) && isValidId(snippetId) &&
+          existing().ownerUid == request.auth.uid &&
+          parentUserExists(uid);
+      }
+
+      // 3. User Run History (/users/{uid}/history/{historyId})
+      match /history/{historyId} {
+        allow get: if isOwner(uid) && isValidId(uid) && isValidId(historyId) && parentUserExists(uid);
+        allow list: if isOwner(uid) && existing().ownerUid == request.auth.uid;
+        allow create: if isOwner(uid) && isValidId(uid) && isValidId(historyId) &&
+          isValidHistoryEntry(incoming(), uid) &&
+          incoming().createdAt == request.time &&
+          parentUserExists(uid);
+        allow update: if isOwner(uid) && isValidId(uid) && isValidId(historyId) &&
+          isValidHistoryEntry(incoming(), uid) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['favorite', 'updatedAt']) &&
+          parentUserExists(uid);
+        allow delete: if isOwner(uid) && isValidId(uid) && isValidId(historyId) &&
+          existing().ownerUid == request.auth.uid &&
+          parentUserExists(uid);
+      }
+
+      // 4. User Learning Progress (/users/{uid}/progress/{docId})
+      match /progress/{docId} {
+        allow get: if isOwner(uid) && isValidId(uid) && isValidId(docId) && parentUserExists(uid);
+        allow list: if false;
+        allow create: if isOwner(uid) && isValidId(uid) && isValidId(docId) &&
+          isValidUserProgress(incoming(), uid) &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(uid);
+        allow update: if isOwner(uid) && isValidId(uid) && isValidId(docId) &&
+          isValidUserProgress(incoming(), uid) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['streak', 'lastActiveDate', 'completedProblemIds', 'badges', 'topicsCovered', 'updatedAt']) &&
+          parentUserExists(uid);
+        allow delete: if false;
+      }
+    }
+
+    // 5. Public Shared Runs (/shares/{shareId}) — public get, owner create/delete
+    match /shares/{shareId} {
+      allow get: if isValidId(shareId);
+      allow list: if false;
+      allow create: if isSignedIn() && isValidId(shareId) &&
+        isValidSharedRun(incoming()) &&
+        incoming().createdAt == request.time &&
+        parentUserExists(request.auth.uid);
+      allow update: if false;
+      allow delete: if isSignedIn() && isValidId(shareId) &&
+        existing().ownerUid == request.auth.uid;
+    }
+
+    // 6. Server-Only Trace Cache (/traceCache/{hash})
+    match /traceCache/{hash} {
+      allow read, write: if false;
+    }
+
+    // 7. Read-Only Problem Library (/problems/{problemId})
+    match /problems/{problemId} {
+      allow get: if isValidId(problemId);
+      allow list: if existing().difficulty in ['easy', 'medium', 'hard'];
+      allow write: if false;
+    }
+  }
+}

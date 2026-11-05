@@ -1,0 +1,272 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile and personalization settings for Logic Lab.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner user UID."
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "User display name."
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Avatar URL."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp."
+        },
+        "settings": {
+          "type": "object",
+          "description": "User UI preferences (language, theme, speed, reduceMotion, fontSize, depth)."
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "settings"]
+    },
+    "Snippet": {
+      "title": "Snippet",
+      "description": "Saved user code program in Logic Lab.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "language": {
+          "type": "string",
+          "enum": ["javascript", "python", "cpp", "java"]
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 6000
+        },
+        "favorite": {
+          "type": "boolean"
+        },
+        "problemId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "title", "language", "code", "favorite", "createdAt", "updatedAt"]
+    },
+    "HistoryEntry": {
+      "title": "HistoryEntry",
+      "description": "Execution trace run history record for a user.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title_bn": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "title_en": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "language": {
+          "type": "string",
+          "enum": ["javascript", "python", "cpp", "java"]
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 6000
+        },
+        "codeHash": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "analogyType": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "verdictStatus": {
+          "type": "string",
+          "enum": ["ok", "logic_error", "runtime_error", "infinite_loop", "compile_error"]
+        },
+        "favorite": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "title_bn", "title_en", "language", "code", "analogyType", "verdictStatus", "favorite", "createdAt"]
+    },
+    "UserProgress": {
+      "title": "UserProgress",
+      "description": "Streak, completed problems, badges, and topics covered.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "streak": {
+          "type": "number"
+        },
+        "lastActiveDate": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "completedProblemIds": {
+          "type": "array"
+        },
+        "badges": {
+          "type": "array"
+        },
+        "topicsCovered": {
+          "type": "array"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "streak", "lastActiveDate", "completedProblemIds", "badges", "topicsCovered", "updatedAt"]
+    },
+    "SharedRun": {
+      "title": "SharedRun",
+      "description": "Public read-only shared visualization link.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title_bn": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "title_en": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "language": {
+          "type": "string",
+          "enum": ["javascript", "python", "cpp", "java"]
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 6000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "title_bn", "title_en", "language", "code", "createdAt"]
+    },
+    "TraceCacheEntry": {
+      "title": "TraceCacheEntry",
+      "description": "Server-managed trace cache.",
+      "type": "object",
+      "properties": {
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["createdAt"]
+    },
+    "ProblemEntry": {
+      "title": "ProblemEntry",
+      "description": "Curated DSA problem in the library.",
+      "type": "object",
+      "properties": {
+        "title_bn": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "title_en": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "topic": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "difficulty": {
+          "type": "string",
+          "enum": ["easy", "medium", "hard"]
+        },
+        "analogyType": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["title_bn", "title_en", "topic", "difficulty", "analogyType"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profile document and personal UI settings."
+    },
+    "/users/{uid}/snippets/{snippetId}": {
+      "schema": { "$ref": "#/entities/Snippet" },
+      "description": "User's saved programs."
+    },
+    "/users/{uid}/history/{historyId}": {
+      "schema": { "$ref": "#/entities/HistoryEntry" },
+      "description": "User's visualization run history."
+    },
+    "/users/{uid}/progress/{docId}": {
+      "schema": { "$ref": "#/entities/UserProgress" },
+      "description": "User's learning streak, completed problem IDs, and badges."
+    },
+    "/shares/{shareId}": {
+      "schema": { "$ref": "#/entities/SharedRun" },
+      "description": "Read-only public shared code visualization runs."
+    },
+    "/traceCache/{hash}": {
+      "schema": { "$ref": "#/entities/TraceCacheEntry" },
+      "description": "Server-only cached traces."
+    },
+    "/problems/{problemId}": {
+      "schema": { "$ref": "#/entities/ProblemEntry" },
+      "description": "Public read-only curated problem library."
+    }
+  }
+}

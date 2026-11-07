@@ -1,5 +1,8 @@
 import { create } from 'zustand';
 import {
+  ExecutionDiagnostic,
+  ExecutionResultPayload,
+  ExecutionStatus,
   ExecutionTrace,
   ExplainLanguage,
   ExplanationDepth,
@@ -51,6 +54,8 @@ export interface SavedSnippetItem {
 
 export interface SavedHistoryItem {
   id: string;
+  fileName?: string;
+  folderName?: string;
   title_bn: string;
   title_en: string;
   language: SupportedLanguage;
@@ -59,6 +64,8 @@ export interface SavedHistoryItem {
   verdictStatus: ExecutionTrace['verdict']['status'];
   favorite: boolean;
   timestamp: string;
+  trace?: ExecutionTrace;
+  createdAt?: number;
 }
 
 export interface UserProgressState {
@@ -179,6 +186,10 @@ interface LabState {
   traceProgressStage: 0 | 1 | 2 | 3;
   apiError: BilingualMessage | null;
   apiNotice: BilingualMessage | null;
+  diagnostics: ExecutionDiagnostic[];
+  executionStatus: ExecutionStatus | 'idle';
+  canRun: boolean;
+  activeBreakpoints: number[];
   hoveredVariable: string | null;
   hoveredLine: number | null;
   cursorPosition: { lineNumber: number; column: number };
@@ -199,9 +210,14 @@ interface LabState {
   lastCreatedShareUrl: string | null;
   lastCreatedShareId: string | null;
   toast: ToastMessage | null;
+  historyDropdownOpen: boolean;
 
   // Actions
   initAuthAndCloudSync: () => () => void;
+  setHistoryDropdownOpen: (open: boolean) => void;
+  toggleHistoryDropdown: () => void;
+  restoreHistoryItem: (item: SavedHistoryItem) => void;
+  clearAllHistory: () => void;
   setActiveRoute: (route: AppRoute) => void;
   setActiveResultTab: (tab: WorkspaceResultTab) => void;
   toggleTheme: () => void;
@@ -222,7 +238,9 @@ interface LabState {
   loadLibraryProblem: (problemId: string, useFaulty?: boolean) => Promise<void>;
   setCode: (code: string) => void;
   resetSnippetToNew: () => void;
-  runVisualize: () => Promise<void>;
+  runVisualize: (overrideCode?: string) => Promise<void>;
+  toggleBreakpoint: (line: number) => void;
+  clearBreakpoints: () => void;
   play: () => void;
   pause: () => void;
   togglePlay: () => void;
@@ -266,7 +284,7 @@ const INITIAL_USER_FILE: UserCodeFile = {
   folderName: 'my-project',
   fileName: 'main.js',
   language: 'javascript',
-  code: '',
+  code: '// Start writing here...\n',
 };
 
 const INITIAL_PROGRESS: UserProgressState = {
@@ -277,6 +295,27 @@ const INITIAL_PROGRESS: UserProgressState = {
   topicsCovered: [],
 };
 
+function loadInitialHistory(): SavedHistoryItem[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem('logic_lab_history_v2');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return [];
+}
+
+function persistHistory(items: SavedHistoryItem[]) {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem('logic_lab_history_v2', JSON.stringify(items.slice(0, 50)));
+  } catch {}
+}
+
+let activeAbortController: AbortController | null = null;
+
 async function fetchTraceFromApi(
   params: {
     code: string;
@@ -284,15 +323,24 @@ async function fetchTraceFromApi(
     explainLanguage: ExplainLanguage;
     depth: ExplanationDepth;
     fileName?: string;
+    bypassCache?: boolean;
   },
-  uid?: string
+  uid?: string,
+  signal?: AbortSignal
 ): Promise<{
   trace?: ExecutionTrace;
   apiNotice?: BilingualMessage | null;
   error?: BilingualMessage;
+  status?: ExecutionStatus;
+  canRun?: boolean;
+  output?: string;
+  diagnostics?: ExecutionDiagnostic[];
+  visualizerData?: ExecutionTrace | null;
 }> {
   const res = await fetch('/api/trace', {
     method: 'POST',
+    signal,
+    cache: 'no-store',
     headers: {
       'Content-Type': 'application/json',
       'x-user-uid': uid || 'guest-local',
@@ -301,11 +349,22 @@ async function fetchTraceFromApi(
   });
   const data = await res.json();
   if (!res.ok || data.error) {
-    return { error: data.error };
+    return {
+      error: data.error,
+      status: data.status || 'error',
+      canRun: data.canRun ?? false,
+      output: data.output || (data.error?.message_en ?? 'Execution error'),
+      diagnostics: data.diagnostics || [],
+    };
   }
   return {
-    trace: data.trace,
+    trace: data.trace || data.visualizerData,
     apiNotice: data.apiNotice || null,
+    status: data.status,
+    canRun: data.canRun,
+    output: data.output,
+    diagnostics: data.diagnostics || [],
+    visualizerData: data.visualizerData,
   };
 }
 
@@ -321,7 +380,7 @@ export const useLabStore = create<LabState>((set, get) => ({
   activeFileId: INITIAL_USER_FILE.id,
   folderName: INITIAL_USER_FILE.folderName,
   fileName: INITIAL_USER_FILE.fileName,
-  code: '',
+  code: INITIAL_USER_FILE.code,
   hasExecuted: false,
   activeResultTab: 'explanation',
 
@@ -339,6 +398,20 @@ export const useLabStore = create<LabState>((set, get) => ({
   traceProgressStage: 0,
   apiError: null,
   apiNotice: null,
+  diagnostics: [],
+  executionStatus: 'idle',
+  canRun: true,
+  activeBreakpoints: [],
+  toggleBreakpoint: (line: number) => {
+    const { activeBreakpoints } = get();
+    const exists = activeBreakpoints.includes(line);
+    set({
+      activeBreakpoints: exists
+        ? activeBreakpoints.filter((l) => l !== line)
+        : [...activeBreakpoints, line].sort((a, b) => a - b),
+    });
+  },
+  clearBreakpoints: () => set({ activeBreakpoints: [] }),
   hoveredVariable: null,
   hoveredLine: null,
   cursorPosition: { lineNumber: 1, column: 1 },
@@ -346,13 +419,14 @@ export const useLabStore = create<LabState>((set, get) => ({
   commandPaletteOpen: false,
   shortcutsOpen: false,
   tourStep: null,
+  historyDropdownOpen: false,
 
   user: null,
   isAuthReady: false,
   isCloudSyncing: false,
   guestWorkMigrated: false,
   snippets: [],
-  historyItems: [],
+  historyItems: loadInitialHistory(),
   progress: INITIAL_PROGRESS,
   sharedRun: null,
   shareModalOpen: false,
@@ -555,13 +629,13 @@ export const useLabStore = create<LabState>((set, get) => ({
       folderName: folderName || 'my-project',
       fileName: `${basePrefix}${ext}`,
       language,
-      code: '',
+      code: language === 'python' ? '# Start writing here...\n' : '// Start writing here...\n',
     };
     set({
       userFiles: [...userFiles, newFile],
       activeFileId: newFile.id,
       fileName: newFile.fileName,
-      code: '',
+      code: newFile.code,
       hasExecuted: false,
       trace: EMPTY_INITIAL_TRACE,
       currentStepIndex: 0,
@@ -649,19 +723,44 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   setCode: (code) => {
-    const { activeFileId, userFiles } = get();
+    const { activeFileId, userFiles, trace } = get();
     const updated = userFiles.map((f) => (f.id === activeFileId ? { ...f, code } : f));
-    set({ code, userFiles: updated, isDirty: true, apiError: null });
+    const wasError = Boolean(trace.hasError || trace.verdict.status === 'compile_error');
+    set({
+      code,
+      userFiles: updated,
+      isDirty: true,
+      apiError: null,
+      ...(wasError
+        ? {
+            executionStatus: 'idle',
+            trace: {
+              ...trace,
+              hasError: false,
+              errorDetails: null,
+              verdict: { status: 'ok', message: '' },
+            },
+          }
+        : {}),
+    });
   },
 
   resetSnippetToNew: () => {
-    const { activeFileId, userFiles } = get();
-    const updated = userFiles.map((f) => (f.id === activeFileId ? { ...f, code: '' } : f));
+    if (activeAbortController) {
+      activeAbortController.abort();
+      activeAbortController = null;
+    }
+    const { activeFileId, userFiles, language } = get();
+    const defaultComment = language === 'python' ? '# Start writing here...\n' : '// Start writing here...\n';
+    const updated = userFiles.map((f) => (f.id === activeFileId ? { ...f, code: defaultComment } : f));
     set({
-      code: '',
+      code: defaultComment,
       userFiles: updated,
       hasExecuted: false,
       trace: EMPTY_INITIAL_TRACE,
+      diagnostics: [],
+      executionStatus: 'idle',
+      canRun: true,
       isDirty: false,
       currentStepIndex: 0,
       prevStepIndex: 0,
@@ -670,7 +769,15 @@ export const useLabStore = create<LabState>((set, get) => ({
     });
   },
 
-  runVisualize: async () => {
+  runVisualize: async (overrideCode?: string) => {
+    // 1. Abort any previous hanging execution/Gemini requests
+    if (activeAbortController) {
+      activeAbortController.abort();
+      activeAbortController = null;
+    }
+    const currentAbortController = new AbortController();
+    activeAbortController = currentAbortController;
+
     let {
       code,
       language,
@@ -684,6 +791,26 @@ export const useLabStore = create<LabState>((set, get) => ({
       userFiles,
     } = get();
 
+    if (typeof overrideCode === 'string') {
+      code = overrideCode;
+      const updatedFiles = userFiles.map((f) => (f.id === activeFileId ? { ...f, code } : f));
+      set({ code, userFiles: updatedFiles });
+    }
+
+    // 2. Reset all execution flags, loading states, output streams, and previous error states before starting fresh run
+    set({
+      isPlaying: false,
+      isTracing: true,
+      traceProgressStage: 1,
+      apiError: null,
+      apiNotice: null,
+      diagnostics: [],
+      executionStatus: 'idle',
+      canRun: true,
+      currentStepIndex: 0,
+      prevStepIndex: 0,
+    });
+
     // If editor is blank, show a clear error and do not generate any animation
     if (!code.trim()) {
       set({
@@ -691,6 +818,18 @@ export const useLabStore = create<LabState>((set, get) => ({
         isPlaying: false,
         isTracing: false,
         traceProgressStage: 0,
+        executionStatus: 'error',
+        canRun: false,
+        diagnostics: [
+          {
+            line: 1,
+            severity: 'error',
+            message:
+              explainLanguage === 'bn'
+                ? 'এডিটর খালি আছে। রান ও বিশ্লেষণ করার জন্য আগে আপনার কোড লিখুন।'
+                : 'Editor is empty. Please write or paste your code before running.',
+          },
+        ],
         apiError: {
           code: 'EMPTY_CODE',
           message_bn: 'এডিটর খালি আছে। রান ও বিশ্লেষণ করার জন্য আগে আপনার কোড লিখুন।',
@@ -726,13 +865,6 @@ export const useLabStore = create<LabState>((set, get) => ({
       set({ language, fileName, userFiles: updatedFiles });
     }
 
-    set({
-      isPlaying: false,
-      isTracing: true,
-      traceProgressStage: 1,
-      apiError: null,
-    });
-
     const stage2Timer = setTimeout(() => {
       if (get().isTracing) set({ traceProgressStage: 2 });
     }, 60);
@@ -742,31 +874,63 @@ export const useLabStore = create<LabState>((set, get) => ({
     }, 120);
 
     try {
-      const [apiRes] = await Promise.all([
-        fetchTraceFromApi(
-          { code, language, explainLanguage, depth, fileName },
-          user?.uid
-        ),
-        new Promise((r) => setTimeout(r, 150)),
-      ]);
+      const apiRes = await fetchTraceFromApi(
+        { code, language, explainLanguage, depth, fileName, bypassCache: true },
+        user?.uid,
+        currentAbortController.signal
+      );
 
       clearTimeout(stage2Timer);
       clearTimeout(stage3Timer);
 
-      if (apiRes.error) {
+      if (currentAbortController.signal.aborted) {
+        return;
+      }
+
+      const diagnostics = apiRes.diagnostics || [];
+      const hasErrors =
+        Boolean(apiRes.error) ||
+        diagnostics.some((d) => d.severity === 'error') ||
+        Boolean(apiRes.trace?.hasError) ||
+        apiRes.trace?.verdict.status === 'compile_error';
+      const hasWarnings = diagnostics.some((d) => d.severity === 'warning');
+      const executionStatus: ExecutionStatus = hasErrors
+        ? 'error'
+        : hasWarnings
+        ? 'warning'
+        : 'success';
+      const canRun = apiRes.canRun ?? !hasErrors;
+
+      if (hasErrors) {
         set({
           hasExecuted: true,
           isTracing: false,
           traceProgressStage: 0,
-          apiError: apiRes.error,
-          trace: {
+          apiError: apiRes.error || {
+            code: 'COMPILE_ERROR',
+            message_bn:
+              apiRes.trace?.errorDetails?.messageBn ||
+              apiRes.trace?.verdict.message ||
+              'কোড কম্পাইল বা রান করতে ত্রুটি হয়েছে।',
+            message_en:
+              apiRes.trace?.errorDetails?.message ||
+              apiRes.trace?.verdict.message ||
+              'Execution error encountered.',
+          },
+          executionStatus: 'error',
+          canRun: false,
+          diagnostics,
+          trace: apiRes.trace || {
             ...EMPTY_INITIAL_TRACE,
             hasError: true,
             isValidLogic: false,
+            errorDetails: null,
             verdict: {
               status: 'compile_error',
               message:
-                explainLanguage === 'bn' ? apiRes.error.message_bn : apiRes.error.message_en,
+                explainLanguage === 'bn'
+                  ? apiRes.error?.message_bn || 'কোড কম্পাইল বা সিনট্যাক্স ত্রুটি।'
+                  : apiRes.error?.message_en || 'Compilation or syntax error.',
             },
           },
         });
@@ -775,21 +939,46 @@ export const useLabStore = create<LabState>((set, get) => ({
 
       if (apiRes.trace) {
         const nextTrace = apiRes.trace;
+        nextTrace.status = executionStatus;
+        nextTrace.diagnostics = diagnostics;
+
+        const now = new Date();
+        const formattedDate =
+          now.toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+          }) +
+          ', ' +
+          now.toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+
         const newEntry: SavedHistoryItem = {
           id: `run-${Date.now()}`,
-          title_bn: `${folderName}/${fileName}`,
-          title_en: `${folderName}/${fileName}`,
+          fileName: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
+          folderName: '',
+          title_bn: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
+          title_en: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
           language,
           code,
           analogyType: nextTrace.analogyType,
           verdictStatus: nextTrace.verdict.status,
           favorite: false,
-          timestamp: 'Just now',
+          timestamp: formattedDate,
+          trace: nextTrace,
+          createdAt: Date.now(),
         };
+
+        const updatedHistory = [newEntry, ...historyItems.slice(0, 49)];
+        persistHistory(updatedHistory);
 
         set({
           hasExecuted: true,
           trace: nextTrace,
+          diagnostics,
+          executionStatus,
+          canRun: true,
           apiNotice: null,
           apiError: null,
           isTracing: false,
@@ -798,7 +987,7 @@ export const useLabStore = create<LabState>((set, get) => ({
           currentStepIndex: 0,
           prevStepIndex: 0,
           isPlaying: false,
-          historyItems: [newEntry, ...historyItems.slice(0, 29)],
+          historyItems: updatedHistory,
         });
 
         // Persist run history to backend API in the background
@@ -837,9 +1026,12 @@ export const useLabStore = create<LabState>((set, get) => ({
         }
         return;
       }
-    } catch {
+    } catch (err: any) {
       clearTimeout(stage2Timer);
       clearTimeout(stage3Timer);
+      if (err?.name === 'AbortError' || currentAbortController.signal.aborted) {
+        return;
+      }
     }
 
     set({
@@ -939,7 +1131,7 @@ export const useLabStore = create<LabState>((set, get) => ({
 
   setEditorFontSize: (val, isDelta = false) => {
     const current = get().editorFontSize;
-    const next = isDelta ? Math.min(22, Math.max(12, current + val)) : val;
+    const next = isDelta ? Math.min(28, Math.max(12, current + val)) : val;
     set({ editorFontSize: next });
   },
 
@@ -1113,11 +1305,60 @@ export const useLabStore = create<LabState>((set, get) => ({
 
   deleteHistoryItem: (id) => {
     const { historyItems, user } = get();
-    set({ historyItems: historyItems.filter((item) => item.id !== id) });
+    const next = historyItems.filter((item) => item.id !== id);
+    persistHistory(next);
+    set({ historyItems: next });
     void fetch(`/api/history/${id}`, {
       method: 'DELETE',
       headers: { 'x-user-uid': user?.uid || 'guest-local' },
     }).catch(() => {});
+  },
+
+  setHistoryDropdownOpen: (open: boolean) => set({ historyDropdownOpen: open }),
+  toggleHistoryDropdown: () =>
+    set((state) => ({ historyDropdownOpen: !state.historyDropdownOpen })),
+
+  restoreHistoryItem: (item: SavedHistoryItem) => {
+    const { userFiles, activeFileId } = get();
+    const updatedFiles = userFiles.map((f) =>
+      f.id === activeFileId
+        ? {
+            ...f,
+            code: item.code,
+            fileName: item.fileName || item.title_en,
+            language: item.language,
+          }
+        : f
+    );
+    set({
+      code: item.code,
+      fileName: item.fileName || item.title_en,
+      language: item.language,
+      trace: item.trace || EMPTY_INITIAL_TRACE,
+      hasExecuted: true,
+      currentStepIndex: 0,
+      prevStepIndex: 0,
+      isPlaying: false,
+      historyDropdownOpen: false,
+      apiError:
+        item.verdictStatus === 'compile_error'
+          ? {
+              code: 'RESTORED_ERROR',
+              message_bn: item.trace?.verdict?.message || 'কোডে ত্রুটি আছে',
+              message_en: item.trace?.verdict?.message || 'Error in code',
+            }
+          : null,
+      userFiles: updatedFiles,
+    });
+  },
+
+  clearAllHistory: () => {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.removeItem('logic_lab_history_v2');
+      } catch {}
+    }
+    set({ historyItems: [], historyDropdownOpen: false });
   },
 
   createShareLink: async () => {

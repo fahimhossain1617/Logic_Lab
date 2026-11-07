@@ -166,6 +166,27 @@ export interface TraceVerdict {
   message: string;
 }
 
+export type ExecutionStatus = 'success' | 'warning' | 'error';
+export type DiagnosticSeverity = 'error' | 'warning' | 'info';
+
+export interface ExecutionDiagnostic {
+  line: number;
+  column?: number;
+  endLine?: number;
+  endColumn?: number;
+  severity: DiagnosticSeverity;
+  message: string;
+  source?: string;
+}
+
+export interface ExecutionResultPayload {
+  status: ExecutionStatus;
+  canRun: boolean;
+  output: string;
+  diagnostics: ExecutionDiagnostic[];
+  visualizerData: ExecutionTrace | null;
+}
+
 export type CompilationErrorType =
   | 'COMPILATION_ERROR'
   | 'SYNTAX_ERROR'
@@ -195,6 +216,8 @@ export interface ExecutionTrace {
   outputExplanation: string;
   verdict: TraceVerdict;
   programSummary?: ProgramSummary | null;
+  status?: ExecutionStatus;
+  diagnostics?: ExecutionDiagnostic[];
 }
 
 export interface SampleProgram {

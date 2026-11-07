@@ -75,6 +75,9 @@ const IGNORED_SANDBOX_KEYS = new Set([
   'isFinite',
   'Map',
   'Set',
+  'Random',
+  'Scanner',
+  'System',
   '__traceStep',
   '__traceLoopCheck',
   '__traceCondCheck',
@@ -128,6 +131,11 @@ const LANGUAGE_KEYWORDS = new Set([
   'break',
   'continue',
   'return',
+  'require',
+  'module',
+  'exports',
+  'crypto',
+  'Buffer',
   'try',
   'catch',
   'except',
@@ -166,6 +174,10 @@ const LANGUAGE_KEYWORDS = new Set([
   'FileInputStream',
   'BufferedReader',
   'Scanner',
+  'Random',
+  'Collections',
+  'ArrayList',
+  'HashMap',
   'Exception',
   'RuntimeException',
   'ArithmeticException',
@@ -373,9 +385,9 @@ function extractVariablesAndTypes(
       }
     }
 
-    // Generic typed declarations (including Java/C++ object types like FileReader, Scanner, File)
+    // Generic typed declarations (including Java/C++ collection types like List, ArrayList, HashMap, vector, Scanner, File, Random)
     const typedDeclRegex =
-      /\b(?:let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char|auto|FileReader|FileInputStream|BufferedReader|Scanner|File|Object|Integer|Double)\s*(?:\[\s*\])?\s+([a-zA-Z_$][\w$]*)/g;
+      /\b(?:let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char|auto|FileReader|FileInputStream|BufferedReader|Scanner|Random|File|Object|Integer|Double|List|ArrayList|LinkedList|Map|HashMap|TreeMap|Set|HashSet|TreeSet|Queue|Deque|Stack|PriorityQueue|vector\s*<[^>]+>|(?:[A-Za-z_$][\w$]*\s*<[^>]+>)|(?:[A-Z][A-Za-z0-9_$]*))\s*(?:\[\s*\])?\s+([a-zA-Z_$][\w$]*)/g;
     let tm: RegExpExecArray | null;
     while ((tm = typedDeclRegex.exec(trimmed)) !== null) {
       const v = tm[1];
@@ -523,6 +535,16 @@ function normalizeExpressionToJs(
       /new\s+(?:int|long|double|float)\s*\[\s*([^\]]+)\s*\]/g,
       'new Array($1).fill(0)'
     );
+    // Java collection instantiations
+    out = out
+      .replace(/new\s+(?:ArrayList|LinkedList)(?:\s*<[^>]*>)?\s*\(\s*\)/g, 'new ArrayList()')
+      .replace(/new\s+(?:HashMap|TreeMap)(?:\s*<[^>]*>)?\s*\(\s*\)/g, 'new HashMap()')
+      .replace(/new\s+(?:HashSet|TreeSet)(?:\s*<[^>]*>)?\s*\(\s*\)/g, 'new Set()');
+
+    // Java type casts: `(double) sum` -> `Number(sum)`, `(int) x` -> `Math.trunc(x)`
+    out = out.replace(/\((?:double|float)\)\s*([a-zA-Z0-9_(\[]+)/g, 'Number($1)');
+    out = out.replace(/\((?:int|long|short|byte)\)\s*([a-zA-Z0-9_(\[]+)/g, 'Math.trunc($1)');
+
     // Array brace literal `{10, 20, 30}` -> `[10, 20, 30]`
     if (out.startsWith('{') && out.endsWith('}')) {
       out = `[${out.slice(1, -1)}]`;
@@ -535,6 +557,7 @@ function normalizeExpressionToJs(
       .replace(/\.charAt\s*\(([^)]+)\)/g, '[($1)]')
       .replace(/\.push_back\s*\(/g, '.push(')
       .replace(/\.pop_back\s*\(\s*\)/g, '.pop()')
+      .replace(/\.add\s*\(/g, '.push(')
       .replace(/\.equals\s*\(([^)]+)\)/g, '=== ($1)')
       .replace(/\bInteger\.MAX_VALUE\b/g, '2147483647')
       .replace(/\bInteger\.MIN_VALUE\b/g, '-2147483648')
@@ -938,6 +961,26 @@ function buildInstrumentedMultiLangScript(
         continue;
       }
     } else {
+      // Enhanced for loop `for (Type var : iterable)` in Java / C++
+      const forEachMatch = trimmed.match(
+        /^for\s*\(\s*(?:final\s+)?(?:[A-Za-z0-9_<>$\s]+)\s+([A-Za-z_$][\w$]*)\s*:\s*(.+?)\s*\)\s*(\{)?\s*$/
+      );
+      if (forEachMatch) {
+        const loopVar = forEachMatch[1];
+        const rawIter = forEachMatch[2].trim();
+        const jsIter = normalizeExpressionToJs(rawIter, language, false, lineNum);
+        const brace = forEachMatch[3] ? '{' : '';
+        seenVars.add(loopVar);
+        processedLines.push(
+          `${pyClosingPrefix}for (let ${loopVar} of (${jsIter})) ${brace} __traceStep(${lineNum}, "LOOP_CHECK", __cap({ [${JSON.stringify(
+            loopVar
+          )}]: ${loopVar} }), { conditionExpr: ${JSON.stringify(
+            `${loopVar} in ${rawIter}`
+          )}, conditionResult: true });`
+        );
+        continue;
+      }
+
       const cForMatch = trimmed.match(
         /^for\s*\(\s*([^;]+);\s*([^;]+);\s*([^)]+)\)\s*(\{)?\s*$/
       );
@@ -1184,7 +1227,7 @@ function buildInstrumentedMultiLangScript(
 
     // 18. Typed variable declaration with initialization (JS/Java/C++)
     const typedDeclAssign = trimmed.match(
-      /^(?:final\s+|static\s+)*(?:let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char|auto|FileReader|FileInputStream|BufferedReader|Scanner|File|Object|Integer|Double|vector\s*<[^>]+>)\s*(?:\[\s*\])?\s+([A-Za-z_$][\w$]*)\s*(?:\[\s*\])?\s*=\s*(.+?)\s*;?\s*$/
+      /^(?:final\s+|static\s+)*(?:let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char|auto|FileReader|FileInputStream|BufferedReader|Scanner|Random|File|Object|Integer|Double|List|ArrayList|LinkedList|Map|HashMap|TreeMap|Set|HashSet|TreeSet|Queue|Deque|Stack|PriorityQueue|vector\s*<[^>]+>|(?:[A-Za-z_$][\w$]*\s*<[^>]+>)|(?:[A-Z][A-Za-z0-9_$]*))\s*(?:\[\s*\])?\s+([A-Za-z_$][\w$]*)\s*(?:\[\s*\])?\s*=\s*(.+?)\s*;?\s*$/
     );
     if (typedDeclAssign) {
       const varName = typedDeclAssign[1];
@@ -1207,15 +1250,16 @@ function buildInstrumentedMultiLangScript(
       continue;
     }
 
-    // 19. Typed variable declaration without initialization (e.g. `int temp;`)
+    // 19. Typed variable declaration without initialization (e.g. `int temp;` or `vector<int> v;`)
     const typedDeclOnly = trimmed.match(
-      /^(?:let|var|int|long|short|byte|float|double|boolean|bool|String|string|char|FileReader|Scanner|File)\s+([A-Za-z_$][\w$]*)\s*;?\s*$/
+      /^(?:let|var|int|long|short|byte|float|double|boolean|bool|String|string|char|FileReader|Scanner|Random|File|List|ArrayList|Map|HashMap|vector\s*<[^>]+>|(?:[A-Za-z_$][\w$]*\s*<[^>]+>)|(?:[A-Z][A-Za-z0-9_$]*))\s+([A-Za-z_$][\w$]*)\s*;?\s*$/
     );
     if (typedDeclOnly) {
       const varName = typedDeclOnly[1];
       seenVars.add(varName);
+      const initVal = trimmed.startsWith('vector') || trimmed.includes('ArrayList') ? '[]' : 'null';
       processedLines.push(
-        `${pyClosingPrefix}${varName} = null; __traceStep(${lineNum}, "DECLARE", __cap(), { targetVar: ${JSON.stringify(
+        `${pyClosingPrefix}${varName} = ${initVal}; __traceStep(${lineNum}, "DECLARE", __cap(), { targetVar: ${JSON.stringify(
           varName
         )} });`
       );
@@ -1477,6 +1521,14 @@ export function runDeterministicMultiLanguage(
     },
     prompt: () => stdinLines[stdinIdx++] ?? '',
     input: () => stdinLines[stdinIdx++] ?? '',
+    require: (modName: string) => {
+      try {
+        if (modName === 'crypto' || modName === 'node:crypto') return require('node:crypto');
+        if (modName === 'util' || modName === 'node:util') return require('node:util');
+      } catch {}
+      return {};
+    },
+    crypto: globalThis.crypto,
     Math,
     Number,
     String,
@@ -1490,6 +1542,110 @@ export function runDeterministicMultiLanguage(
     isFinite,
     Map,
     Set,
+    Scanner: class Scanner {
+      private tokens: string[];
+      private idx = 0;
+      constructor(_src?: any) {
+        this.tokens = String(stdin || '').trim().split(/\s+/).filter(Boolean);
+      }
+      hasNext() { return this.idx < this.tokens.length; }
+      hasNextInt() { return this.hasNext() && !Number.isNaN(Number(this.tokens[this.idx])); }
+      next() { return this.tokens[this.idx++] ?? ''; }
+      nextInt() { return Number.parseInt(this.tokens[this.idx++] ?? '0', 10); }
+      nextDouble() { return Number.parseFloat(this.tokens[this.idx++] ?? '0'); }
+      nextLine() { return stdinLines[stdinIdx++] ?? (this.tokens[this.idx++] ?? ''); }
+      close() {}
+    },
+    Random: class Random {
+      private seed: number;
+      constructor(seed?: number) {
+        this.seed = typeof seed === 'number' ? seed : Date.now();
+      }
+      private next(): number {
+        this.seed = (this.seed * 1664525 + 1013904223) % 4294967296;
+        return (this.seed >>> 0) / 4294967296;
+      }
+      nextInt(bound?: number) {
+        const r = this.next();
+        if (typeof bound === 'number' && bound > 0) {
+          return Math.floor(r * bound);
+        }
+        return Math.floor(r * 2147483647);
+      }
+      nextDouble() { return this.next(); }
+      nextBoolean() { return this.next() >= 0.5; }
+    },
+    System: {
+      in: {},
+      out: {
+        println: (...args: any[]) => {
+          logs.push(args.map(String).join(' '));
+        },
+        print: (...args: any[]) => {
+          inlineBuffer += args.map(String).join(' ');
+        },
+      },
+      err: {
+        println: (...args: any[]) => {
+          errors.push(args.map(String).join(' '));
+        },
+      },
+    },
+    ArrayList: class ArrayList extends Array {
+      get(i: number) { return this[i]; }
+      set(i: number, val: any) { this[i] = val; return val; }
+      add(val: any) { this.push(val); return true; }
+      size() { return this.length; }
+      isEmpty() { return this.length === 0; }
+      contains(val: any) { return this.includes(val); }
+      remove(i: any) {
+        if (typeof i === 'number') {
+          const removed = this.splice(i, 1);
+          return removed[0];
+        }
+        const idx = this.indexOf(i);
+        if (idx >= 0) { this.splice(idx, 1); return true; }
+        return false;
+      }
+      clear() { this.length = 0; }
+    },
+    HashMap: class HashMap {
+      private map = new globalThis.Map();
+      put(k: any, v: any) { this.map.set(k, v); return v; }
+      get(k: any) { return this.map.get(k); }
+      getOrDefault(k: any, def: any) { return this.map.has(k) ? this.map.get(k) : def; }
+      containsKey(k: any) { return this.map.has(k); }
+      keySet() { return Array.from(this.map.keys()); }
+      values() { return Array.from(this.map.values()); }
+      entrySet() { return Array.from(this.map.entries()); }
+      size() { return this.map.size; }
+      isEmpty() { return this.map.size === 0; }
+      remove(k: any) { return this.map.delete(k); }
+      clear() { this.map.clear(); }
+      toJSON() { return Object.fromEntries(this.map); }
+      toString() { return JSON.stringify(Object.fromEntries(this.map)); }
+    },
+    Collections: {
+      sort: (list: any[], comparator?: any) => {
+        if (Array.isArray(list)) {
+          if (typeof comparator === 'function') {
+            list.sort(comparator);
+          } else {
+            list.sort((a, b) => (typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b))));
+          }
+        }
+      },
+      reverse: (list: any[]) => { if (Array.isArray(list)) list.reverse(); },
+      min: (list: any[]) => (Array.isArray(list) ? Math.min(...list) : null),
+      max: (list: any[]) => (Array.isArray(list) ? Math.max(...list) : null),
+      swap: (list: any[], i: number, j: number) => {
+        if (Array.isArray(list)) {
+          const tmp = list[i];
+          list[i] = list[j];
+          list[j] = tmp;
+        }
+      },
+    },
     __toInt: (val: any, line = 1, capFn?: () => Record<string, any>) => {
       if (typeof val === 'number') {
         if (!Number.isFinite(val)) {

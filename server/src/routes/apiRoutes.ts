@@ -3,13 +3,16 @@ import { z } from 'zod';
 import {
   generateExecutionTrace,
   getCacheSize,
+  clearTraceCache,
   isGeminiKeyConfigured,
 } from '../services/geminiTraceService';
+import { preprocessCode } from '../services/codePreprocessor';
 import { traceRateLimiter } from '../middleware/rateLimitAndSecurity';
 import { SAMPLE_PROGRAMS } from '../../../src/data/sampleTraces';
 import { PROBLEM_LIBRARY } from '../../../src/data/problemLibrary';
 import { runDeterministicMultiLanguage } from '../tracers/realExecutionRunner';
-import { ExecutionTrace, SupportedLanguage } from '../../../shared/types';
+import { analyzeCode, executeCode } from '../services/toolchains/toolchainManager';
+import { ExecutionDiagnostic, ExecutionStatus, ExecutionTrace, SupportedLanguage } from '../../../shared/types';
 
 export const apiRouter = Router();
 
@@ -20,6 +23,7 @@ const TraceRequestSchema = z.object({
   depth: z.enum(['simple', 'detailed']).default('simple'),
   fileName: z.string().optional(),
   stdin: z.string().optional().default(''),
+  bypassCache: z.boolean().optional().default(false),
 });
 
 // Server-side persistence store (paired with Cloud Firestore on the client)
@@ -154,11 +158,50 @@ apiRouter.post('/trace', traceRateLimiter, async (req: Request, res: Response) =
   }
 });
 
+// Clear runtime cache endpoint (/api/cache/clear)
+apiRouter.post('/cache/clear', (_req: Request, res: Response) => {
+  clearTraceCache();
+  res.json({
+    status: 'ok',
+    message: 'Runtime cache cleared successfully.',
+  });
+});
+
+// Real-time Code Analysis Endpoint (/api/analyze)
+apiRouter.post('/analyze', traceRateLimiter, async (req: Request, res: Response) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code : '';
+  const language: SupportedLanguage = req.body?.language || 'javascript';
+  const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
+
+  if (!code.trim()) {
+    return res.json({ canCompile: true, diagnostics: [], language });
+  }
+
+  try {
+    const analysis = await analyzeCode(code, language, fileName);
+    return res.json(analysis);
+  } catch (err: any) {
+    return res.json({
+      canCompile: false,
+      diagnostics: [
+        {
+          line: 1,
+          severity: 'error' as const,
+          message: err?.message || 'Code analysis error',
+          source: language,
+        },
+      ],
+      language,
+    });
+  }
+});
+
 // Sandboxed Real Execution Endpoint (/api/execute)
-apiRouter.post('/execute', traceRateLimiter, (req: Request, res: Response) => {
+apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response) => {
   const code = typeof req.body?.code === 'string' ? req.body.code : '';
   const language: SupportedLanguage = req.body?.language || 'javascript';
   const stdin = typeof req.body?.stdin === 'string' ? req.body.stdin : '';
+  const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
 
   if (!code.trim()) {
     return res.status(400).json({
@@ -170,11 +213,50 @@ apiRouter.post('/execute', traceRateLimiter, (req: Request, res: Response) => {
     });
   }
 
-  const result = runDeterministicMultiLanguage(code, language, stdin, 1200);
+  const prep = preprocessCode(code, language);
+
+  // 1. Run actual toolchain compilation and sandboxed execution
+  const toolchainRes = await executeCode(prep.code, language, stdin, 4000, fileName);
+
+  // 2. Run deterministic step simulation for UI visualization
+  const simResult = runDeterministicMultiLanguage(prep.code, language, stdin, 1200);
+
+  // Adjust line numbers if boilerplate lines were prepended
+  if (prep.injectedPrefixLines > 0) {
+    for (const st of simResult.recordedSteps) {
+      st.line = Math.max(1, st.line - prep.injectedPrefixLines);
+    }
+  }
+
+  // Combine real compiler/runtime diagnostics with minor preprocessor warnings
+  const combinedDiagnostics: ExecutionDiagnostic[] = [
+    ...toolchainRes.diagnostics,
+    ...prep.diagnostics,
+  ];
+
+  const hasErrors =
+    toolchainRes.status === 'error' ||
+    combinedDiagnostics.some((d) => d.severity === 'error');
+  const hasWarnings = combinedDiagnostics.some((d) => d.severity === 'warning');
+  const status: ExecutionStatus = hasErrors ? 'error' : hasWarnings ? 'warning' : 'success';
+  const canRun = !hasErrors;
+
+  const output = toolchainRes.output || simResult.stdout || '';
+
   return res.json({
+    ...simResult,
+    status,
+    canRun,
+    output,
+    stdout: toolchainRes.stdout || simResult.stdout,
+    stderr: toolchainRes.stderr || simResult.stderr,
+    exitCode: toolchainRes.exitCode,
+    timedOut: toolchainRes.timedOut,
+    runtimeError: toolchainRes.runtimeError,
+    diagnostics: combinedDiagnostics,
+    visualizerData: canRun ? simResult : null,
     traceSource: 'real_execution',
     language,
-    ...result,
   });
 });
 

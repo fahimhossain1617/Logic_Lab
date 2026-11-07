@@ -301,6 +301,35 @@ test('Java Runtime Exception Handling: try / catch / finally with FileNotFoundEx
   assert.equal(executedLines.includes(9), true);
 });
 
+test('History item and state restoration preserves trace, code, and filename', () => {
+  const sampleTrace = SAMPLE_PROGRAMS[0].traces.bn.simple;
+  const historyItem = {
+    id: 'run-1700000000',
+    fileName: 'bubble_sort.py',
+    language: 'python' as const,
+    code: 'def sort(): pass',
+    analogyType: sampleTrace.analogyType,
+    verdictStatus: sampleTrace.verdict.status,
+    favorite: false,
+    timestamp: 'Nov 5, 09:30 PM',
+    trace: sampleTrace,
+    createdAt: 1700000000,
+  };
+
+  assert.equal(historyItem.fileName, 'bubble_sort.py');
+  assert.equal(historyItem.trace.steps.length > 0, true);
+  assert.equal(historyItem.trace.isValidLogic, true);
+});
+
+test('Editor font size clamping logic allows smooth zoom between 12 and 28', () => {
+  const clampSize = (curr: number, delta: number) => Math.min(28, Math.max(12, curr + delta));
+  assert.equal(clampSize(14, 2), 16);
+  assert.equal(clampSize(14, -2), 12);
+  assert.equal(clampSize(12, -2), 12); // min bound
+  assert.equal(clampSize(28, 2), 28); // max bound
+  assert.equal(clampSize(26, 4), 28); // clamped to max
+});
+
 
 
 

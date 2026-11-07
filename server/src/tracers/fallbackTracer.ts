@@ -164,6 +164,12 @@ const BUILTIN_IDENTIFIERS = new Set([
   'nullptr',
   'this',
   'super',
+  'require',
+  'module',
+  'exports',
+  'process',
+  'Buffer',
+  'crypto',
   'System',
   'out',
   'err',
@@ -208,6 +214,18 @@ const BUILTIN_IDENTIFIERS = new Set([
   'FileInputStream',
   'BufferedReader',
   'Scanner',
+  'Random',
+  'BigDecimal',
+  'BigInteger',
+  'LocalDate',
+  'LocalTime',
+  'LocalDateTime',
+  'Instant',
+  'Duration',
+  'Iterator',
+  'Optional',
+  'Objects',
+  'UUID',
   'Files',
   'Paths',
   'Exception',
@@ -218,6 +236,13 @@ const BUILTIN_IDENTIFIERS = new Set([
   'NullPointerException',
   'ArrayIndexOutOfBoundsException',
   'IndexOutOfBoundsException',
+  'IllegalArgumentException',
+  'IllegalStateException',
+  'NoSuchElementException',
+  'Thread',
+  'Runnable',
+  'Comparable',
+  'Comparator',
   'NumberFormatException',
   'IllegalArgumentException',
   'Throwable',
@@ -227,6 +252,16 @@ const BUILTIN_IDENTIFIERS = new Set([
   'INT_MIN',
   'length',
   'size',
+  'TreeMap',
+  'TreeSet',
+  'Deque',
+  'PriorityQueue',
+  'Iterator',
+  'vector',
+  'pair',
+  'make_pair',
+  'sort',
+  'reverse',
 ]);
 
 function makeErrorDetails(params: {
@@ -640,6 +675,22 @@ export function detectSyntaxError(
     type StaticVarType = 'int' | 'float' | 'boolean' | 'String' | 'char' | 'array' | 'object';
     const declaredVars = new Map<string, StaticVarType>();
     const declaredFunctions = new Set<string>(['main']);
+    const importedSymbols = new Set<string>();
+    let hasWildcardImport = false;
+
+    // Pre-pass: collect imported symbols from import statements
+    for (let i = 0; i < lines.length; i++) {
+      const impMatch = lines[i].trim().match(/^import\s+([A-Za-z0-9_.]+(?:\.\*)?)\s*;/);
+      if (impMatch) {
+        const impPath = impMatch[1];
+        if (impPath.endsWith('.*')) {
+          hasWildcardImport = true;
+        } else {
+          const parts = impPath.split('.');
+          importedSymbols.add(parts[parts.length - 1]);
+        }
+      }
+    }
 
     // Pre-pass: collect method names and their parameter names
     for (let i = 0; i < lines.length; i++) {
@@ -845,9 +896,9 @@ export function detectSyntaxError(
         continue;
       }
 
-      // Check typed declarations on this line: e.g. `int a = 5, b = 10;` or `int[] arr = {1, 2};`
+      // Check typed declarations on this line: e.g. `int a = 5, b = 10;`, `int[] arr = {1, 2};`, or `Random r = new Random();`
       const declHeaderMatch = cleaned.match(
-        /^(?:final\s+|static\s+)*(int|long|short|byte|double|float|boolean|bool|String|string|char|auto|FileReader|FileInputStream|BufferedReader|Scanner|File|Object|Integer|Double|vector\s*<[^>]+>)(\s*\[\s*\])?\s+(.+?);?\s*$/
+        /^(?:final\s+|static\s+)*([A-Z][A-Za-z0-9_$]*(?:<[^>]+>)?|int|long|short|byte|double|float|boolean|bool|String|string|char|auto|vector\s*<[^>]+>|(?:[A-Za-z_$][\w$]*\s*<[^>]+>))(\s*\[\s*\])?\s+(.+?);?\s*$/
       );
       if (declHeaderMatch) {
         const baseTypeKw = declHeaderMatch[1];
@@ -902,11 +953,14 @@ export function detectSyntaxError(
                   !BUILTIN_IDENTIFIERS.has(tok) &&
                   !declaredVars.has(tok) &&
                   !declaredFunctions.has(tok) &&
+                  !importedSymbols.has(tok) &&
+                  !/^[A-Z]/.test(tok) &&
                   !/^[0-9]/.test(tok)
                 ) {
-                  // Ignore method calls `.tok(` or `tok(` if defined
+                  // Ignore method calls `.tok(` or `tok(` if defined or constructors `new tok(`
                   const isMethodOrProp = new RegExp(`(?:\\.|::)\\s*${tok}\\b`).test(strippedRhs);
-                  if (!isMethodOrProp) {
+                  const isConstructor = new RegExp(`\\bnew\\s+${tok}\\b`).test(strippedRhs);
+                  if (!isMethodOrProp && !isConstructor) {
                     return makeErrorDetails({
                       errorType: 'COMPILATION_ERROR',
                       lineNumber: lineNum,
@@ -966,13 +1020,16 @@ export function detectSyntaxError(
         const idxInLine = idMatch.index;
         const beforeSlice = strippedLine.slice(0, idxInLine);
 
-        // Skip if preceded by `.` or `::` (member access like `arr.length` or `std::cout`)
-        if (/(?:\.|::)\s*$/.test(beforeSlice)) continue;
+        // Skip if preceded by `.` or `::` (member access like `arr.length` or `std::cout`) or `new ` (constructor call)
+        if (/(?:\.|::)\s*$/.test(beforeSlice) || /\bnew\s+$/.test(beforeSlice)) continue;
 
         if (
           !BUILTIN_IDENTIFIERS.has(tok) &&
           !declaredVars.has(tok) &&
-          !declaredFunctions.has(tok)
+          !declaredFunctions.has(tok) &&
+          !importedSymbols.has(tok) &&
+          !(hasWildcardImport && /^[A-Z]/.test(tok)) &&
+          !/^[A-Z]/.test(tok)
         ) {
           return makeErrorDetails({
             errorType: 'COMPILATION_ERROR',

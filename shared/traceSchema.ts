@@ -193,4 +193,18 @@ export const ExecutionTraceSchema = z.object({
     message: z.string(),
   }),
   programSummary: ProgramSummarySchema.nullable().optional(),
+  status: z.enum(['success', 'warning', 'error']).optional(),
+  diagnostics: z
+    .array(
+      z.object({
+        line: z.number(),
+        column: z.number().optional(),
+        endLine: z.number().optional(),
+        endColumn: z.number().optional(),
+        severity: z.enum(['error', 'warning', 'info']),
+        message: z.string(),
+        source: z.string().optional(),
+      })
+    )
+    .optional(),
 });

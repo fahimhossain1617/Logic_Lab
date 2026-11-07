@@ -3,7 +3,7 @@ import { useLabStore } from '../../store/useLabStore';
 import { StageCanvas } from '../stage/StageCanvas';
 import { FormattedText } from '../common/FormattedText';
 import { getStepDurationMs } from '../../utils/playerLogic';
-import { Play, Pause, SkipBack, SkipForward, RotateCcw } from 'lucide-react';
+import { Play, Pause, SkipBack, SkipForward, RotateCcw, BookOpen, Layers } from 'lucide-react';
 
 export const LineByLineWorkspace: React.FC = () => {
   const {
@@ -117,16 +117,15 @@ export const LineByLineWorkspace: React.FC = () => {
             aria-selected={activeResultTab === 'explanation'}
             onClick={() => setActiveResultTab('explanation')}
             data-testid="tab-explanation-btn"
-            className={`px-4 sm:px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+            className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
               activeResultTab === 'explanation'
-                ? 'bg-[#A3C1FF] text-[#070A1A]'
-                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800'
             }`}
           >
+            <BookOpen className="w-4 h-4" />
             <span lang={explainLanguage}>
-              {explainLanguage === 'bn'
-                ? '১. ব্যাখ্যা ও লজিক বিল্ডিং (Explanation)'
-                : '1. Step & Line Explanation'}
+              {explainLanguage === 'bn' ? 'ব্যাখ্যা' : 'Explanation'}
             </span>
           </button>
 
@@ -136,16 +135,15 @@ export const LineByLineWorkspace: React.FC = () => {
             aria-selected={activeResultTab === 'animation'}
             onClick={() => setActiveResultTab('animation')}
             data-testid="tab-animation-btn"
-            className={`px-4 sm:px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+            className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
               activeResultTab === 'animation'
-                ? 'bg-[#A3C1FF] text-[#070A1A]'
-                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800'
             }`}
           >
+            <Layers className="w-4 h-4" />
             <span lang={explainLanguage}>
-              {explainLanguage === 'bn'
-                ? '২. লাইন বাই লাইন ৩ডি অ্যানিমেশন (Animation)'
-                : '2. Line-by-Line 3D Animation'}
+              {explainLanguage === 'bn' ? 'অ্যানিমেশন' : 'Animation'}
             </span>
           </button>
         </div>
@@ -495,8 +493,8 @@ export const LineByLineWorkspace: React.FC = () => {
                     onClick={() => setSpeed(s)}
                     className={`px-2.5 py-1 rounded-lg cursor-pointer transition-colors ${
                       speed === s
-                        ? 'bg-[#A3C1FF] text-[#070A1A] font-bold'
-                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+                        ? 'bg-blue-600 text-white font-bold'
+                        : 'text-slate-400 hover:text-white hover:bg-slate-800'
                     }`}
                   >
                     {s}x
@@ -533,8 +531,8 @@ export const LineByLineWorkspace: React.FC = () => {
                     data-testid={`timeline-step-item-${idx}`}
                     className={`w-full text-left px-5 py-4 transition-colors cursor-pointer block ${
                       isSelected
-                        ? 'bg-[#A3C1FF]/15 border-l-4 border-l-[#A3C1FF]'
-                        : 'hover:bg-[var(--bg-gutter)]/40 border-l-4 border-l-transparent'
+                        ? 'bg-blue-600/15 border-l-4 border-l-blue-500'
+                        : 'hover:bg-slate-800/40 border-l-4 border-l-transparent'
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2 mb-1.5">

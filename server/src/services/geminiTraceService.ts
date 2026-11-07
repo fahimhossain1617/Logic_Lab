@@ -2,6 +2,9 @@ import crypto from 'node:crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   AnalogyType,
+  ExecutionDiagnostic,
+  ExecutionResultPayload,
+  ExecutionStatus,
   ExecutionTrace,
   ExplainLanguage,
   ExplanationDepth,
@@ -10,6 +13,7 @@ import {
   TraceErrorDetails,
   TraceStep,
 } from '../../../shared/types';
+import { preprocessCode } from './codePreprocessor';
 import { ExecutionTraceSchema } from '../../../shared/traceSchema';
 import {
   GEMINI_TRACE_SYSTEM_PROMPT,
@@ -25,6 +29,7 @@ import {
   runDeterministicMultiLanguage,
   stripCommentsPreservingLines,
 } from '../tracers/realExecutionRunner';
+import { analyzeCode, executeCode } from './toolchains/toolchainManager';
 
 export interface ApiNotice {
   code: string;
@@ -32,7 +37,7 @@ export interface ApiNotice {
   message_en: string;
 }
 
-export interface TraceServiceResult {
+export interface TraceServiceResult extends ExecutionResultPayload {
   hasError: boolean;
   errorDetails: TraceErrorDetails | null;
   programSummary: ProgramSummary | null;
@@ -43,6 +48,10 @@ export interface TraceServiceResult {
 }
 
 const traceCache = new Map<string, { trace: ExecutionTrace; createdAt: number }>();
+
+export function clearTraceCache(): void {
+  traceCache.clear();
+}
 
 export function computeTraceHash(params: {
   language: SupportedLanguage;
@@ -509,9 +518,43 @@ function normalizeGeminiRawOutput(
   };
 }
 
-function formatResult(trace: ExecutionTrace, cached: boolean): TraceServiceResult {
+function formatResult(
+  trace: ExecutionTrace,
+  cached: boolean,
+  diagnostics: ExecutionDiagnostic[] = []
+): TraceServiceResult {
   const hasError = Boolean(trace.hasError || trace.verdict.status === 'compile_error');
+  const allDiagnostics = [...diagnostics];
+
+  if (hasError && trace.errorDetails) {
+    const errLine = trace.errorDetails.lineNumber || trace.errorDetails.line || 1;
+    if (!allDiagnostics.some((d) => d.severity === 'error' && d.line === errLine)) {
+      allDiagnostics.unshift({
+        line: errLine,
+        severity: 'error',
+        message: trace.errorDetails.message,
+      });
+    }
+  }
+
+  const hasErrors = hasError || allDiagnostics.some((d) => d.severity === 'error');
+  const hasWarnings = allDiagnostics.some((d) => d.severity === 'warning');
+  const status: ExecutionStatus = hasErrors ? 'error' : hasWarnings ? 'warning' : 'success';
+  const canRun = !hasErrors;
+
+  const output = hasError
+    ? trace.errorDetails?.message || trace.verdict.message || 'Execution failed.'
+    : trace.finalOutput || '';
+
+  trace.status = status;
+  trace.diagnostics = allDiagnostics;
+
   return {
+    status,
+    canRun,
+    output,
+    diagnostics: allDiagnostics,
+    visualizerData: canRun ? trace : null,
     hasError,
     errorDetails: hasError ? trace.errorDetails : null,
     programSummary: hasError ? null : trace.programSummary ?? null,
@@ -529,49 +572,227 @@ export async function generateExecutionTrace(params: {
   depth: ExplanationDepth;
   fileName?: string;
   stdin?: string;
+  bypassCache?: boolean;
 }): Promise<TraceServiceResult> {
-  // 1. Pre-execution static analysis & javac validation (reject errors immediately before any simulation)
+  // Preprocess code: auto-inject missing imports/headers & collect non-blocking warnings
+  const prep = preprocessCode(params.code, params.language);
+  const codeToRun = prep.code;
+  const initialDiagnostics = [...prep.diagnostics];
+
+  // 1. Real Compiler / Toolchain validation (source of truth)
+  const toolchainAnalysis = await analyzeCode(codeToRun, params.language, params.fileName);
+  if (!toolchainAnalysis.canCompile) {
+    const firstErr = toolchainAnalysis.diagnostics.find((d) => d.severity === 'error');
+    const errLine = firstErr?.line || 1;
+    const errTrace = buildFallbackTrace({ ...params, code: codeToRun });
+    errTrace.hasError = true;
+    errTrace.verdict.status = 'compile_error';
+    errTrace.verdict.message = firstErr?.message || 'Compilation error.';
+    errTrace.errorDetails = {
+      errorType: 'COMPILATION_ERROR',
+      lineNumber: errLine,
+      line: errLine,
+      message: firstErr?.message || 'Compilation failed.',
+      messageBn:
+        params.explainLanguage === 'bn'
+          ? `কম্পাইল ত্রুটি (লাইন ${errLine}): ${firstErr?.message}`
+          : undefined,
+    };
+    return formatResult(errTrace, false, [
+      ...initialDiagnostics,
+      ...toolchainAnalysis.diagnostics,
+    ]);
+  }
+
+  // 1B. Quick sanity check with detectSyntaxError (for bracket balance / file name mismatch)
   const syntaxErr = detectSyntaxError(
-    params.code,
+    codeToRun,
     params.explainLanguage,
     params.language,
     params.fileName
   );
-  if (syntaxErr) {
-    const errTrace = buildFallbackTrace(params);
-    return formatResult(errTrace, false);
+  if (syntaxErr && syntaxErr.errorType === 'FILE_NAME_MISMATCH') {
+    if (prep.injectedPrefixLines > 0 && syntaxErr.lineNumber) {
+      syntaxErr.lineNumber = Math.max(1, syntaxErr.lineNumber - prep.injectedPrefixLines);
+      syntaxErr.line = syntaxErr.lineNumber;
+    }
+    const errTrace = buildFallbackTrace({ ...params, code: codeToRun });
+    errTrace.errorDetails = syntaxErr;
+    return formatResult(errTrace, false, initialDiagnostics);
   }
 
   const hash = computeTraceHash(params);
-  const cachedEntry = traceCache.get(hash);
-  if (cachedEntry) {
-    return formatResult(cachedEntry.trace, true);
+  if (!params.bypassCache) {
+    const cachedEntry = traceCache.get(hash);
+    if (
+      cachedEntry &&
+      !cachedEntry.trace.hasError &&
+      cachedEntry.trace.verdict.status !== 'compile_error'
+    ) {
+      return formatResult(cachedEntry.trace, true, initialDiagnostics);
+    }
   }
 
-  // 2. Build ground-truth runtime execution across ALL 4 languages (JS, Python, C++, Java)
+  // 2. Real Sandboxed Execution across ALL 4 languages
+  const realExec = await executeCode(
+    codeToRun,
+    params.language,
+    params.stdin || '',
+    3500,
+    params.fileName
+  );
+
+  // 3. Deterministic step recorder for UI animation
   const sandboxResult = runDeterministicMultiLanguage(
-    params.code,
+    codeToRun,
     params.language,
     params.stdin || '',
     1200
   );
 
-  const deterministicTrace = buildFallbackTrace(params);
+  const deterministicTrace = buildFallbackTrace({ ...params, code: codeToRun });
 
-  // If runtime execution or static check flagged a compilation/syntax error, halt immediately
+  // Use real execution stdout as ground truth (normalized of trailing newline)
+  const cleanedStdout = (realExec.stdout || sandboxResult.stdout || '').replace(/\r?\n$/, '');
+  deterministicTrace.finalOutput = cleanedStdout;
+
+  if (realExec.runtimeError) {
+    deterministicTrace.hasError = true;
+    deterministicTrace.isValidLogic = false;
+    deterministicTrace.verdict.status = realExec.timedOut ? 'infinite_loop' : 'runtime_error';
+    deterministicTrace.verdict.message = realExec.runtimeError;
+    deterministicTrace.errorDetails = {
+      lineNumber: realExec.runtimeErrorLine || 1,
+      line: realExec.runtimeErrorLine || 1,
+      message: realExec.runtimeError,
+    };
+  } else {
+    // Real execution succeeded with exitCode 0
+    deterministicTrace.hasError = false;
+    deterministicTrace.isValidLogic = true;
+    deterministicTrace.errorDetails = null;
+    deterministicTrace.verdict.status = 'ok';
+    deterministicTrace.verdict.message = 'Program compiled and executed successfully.';
+    deterministicTrace.outputExplanation =
+      params.explainLanguage === 'bn'
+        ? `প্রোগ্রামটি সফলভাবে সম্পন্ন হয়েছে এবং আউটপুট তৈরি করেছে।`
+        : `Program compiled and executed successfully.`;
+    deterministicTrace.traceSource = 'real_execution';
+  }
+
+  // If deterministicTrace.steps is empty but sandbox recorded steps, use them!
+  if (deterministicTrace.steps.length === 0 && sandboxResult.recordedSteps.length > 0) {
+    deterministicTrace.steps = sandboxResult.recordedSteps.map((st, idx) => ({
+      stepIndex: idx + 1,
+      step: idx + 1,
+      activeLine: st.line,
+      lineNumber: st.line,
+      codeSnippet: st.codeSnippet,
+      action: st.actionType === 'DECLARE' ? 'declare' : 'assign',
+      actionType: st.actionType,
+      analogyType: 'generic_memory',
+      from: null,
+      to: st.memoryDelta?.variable || null,
+      explanation: st.consoleOutput
+        ? `Output: ${st.consoleOutput}`
+        : `Executing line ${st.line}: ${st.codeSnippet}`,
+      why: '',
+      stdout: st.consoleOutput,
+      consoleOutput: st.consoleOutput,
+      changes: st.memoryDelta
+        ? [{ name: st.memoryDelta.variable || '', from: st.memoryDelta.oldValue, to: st.memoryDelta.newValue }]
+        : [],
+      variables: st.variables || {},
+      memoryState: st.variables || {},
+      memoryDelta: st.memoryDelta || { variable: null, oldValue: null, newValue: null },
+      fault: null,
+      structure: null,
+      whatHappenedBn: st.consoleOutput
+        ? `আউটপুট: ${st.consoleOutput}`
+        : `লাইন ${st.line} কার্যকর হয়েছে।`,
+      logicBuildingBn: '',
+    }));
+  } else if (deterministicTrace.steps.length === 0 && realExec.status === 'success') {
+    // Generate fallback steps from executable lines and final stdout
+    const codeLines = codeToRun.split('\n');
+    const execLines: { line: number; text: string }[] = [];
+    for (let i = 0; i < codeLines.length; i++) {
+      const t = codeLines[i].trim();
+      if (
+        t &&
+        !t.startsWith('//') &&
+        !t.startsWith('/*') &&
+        !t.startsWith('*') &&
+        !t.startsWith('import ') &&
+        !t.startsWith('#include') &&
+        !t.startsWith('package ')
+      ) {
+        execLines.push({ line: i + 1, text: t });
+      }
+    }
+    const sampleSteps = execLines.slice(0, 30);
+    deterministicTrace.steps = sampleSteps.map((el, idx) => ({
+      stepIndex: idx + 1,
+      step: idx + 1,
+      activeLine: el.line,
+      lineNumber: el.line,
+      codeSnippet: el.text,
+      action: 'assign',
+      actionType: idx === sampleSteps.length - 1 && cleanedStdout ? 'OUTPUT' : 'ASSIGN',
+      analogyType: 'generic_memory',
+      from: null,
+      to: null,
+      explanation:
+        idx === sampleSteps.length - 1 && cleanedStdout
+          ? `Program Output: ${cleanedStdout.split('\n')[0]}`
+          : `Line ${el.line}: ${el.text}`,
+      why: '',
+      stdout: idx === sampleSteps.length - 1 ? cleanedStdout : null,
+      consoleOutput: idx === sampleSteps.length - 1 ? cleanedStdout : null,
+      changes: [],
+      variables: {},
+      memoryState: {},
+      memoryDelta: { variable: null, oldValue: null, newValue: null },
+      fault: null,
+      structure: null,
+      whatHappenedBn:
+        idx === sampleSteps.length - 1 && cleanedStdout
+          ? `প্রোগ্রাম আউটপুট: ${cleanedStdout.split('\n')[0]}`
+          : `লাইন ${el.line}: ${el.text}`,
+      logicBuildingBn: '',
+    }));
+  }
+
+  // Adjust line numbers if boilerplate was prepended
+  if (prep.injectedPrefixLines > 0) {
+    for (const st of deterministicTrace.steps) {
+      st.activeLine = Math.max(1, st.activeLine - prep.injectedPrefixLines);
+      if (st.lineNumber) st.lineNumber = Math.max(1, st.lineNumber - prep.injectedPrefixLines);
+    }
+    for (const ln of deterministicTrace.lineNotes) {
+      ln.line = Math.max(1, ln.line - prep.injectedPrefixLines);
+    }
+  }
+
+  const combinedDiagnostics: ExecutionDiagnostic[] = [
+    ...toolchainAnalysis.diagnostics,
+    ...realExec.diagnostics,
+    ...initialDiagnostics,
+  ];
+
+  // If real execution had fatal compilation failure, halt immediately
   if (
     deterministicTrace.hasError ||
-    deterministicTrace.verdict.status === 'compile_error' ||
-    (sandboxResult.runtimeError &&
-      (sandboxResult.recordedSteps.length === 0 ||
-        /is not defined|SyntaxError|ReferenceError/.test(sandboxResult.runtimeError)))
+    (deterministicTrace.verdict.status as string) === 'compile_error'
   ) {
-    return formatResult(deterministicTrace, false);
+    return formatResult(deterministicTrace, false, combinedDiagnostics);
   }
 
   if (!isGeminiKeyConfigured()) {
-    traceCache.set(hash, { trace: deterministicTrace, createdAt: Date.now() });
-    return formatResult(deterministicTrace, false);
+    if (!deterministicTrace.hasError) {
+      traceCache.set(hash, { trace: deterministicTrace, createdAt: Date.now() });
+    }
+    return formatResult(deterministicTrace, false, combinedDiagnostics);
   }
 
   const stepPreview = (sandboxResult.recordedSteps || [])
@@ -587,9 +808,11 @@ export async function generateExecutionTrace(params: {
     .join('\n');
 
   const groundTruthContext = [
-    `- Real Runtime Execution Timed Out (Infinite Loop): ${sandboxResult.timedOut}`,
-    `- Real Runtime Error: ${sandboxResult.runtimeError || 'None'}`,
-    `- Real Runtime Final Stdout: ${JSON.stringify(sandboxResult.stdout)}`,
+    `- Real Compiler Status: Succeeded without errors`,
+    `- Real Runtime Exit Code: ${realExec.exitCode}`,
+    `- Real Runtime Execution Timed Out: ${realExec.timedOut}`,
+    `- Real Runtime Error: ${realExec.runtimeError || 'None'}`,
+    `- Real Runtime Final Stdout: ${JSON.stringify(realExec.stdout || sandboxResult.stdout)}`,
     `- Real Runtime Final Variables: ${JSON.stringify(sandboxResult.finalVariables)}`,
     stepPreview ? `- Real Runtime Recorded Step Sequence:\n${stepPreview}` : '',
   ]
@@ -606,14 +829,12 @@ export async function generateExecutionTrace(params: {
   });
 
   const configuredModel = process.env.GEMINI_MODEL?.trim();
+  const primaryModel = configuredModel || 'gemini-2.5-flash';
   const candidateModels = [
-    configuredModel &&
-    !configuredModel.startsWith('gemini-1.') &&
-    !configuredModel.startsWith('gemini-2.0')
-      ? configuredModel
-      : 'gemini-3.8-flash',
-    'gemini-flash-latest',
-  ];
+    primaryModel,
+    'gemini-2.5-flash',
+    'gemini-1.5-flash',
+  ].filter((v, i, a) => a.indexOf(v) === i);
 
   const baseUserPrompt = buildUserTracePrompt({
     ...params,
@@ -639,6 +860,7 @@ export async function generateExecutionTrace(params: {
             systemInstruction: GEMINI_TRACE_SYSTEM_PROMPT,
             responseMimeType: 'application/json',
             responseSchema: TRACE_RESPONSE_SCHEMA,
+            temperature: 0.2,
           },
         });
 
@@ -688,8 +910,20 @@ export async function generateExecutionTrace(params: {
         const validated = ExecutionTraceSchema.safeParse(normalized);
 
         if (validated.success) {
-          traceCache.set(hash, { trace: validated.data, createdAt: Date.now() });
-          return formatResult(validated.data, false);
+          const finalTrace: ExecutionTrace = validated.data as unknown as ExecutionTrace;
+          if (prep.injectedPrefixLines > 0) {
+            for (const st of finalTrace.steps) {
+              st.activeLine = Math.max(1, st.activeLine - prep.injectedPrefixLines);
+              if (st.lineNumber) st.lineNumber = Math.max(1, st.lineNumber - prep.injectedPrefixLines);
+            }
+            for (const ln of finalTrace.lineNotes) {
+              ln.line = Math.max(1, ln.line - prep.injectedPrefixLines);
+            }
+          }
+          if (!finalTrace.hasError) {
+            traceCache.set(hash, { trace: finalTrace, createdAt: Date.now() });
+          }
+          return formatResult(finalTrace, false, initialDiagnostics);
         }
 
         lastValidationError = validated.error.message;
@@ -707,7 +941,9 @@ export async function generateExecutionTrace(params: {
     }
   }
 
-  traceCache.set(hash, { trace: deterministicTrace, createdAt: Date.now() });
-  return formatResult(deterministicTrace, false);
+  if (!deterministicTrace.hasError) {
+    traceCache.set(hash, { trace: deterministicTrace, createdAt: Date.now() });
+  }
+  return formatResult(deterministicTrace, false, initialDiagnostics);
 }
 

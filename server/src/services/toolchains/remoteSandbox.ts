@@ -56,10 +56,12 @@ async function runPiston(
   language: SupportedLanguage,
   code: string,
   stdin: string,
-  timeoutMs: number
+  timeoutMs: number,
+  fileName?: string
 ): Promise<RemoteSandboxResult | null> {
   const endpoint = `${baseUrl.replace(/\/+$/, '')}/execute`;
   const cfg = PISTON_LANGUAGES[language];
+  const resolvedFileName = fileName && fileName.trim() ? fileName.trim() : cfg.fileName;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(timeoutMs + 6000, 10000));
   const startedAt = Date.now();
@@ -72,7 +74,7 @@ async function runPiston(
       body: JSON.stringify({
         language: cfg.language,
         version: '*',
-        files: [{ name: cfg.fileName, content: code }],
+        files: [{ name: resolvedFileName, content: code }],
         stdin: normalizeStdin(stdin),
         run_timeout: timeoutMs,
       }),
@@ -162,6 +164,7 @@ async function runJudge0(
       compile_output?: string | null;
       message?: string | null;
       time?: string | null;
+      exit_code?: number | null;
       status?: { id?: number; description?: string };
     };
 
@@ -191,7 +194,8 @@ async function runJudge0(
     }
 
     const isSuccess = statusId === 3;
-    const exitCode = isSuccess ? 0 : 1;
+    const exitCode =
+      typeof data.exit_code === 'number' ? data.exit_code : isSuccess ? 0 : 1;
     const combinedStderr = rawStderr || (isSuccess ? '' : data.status?.description || '');
     const runtimeError = timedOut
       ? `Execution timed out (${timeoutMs}ms). Possible infinite loop.`
@@ -259,7 +263,8 @@ export async function executeViaRemoteSandbox(
   language: SupportedLanguage,
   code: string,
   stdin = '',
-  timeoutMs = 4000
+  timeoutMs = 4000,
+  fileName?: string
 ): Promise<RemoteSandboxResult | null> {
   if (process.env.REMOTE_SANDBOX_FALLBACK === 'false') {
     return null;
@@ -267,7 +272,7 @@ export async function executeViaRemoteSandbox(
 
   const pistonUrl = process.env.PISTON_API_URL?.trim();
   if (pistonUrl) {
-    const pistonRes = await runPiston(pistonUrl, language, code, stdin, timeoutMs);
+    const pistonRes = await runPiston(pistonUrl, language, code, stdin, timeoutMs, fileName);
     if (pistonRes?.ok) return pistonRes;
   }
 

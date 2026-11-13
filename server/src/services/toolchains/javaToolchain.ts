@@ -16,22 +16,59 @@ import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
 
 /**
- * Extracts public class name or top-level class name from Java source
+ * Strips comments and string/char literals from Java source so package and class declarations
+ * can be identified safely without matching commented or quoted text.
+ */
+function stripJavaCommentsAndStrings(code: string): string {
+  return code.replace(
+    /\/\*[\s\S]*?\*\/|\/\/.*$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/gm,
+    (m) => (m.startsWith('/') ? m.replace(/[^\n]/g, ' ') : '""')
+  );
+}
+
+/**
+ * Extracts package declaration from Java source if present (e.g., "com.example.app").
+ */
+export function extractJavaPackageName(code: string): string | null {
+  const clean = stripJavaCommentsAndStrings(code);
+  const pkgMatch = clean.match(/\bpackage\s+([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*;/);
+  if (pkgMatch && pkgMatch[1]) {
+    return pkgMatch[1].replace(/\s+/g, '');
+  }
+  return null;
+}
+
+/**
+ * Extracts public class name or main-entry class name from Java source.
+ * Prefers `public class ...`, then any top-level class containing `main(`, then first `class`, then filename stem.
  */
 export function extractJavaClassName(code: string, fallbackFileName = 'Main.java'): string {
+  const clean = stripJavaCommentsAndStrings(code);
+
   // 1. Look for public class declaration
-  const pubMatch = code.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
+  const pubMatch = clean.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
   if (pubMatch && pubMatch[1]) {
     return pubMatch[1];
   }
 
-  // 2. Look for any class declaration
-  const classMatch = code.match(/\bclass\s+([A-Za-z_$][\w$]*)\b/);
-  if (classMatch && classMatch[1]) {
-    return classMatch[1];
+  // 2. Look for a class that declares a main method (handles multi-class non-public files)
+  const classHeaderRegex = /\bclass\s+([A-Za-z_$][\w$]*)\b[^{]*\{/g;
+  const classMatches = [...clean.matchAll(classHeaderRegex)];
+  for (let i = 0; i < classMatches.length; i++) {
+    const startIdx = classMatches[i].index ?? 0;
+    const endIdx = i + 1 < classMatches.length ? (classMatches[i + 1].index ?? clean.length) : clean.length;
+    const slice = clean.slice(startIdx, endIdx);
+    if (/\bmain\s*\(/.test(slice)) {
+      return classMatches[i][1];
+    }
   }
 
-  // 3. Fallback to filename without .java
+  // 3. Fallback to first class declaration
+  if (classMatches.length > 0 && classMatches[0][1]) {
+    return classMatches[0][1];
+  }
+
+  // 4. Fallback to filename without .java
   const base = fallbackFileName.replace(/\.java$/i, '').trim();
   return base || 'Main';
 }
@@ -41,11 +78,11 @@ export function extractJavaClassName(code: string, fallbackFileName = 'Main.java
  */
 export function parseJavacDiagnostics(stderr: string, stdout: string): ExecutionDiagnostic[] {
   const combined = `${stderr}\n${stdout}`;
-  const lines = combined.split('\n');
+  const lines = combined.split(/\r?\n/);
   const diagnostics: ExecutionDiagnostic[] = [];
 
-  // Match: File.java:12: error: message OR File.java:12: warning: message
-  const diagRegex = /^.*?[\\/]?([A-Za-z0-9_$]+\.java):(\d+):\s*(error|warning):\s*(.+)$/;
+  // Match any filename (including spaces and Unicode): File.java:12: error: message OR warning: message
+  const diagRegex = /^(.+?\.java):(\d+):\s*(error|warning):\s*(.+)$/;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -53,7 +90,7 @@ export function parseJavacDiagnostics(stderr: string, stdout: string): Execution
     if (match) {
       const lineNum = parseInt(match[2], 10) || 1;
       const severity = match[3] === 'error' ? 'error' : 'warning';
-      let message = match[4].trim();
+      const message = match[4].trim();
 
       let column: number | undefined;
 
@@ -86,10 +123,12 @@ export function parseJavacDiagnostics(stderr: string, stdout: string): Execution
 export async function compileJava(
   code: string,
   fileName = 'Main.java'
-): Promise<ToolchainCompileResult & { workspaceDir: string }> {
+): Promise<ToolchainCompileResult & { workspaceDir: string; sourceFileName: string }> {
   const workspaceDir = await createSandboxWorkspace();
-  const className = extractJavaClassName(code, fileName);
-  const sourceFileName = sanitizeSourceFileName(fileName, `${className}.java`, ['.java']);
+  const simpleClassName = extractJavaClassName(code, fileName);
+  const pkgName = extractJavaPackageName(code);
+  const fullyQualifiedMainClass = pkgName ? `${pkgName}.${simpleClassName}` : simpleClassName;
+  const sourceFileName = sanitizeSourceFileName(fileName, `${simpleClassName}.java`, ['.java']);
   const sourceFilePath = path.join(workspaceDir, sourceFileName);
 
   await fs.writeFile(sourceFilePath, code, 'utf8');
@@ -103,7 +142,8 @@ export async function compileJava(
       diagnostics: [],
       stdout: '',
       stderr: configMsg,
-      mainClass: className,
+      mainClass: fullyQualifiedMainClass,
+      sourceFileName,
       workingDir: workspaceDir,
       workspaceDir,
       compilerUnavailable: true,
@@ -126,7 +166,8 @@ export async function compileJava(
       diagnostics: [],
       stdout: procRes.stdout,
       stderr: configMsg,
-      mainClass: className,
+      mainClass: fullyQualifiedMainClass,
+      sourceFileName,
       workingDir: workspaceDir,
       workspaceDir,
       compilerUnavailable: true,
@@ -142,7 +183,8 @@ export async function compileJava(
     diagnostics,
     stdout: procRes.stdout,
     stderr: procRes.stderr,
-    mainClass: className,
+    mainClass: fullyQualifiedMainClass,
+    sourceFileName,
     workingDir: workspaceDir,
     workspaceDir,
   };
@@ -163,7 +205,13 @@ export async function executeJava(
     if (!compileRes.success) {
       // Fallback to remote sandbox if javac is unavailable on host (e.g. serverless)
       if (compileRes.compilerUnavailable || isLocalExecutionBlockedError(compileRes.stderr)) {
-        const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs);
+        const remote = await executeViaRemoteSandbox(
+          'java',
+          code,
+          stdin,
+          timeoutMs,
+          compileRes.sourceFileName
+        );
         if (remote) {
           const remoteDiagnostics = remote.compileOutput
             ? parseJavacDiagnostics(remote.compileOutput, '')
@@ -270,17 +318,23 @@ export async function executeJava(
 
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
-    } else if (runRes.exitCode !== 0 && runRes.stderr) {
-      runtimeError = runRes.stderr.trim();
-      const lineMatch = runRes.stderr.match(/at\s+[\w.$]+\.main\([^:]+:(\d+)\)/);
-      if (lineMatch) {
-        runtimeErrorLine = parseInt(lineMatch[1], 10);
+    } else if (runRes.exitCode !== 0 && runRes.exitCode !== null) {
+      runtimeError =
+        runRes.stderr.trim() || `Java process exited with error code ${runRes.exitCode}.`;
+      const escapedFile = compileRes.sourceFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const fileFrameMatch = runRes.stderr.match(
+        new RegExp(`at\\s+[^(]+\\(${escapedFile}:(\\d+)\\)`)
+      );
+      const mainFrameMatch = runRes.stderr.match(/at\s+[\w.$<>]+\.main\([^:]+:(\d+)\)/);
+      const match = fileFrameMatch || mainFrameMatch;
+      if (match) {
+        runtimeErrorLine = parseInt(match[1], 10);
       }
     }
 
     const hasWarnings = compileRes.diagnostics.some((d) => d.severity === 'warning');
     const status: 'success' | 'warning' | 'error' =
-      runRes.timedOut || (runRes.exitCode !== 0 && Boolean(runtimeError))
+      runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
         ? 'error'
         : hasWarnings
         ? 'warning'

@@ -23,8 +23,8 @@ export function parseGppDiagnostics(stderr: string, stdout: string): ExecutionDi
   const lines = combined.split('\n');
   const diagnostics: ExecutionDiagnostic[] = [];
 
-  // Match: program.cpp:5:10: error: expected ';' or program.c:5:10: error: ...
-  const diagRegex = /^.*?[\\/]?([A-Za-z0-9_.-]+\.(?:cpp|c|cc|cxx)):(\d+):(\d+):\s*(error|warning|fatal error):\s*(.+)$/;
+  // Match any filename (including spaces and Unicode): program.cpp:5:10: error: expected ';'
+  const diagRegex = /^(.+?\.(?:cpp|cc|cxx|c|hpp|h)):(\d+):(\d+):\s*(error|warning|fatal error):\s*(.+)$/i;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -32,7 +32,7 @@ export function parseGppDiagnostics(stderr: string, stdout: string): ExecutionDi
     if (match) {
       const lineNum = parseInt(match[2], 10) || 1;
       const column = parseInt(match[3], 10) || 1;
-      const isError = match[4].includes('error');
+      const isError = match[4].toLowerCase().includes('error');
       const severity = isError ? 'error' : 'warning';
       const message = match[5].trim();
 
@@ -50,12 +50,12 @@ export function parseGppDiagnostics(stderr: string, stdout: string): ExecutionDi
 }
 
 /**
- * Compiles C++ code with g++
+ * Compiles C++ / C code with g++
  */
 export async function compileCpp(
   code: string,
   fileName = 'main.cpp'
-): Promise<ToolchainCompileResult & { workspaceDir: string; binaryPath: string }> {
+): Promise<ToolchainCompileResult & { workspaceDir: string; binaryPath: string; sourceFileName: string }> {
   const workspaceDir = await createSandboxWorkspace();
   const sourceFileName = sanitizeSourceFileName(fileName, 'main.cpp', ['.cpp', '.cc', '.cxx', '.c']);
   const sourceFilePath = path.join(workspaceDir, sourceFileName);
@@ -75,6 +75,7 @@ export async function compileCpp(
       stderr: configMsg,
       executablePath: binaryFilePath,
       binaryPath: binaryFilePath,
+      sourceFileName,
       workingDir: workspaceDir,
       workspaceDir,
       compilerUnavailable: true,
@@ -82,10 +83,13 @@ export async function compileCpp(
     };
   }
 
-  // Compile with C++17 and standard warning flags (-O0 for fast, contention-free compilation)
+  const isCSource = sourceFileName.toLowerCase().endsWith('.c');
+  const stdFlag = isCSource ? '-std=c11' : '-std=c++17';
+
+  // Compile with C++17 (or C11 for .c) and standard warning flags (-O0 for fast, contention-free compilation)
   const procRes = await runSandboxedProcess({
     cmd: gppPath,
-    args: ['-std=c++17', '-Wall', '-Wextra', '-O0', sourceFileName, '-o', binaryFileName],
+    args: [stdFlag, '-Wall', '-Wextra', '-O0', sourceFileName, '-o', binaryFileName],
     cwd: workspaceDir,
     timeoutMs: 15000,
   });
@@ -100,6 +104,7 @@ export async function compileCpp(
     stderr: procRes.stderr,
     executablePath: binaryFilePath,
     binaryPath: binaryFilePath,
+    sourceFileName,
     workingDir: workspaceDir,
     workspaceDir,
   };
@@ -119,8 +124,14 @@ export async function executeCpp(
   try {
     if (!compileRes.success) {
       // Fallback to remote sandbox if g++ is unavailable on host (e.g. serverless)
-      if (isLocalExecutionBlockedError(compileRes.stderr)) {
-        const remote = await executeViaRemoteSandbox('cpp', code, stdin, timeoutMs);
+      if (compileRes.compilerUnavailable || isLocalExecutionBlockedError(compileRes.stderr)) {
+        const remote = await executeViaRemoteSandbox(
+          'cpp',
+          code,
+          stdin,
+          timeoutMs,
+          compileRes.sourceFileName
+        );
         if (remote) {
           const remoteDiagnostics = remote.compileOutput
             ? parseGppDiagnostics(remote.compileOutput, '')
@@ -132,6 +143,25 @@ export async function executeCpp(
             hasRemoteCompileErr ? remoteDiagnostics[0]?.line || 1 : undefined
           );
         }
+      }
+
+      if (compileRes.compilerUnavailable) {
+        const configMsg =
+          compileRes.compilerError ||
+          compileRes.stderr.trim() ||
+          'C++ compiler (g++) is unavailable on this host.';
+        return {
+          status: 'error',
+          canRun: false,
+          stdout: '',
+          stderr: configMsg,
+          output: configMsg,
+          exitCode: 1,
+          timedOut: false,
+          runtimeError: configMsg,
+          executionTimeMs: 0,
+          diagnostics: [],
+        };
       }
 
       const firstError = compileRes.diagnostics.find((d) => d.severity === 'error');

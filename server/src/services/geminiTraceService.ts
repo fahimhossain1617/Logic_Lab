@@ -26,7 +26,11 @@ import {
   buildExecutionAwareLineNote,
   generateLanguagePitfalls,
 } from '../../../shared/codeAnalysis';
-import { preprocessCode } from './codePreprocessor';
+import {
+  preprocessCode,
+  remapDiagnosticsToOriginal,
+  remapPreprocessedLine,
+} from './codePreprocessor';
 import { ExecutionTraceSchema } from '../../../shared/traceSchema';
 import { classifyErrorCategory, tokenizeStdin } from '../../../shared/stdinHelper';
 import {
@@ -1475,13 +1479,10 @@ export async function generateExecutionTrace(params: {
 
   // 1. Real Compiler / Toolchain validation (source of truth)
   const toolchainAnalysis = await analyzeCode(codeToRun, params.language, params.fileName);
-  const adjustedToolchainDiagnostics = toolchainAnalysis.diagnostics.map((d) => ({
-    ...d,
-    line:
-      prep.injectedPrefixLines > 0 && d.line
-        ? Math.max(1, d.line - prep.injectedPrefixLines)
-        : d.line,
-  }));
+  const adjustedToolchainDiagnostics = remapDiagnosticsToOriginal(
+    toolchainAnalysis.diagnostics,
+    prep
+  );
   if (!toolchainAnalysis.canCompile) {
     const firstErr = adjustedToolchainDiagnostics.find((d) => d.severity === 'error');
     const errLine = firstErr?.line || 1;
@@ -1556,13 +1557,14 @@ export async function generateExecutionTrace(params: {
   deterministicTrace.stdinTokens = tokenizeStdin(params.stdin || '');
 
   // Use real execution stdout as ground truth (normalized of trailing newline)
-  const cleanedStdout = (realExec.stdout || sandboxResult.stdout || '').replace(/\r?\n$/, '');
+  const cleanedStdout = (
+    typeof realExec.stdout === 'string' ? realExec.stdout : sandboxResult.stdout || ''
+  ).replace(/\r?\n$/, '');
   deterministicTrace.finalOutput = cleanedStdout;
 
-  const adjustedRuntimeErrorLine =
-    realExec.runtimeErrorLine && prep.injectedPrefixLines > 0
-      ? Math.max(1, realExec.runtimeErrorLine - prep.injectedPrefixLines)
-      : realExec.runtimeErrorLine;
+  const adjustedRuntimeErrorLine = realExec.runtimeErrorLine
+    ? remapPreprocessedLine(realExec.runtimeErrorLine, prep)
+    : undefined;
 
   if (realExec.runtimeError) {
     const errCat = classifyErrorCategory(realExec.runtimeError, false);

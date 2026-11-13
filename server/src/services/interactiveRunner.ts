@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { spawn, ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { ExecutionDiagnostic, SupportedLanguage } from '../../../shared/types';
-import { preprocessCode } from './codePreprocessor';
+import { preprocessCode, remapDiagnosticsToOriginal } from './codePreprocessor';
 import {
   cleanupSandboxWorkspace,
   createSandboxWorkspace,
@@ -13,9 +13,10 @@ import {
   resolveExecutable,
   runSandboxedProcess,
   sanitizeSourceFileName,
+  sanitizeWorkspacePaths,
 } from './toolchains/sandbox';
 import { parseGppDiagnostics } from './toolchains/cppToolchain';
-import { compileJava, extractJavaClassName } from './toolchains/javaToolchain';
+import { compileJava } from './toolchains/javaToolchain';
 import { checkPythonSyntax } from './toolchains/pythonToolchain';
 import { checkJsSyntax } from './toolchains/nodeToolchain';
 import { executeViaRemoteSandbox, isLocalExecutionBlockedError } from './toolchains/remoteSandbox';
@@ -63,6 +64,7 @@ export interface StartInteractiveResult {
 }
 
 const sessions = new Map<string, InteractiveSession>();
+const MAX_ACTIVE_SESSIONS = 16;
 const MAX_OUTPUT_BYTES = 128 * 1024;
 const STEP_TIMEOUT_MS = 12000;
 const IDLE_TIMEOUT_MS = 120_000;
@@ -370,6 +372,18 @@ export async function startInteractiveSession(
   fileName?: string,
   initialStdin = ''
 ): Promise<StartInteractiveResult> {
+  // Evict already-exited sessions before checking live session capacity
+  for (const [id, existing] of sessions.entries()) {
+    if (existing.exited && Date.now() - existing.startedAt > 5000) {
+      sessions.delete(id);
+    }
+  }
+  const activeCount = [...sessions.values()].filter((s) => !s.exited).length;
+  if (activeCount >= MAX_ACTIVE_SESSIONS) {
+    const busyMsg = 'Too many active execution sessions. Please wait for an existing session to complete.';
+    return { ok: false, diagnostics: [], stderr: busyMsg, runtimeError: busyMsg };
+  }
+
   const prep = preprocessCode(rawCode, language);
   const code = prep.code;
   const isInteractive = hasInputPattern(code, language);
@@ -406,7 +420,7 @@ export async function startInteractiveSession(
       }
 
       const compileArgs = isC
-        ? ['-Wall', '-Wextra', '-O0', sourceFileName, '_unbuf.c', '-o', binaryFileName]
+        ? ['-std=c11', '-Wall', '-Wextra', '-O0', sourceFileName, '_unbuf.c', '-o', binaryFileName]
         : ['-std=c++17', '-Wall', '-Wextra', '-O0', sourceFileName, '_unbuf.c', '-o', binaryFileName];
 
       const compileRes = await runSandboxedProcess({
@@ -416,7 +430,10 @@ export async function startInteractiveSession(
         timeoutMs: 15000,
       });
 
-      const cppDiags = parseGppDiagnostics(compileRes.stderr, compileRes.stdout);
+      const cppDiags = remapDiagnosticsToOriginal(
+        parseGppDiagnostics(compileRes.stderr, compileRes.stdout),
+        prep
+      );
       diagnostics = [...cppDiags, ...prep.diagnostics];
       const hasErrors =
         compileRes.exitCode !== 0 || cppDiags.some((d) => d.severity === 'error');
@@ -442,11 +459,12 @@ export async function startInteractiveSession(
     } else if (language === 'java') {
       const compileRes = await compileJava(code, fileName || 'Main.java');
       workspaceDir = compileRes.workspaceDir;
-      diagnostics = [...compileRes.diagnostics, ...prep.diagnostics];
+      const mappedJavaDiags = remapDiagnosticsToOriginal(compileRes.diagnostics, prep);
+      diagnostics = [...mappedJavaDiags, ...prep.diagnostics];
 
       if (!compileRes.success) {
         await cleanupSandboxWorkspace(workspaceDir);
-        const firstErr = compileRes.diagnostics.find((d) => d.severity === 'error');
+        const firstErr = mappedJavaDiags.find((d) => d.severity === 'error');
         const errMsg =
           compileRes.compilerError ||
           compileRes.stderr.trim() ||
@@ -478,7 +496,7 @@ export async function startInteractiveSession(
         return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };
       }
 
-      const className = extractJavaClassName(code, fileName || 'Main.java');
+      const mainClass = compileRes.mainClass || 'Main';
       await fs.writeFile(path.join(workspaceDir, '_LogicLabRunner.java'), JAVA_RUNNER_CODE, 'utf8');
       const runnerCompile = javacPath
         ? await runSandboxedProcess({
@@ -500,8 +518,8 @@ export async function startInteractiveSession(
       cmd = javaPath;
       args =
         runnerCompile.exitCode === 0
-          ? [...javaUtf8Flags, '-cp', workspaceDir, '_LogicLabRunner', className]
-          : [...javaUtf8Flags, '-cp', workspaceDir, className];
+          ? [...javaUtf8Flags, '-cp', workspaceDir, '_LogicLabRunner', mainClass]
+          : [...javaUtf8Flags, '-cp', workspaceDir, mainClass];
     } else if (language === 'python') {
       const syntaxRes = await checkPythonSyntax(code, fileName || 'script.py');
       workspaceDir = syntaxRes.workspaceDir;
@@ -562,6 +580,7 @@ export async function startInteractiveSession(
       cwd: workspaceDir,
       env: { ...getSanitizedEnv(), ...extraEnv },
       windowsHide: true,
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -589,6 +608,10 @@ export async function startInteractiveSession(
       idleTimeoutTimer: null,
     };
 
+    child.stdin?.on('error', () => {
+      // Ignore EPIPE when child exits before consuming stdin
+    });
+
     if (initialStdin && child.stdin) {
       const normalized = initialStdin.replace(/\r\n/g, '\n');
       try {
@@ -596,6 +619,9 @@ export async function startInteractiveSession(
       } catch {
         // Ignore write error on dead child
       }
+    }
+    if (!isInteractive && child.stdin) {
+      child.stdin.end();
     }
 
     const stdoutDecoder = new StringDecoder('utf8');
@@ -621,7 +647,7 @@ export async function startInteractiveSession(
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      const text = stderrDecoder.write(chunk);
+      const text = sanitizeWorkspacePaths(stderrDecoder.write(chunk), session.workspaceDir);
       if (!text) return;
       if (session.stderrAll.length < MAX_OUTPUT_BYTES) {
         session.stderrAll += text;
@@ -651,7 +677,7 @@ export async function startInteractiveSession(
         if (session.stdoutAll.length < MAX_OUTPUT_BYTES) session.stdoutAll += tailOut;
         emitSessionEvent(session, { type: 'stdout', data: { text: tailOut } });
       }
-      const tailErr = stderrDecoder.end();
+      const tailErr = sanitizeWorkspacePaths(stderrDecoder.end(), session.workspaceDir);
       if (tailErr) {
         if (session.stderrAll.length < MAX_OUTPUT_BYTES) session.stderrAll += tailErr;
         emitSessionEvent(session, { type: 'stderr', data: { text: tailErr } });

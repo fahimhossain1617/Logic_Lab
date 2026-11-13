@@ -233,7 +233,7 @@ export const CodeEditorPanel: React.FC = () => {
     };
   }, []);
 
-  // Real-time debounced compiler diagnostics (350ms)
+  // Real-time debounced compiler diagnostics (350ms) with cancellation & stale-response guard
   useEffect(() => {
     if (!code.trim() || !monacoReady || !monacoRef.current || !editorRef.current) {
       if (monacoRef.current && editorRef.current) {
@@ -244,15 +244,33 @@ export const CodeEditorPanel: React.FC = () => {
       return;
     }
 
+    const controller = new AbortController();
+    let cancelled = false;
+    const reqFileId = useLabStore.getState().activeFileId;
+
     const timer = setTimeout(async () => {
       try {
         const res = await fetch('/api/analyze', {
           method: 'POST',
+          signal: controller.signal,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ code, language, fileName }),
         });
         const data = await res.json();
-        const incomingDiags: ExecutionDiagnostic[] = data.diagnostics || [];
+        const latest = useLabStore.getState();
+        if (
+          cancelled ||
+          controller.signal.aborted ||
+          latest.activeFileId !== reqFileId ||
+          latest.code !== code ||
+          latest.language !== language ||
+          latest.fileName !== fileName
+        ) {
+          return;
+        }
+        const incomingDiags: ExecutionDiagnostic[] = Array.isArray(data.diagnostics)
+          ? data.diagnostics
+          : [];
         setLiveDiagnostics(incomingDiags);
 
         if (monacoRef.current && editorRef.current) {
@@ -276,11 +294,15 @@ export const CodeEditorPanel: React.FC = () => {
           }
         }
       } catch {
-        // Ignore background analysis failures
+        // Ignore aborted or background analysis failures
       }
     }, 350);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearTimeout(timer);
+    };
   }, [code, language, fileName, monacoReady]);
 
   // Highlight active execution line, compilation error line, warnings, and cosmetic breakpoints

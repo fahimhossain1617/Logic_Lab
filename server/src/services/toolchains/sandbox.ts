@@ -233,21 +233,99 @@ export async function getToolchainAvailability(): Promise<Record<ToolchainExecut
 /**
  * Sanitizes a user-provided source filename to prevent path traversal and invalid characters.
  */
+const WINDOWS_RESERVED_BASENAMES = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+export interface FileNameValidationResult {
+  valid: boolean;
+  sanitized?: string;
+  error?: string;
+}
+
+/**
+ * Strictly validates a caller-supplied filename for safety and language extension consistency.
+ * Rejects path traversal, directory separators, null/control chars, and mismatched extensions.
+ */
+export function validateSourceFileName(
+  fileName: string,
+  allowedExts: string[]
+): FileNameValidationResult {
+  if (!fileName || !fileName.trim()) {
+    return { valid: false, error: 'Filename cannot be empty.' };
+  }
+  if (/[\x00-\x1f\x7f]/.test(fileName)) {
+    return { valid: false, error: 'Filename contains invalid control characters.' };
+  }
+  if (fileName.includes('/') || fileName.includes('\\') || fileName.includes('..')) {
+    return {
+      valid: false,
+      error: `Invalid filename "${fileName}": path separators and directory traversal ("..") are not allowed.`,
+    };
+  }
+  if (/[<>:"|?*]/.test(fileName)) {
+    return {
+      valid: false,
+      error: `Invalid filename "${fileName}": contains forbidden filesystem characters (< > : " | ? *).`,
+    };
+  }
+  const trimmed = fileName.trim();
+  if (trimmed.length > 128) {
+    return { valid: false, error: 'Filename exceeds maximum allowed length (128 characters).' };
+  }
+  const lower = trimmed.toLowerCase();
+  const matchedExt = allowedExts.find((ext) => lower.endsWith(ext.toLowerCase()));
+  if (!matchedExt) {
+    return {
+      valid: false,
+      error: `Filename "${trimmed}" does not match expected extension (${allowedExts.join(', ')}).`,
+    };
+  }
+  const stem = trimmed.slice(0, trimmed.length - matchedExt.length).trim();
+  if (!stem || stem === '.' || stem.startsWith('.')) {
+    return {
+      valid: false,
+      error: `Filename "${trimmed}" must have a valid name before the extension.`,
+    };
+  }
+  const sanitized = WINDOWS_RESERVED_BASENAMES.test(stem)
+    ? `_${stem}${matchedExt}`
+    : trimmed;
+  return { valid: true, sanitized };
+}
+
+/**
+ * Safely sanitizes a source filename for writing inside an isolated workspace,
+ * preserving spaces, hyphens, parentheses, and Unicode characters while blocking traversal.
+ */
 export function sanitizeSourceFileName(
   fileName: string | undefined,
   defaultName: string,
   allowedExts: string[]
 ): string {
-  const base = fileName ? path.basename(fileName).replace(/[^A-Za-z0-9_.-]/g, '') : '';
-  if (!base) return defaultName;
-  const lower = base.toLowerCase();
-  if (allowedExts.some((ext) => lower.endsWith(ext))) {
-    return base;
+  if (!fileName || typeof fileName !== 'string') return defaultName;
+  const normalized = fileName.replace(/\\/g, '/').split('/').pop() || '';
+  const cleaned = normalized
+    .replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, '')
+    .replace(/\.{2,}/g, '.')
+    .trim()
+    .replace(/^\.+|\.+$/g, '')
+    .trim();
+
+  if (!cleaned || cleaned.length > 128) return defaultName;
+
+  const lower = cleaned.toLowerCase();
+  const matchedExt = allowedExts.find((ext) => lower.endsWith(ext.toLowerCase()));
+  if (!matchedExt) return defaultName;
+
+  const stem = cleaned.slice(0, cleaned.length - matchedExt.length).trim();
+  if (!stem || stem === '.') return defaultName;
+
+  if (WINDOWS_RESERVED_BASENAMES.test(stem)) {
+    return `_${stem}${matchedExt}`;
   }
-  return defaultName;
+  return cleaned;
 }
 
-const SANDBOX_BASE_DIR = path.join(os.tmpdir(), 'logic-lab-sandbox');
+const SANDBOX_BASE_DIR = path.resolve(path.join(os.tmpdir(), 'logic-lab-sandbox'));
 
 /**
  * Creates an isolated temporary directory for compilation/execution
@@ -260,12 +338,17 @@ export async function createSandboxWorkspace(): Promise<string> {
 }
 
 /**
- * Safely removes a sandbox directory and all its contents
+ * Safely removes a sandbox directory and all its contents (strictly constrained inside SANDBOX_BASE_DIR)
  */
 export async function cleanupSandboxWorkspace(dirPath: string): Promise<void> {
   try {
-    if (dirPath && dirPath.startsWith(SANDBOX_BASE_DIR)) {
-      await fs.rm(dirPath, { recursive: true, force: true });
+    if (!dirPath) return;
+    const resolvedTarget = path.resolve(dirPath);
+    if (
+      resolvedTarget !== SANDBOX_BASE_DIR &&
+      resolvedTarget.startsWith(`${SANDBOX_BASE_DIR}${path.sep}`)
+    ) {
+      await fs.rm(resolvedTarget, { recursive: true, force: true });
     }
   } catch {
     // Ignore cleanup errors
@@ -273,22 +356,65 @@ export async function cleanupSandboxWorkspace(dirPath: string): Promise<void> {
 }
 
 /**
+ * Strips temporary sandbox workspace paths from compiler/runtime messages so internal
+ * filesystem paths are not leaked to clients and diagnostics display clean filenames.
+ */
+export function sanitizeWorkspacePaths(text: string, workspaceDir?: string): string {
+  if (!text) return text;
+  let result = text;
+  if (workspaceDir) {
+    const variants = Array.from(
+      new Set([
+        workspaceDir,
+        path.resolve(workspaceDir),
+        workspaceDir.replace(/\\/g, '/'),
+        workspaceDir.replace(/\//g, '\\'),
+      ])
+    );
+    for (const variant of variants) {
+      if (!variant) continue;
+      const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      result = result.replace(new RegExp(`${escaped}[\\\\/]?`, 'gi'), '');
+    }
+  }
+  const baseEscaped = SANDBOX_BASE_DIR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  result = result.replace(
+    new RegExp(`${baseEscaped}(?:[\\\\/](?:run|exec)-[a-zA-Z0-9-]+)?[\\\\/]?`, 'gi'),
+    ''
+  );
+  return result;
+}
+
+/**
  * Sanitizes PATH to include compilers while stripping sensitive credentials
  */
 export function getSanitizedEnv(): NodeJS.ProcessEnv {
-  // Pass PATH, SYSTEMROOT, TEMP, and standard system variables while stripping secrets
   const cleanEnv: NodeJS.ProcessEnv = {
     PATH: process.env.PATH || process.env.Path || '',
-    SYSTEMROOT: process.env.SYSTEMROOT || 'C:\\Windows',
-    WINDIR: process.env.WINDIR || 'C:\\Windows',
-    TEMP: process.env.TEMP || os.tmpdir(),
-    TMP: process.env.TMP || os.tmpdir(),
-    USERPROFILE: process.env.USERPROFILE || os.homedir(),
-    LOCALAPPDATA: process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
-    APPDATA: process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
-    HOMEDRIVE: process.env.HOMEDRIVE || 'C:',
-    HOMEPATH: process.env.HOMEPATH || '\\Users\\fahim',
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+    PYTHONDONTWRITEBYTECODE: '1',
+    LANG: process.env.LANG || 'C.UTF-8',
   };
+
+  if (process.platform === 'win32') {
+    const homeDir = os.homedir();
+    cleanEnv.SYSTEMROOT = process.env.SYSTEMROOT || 'C:\\Windows';
+    cleanEnv.WINDIR = process.env.WINDIR || 'C:\\Windows';
+    cleanEnv.COMSPEC = process.env.COMSPEC || 'C:\\Windows\\System32\\cmd.exe';
+    cleanEnv.PATHEXT = process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD';
+    cleanEnv.TEMP = process.env.TEMP || os.tmpdir();
+    cleanEnv.TMP = process.env.TMP || os.tmpdir();
+    cleanEnv.USERPROFILE = process.env.USERPROFILE || homeDir;
+    cleanEnv.LOCALAPPDATA = process.env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
+    cleanEnv.APPDATA = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
+    if (process.env.HOMEDRIVE) cleanEnv.HOMEDRIVE = process.env.HOMEDRIVE;
+    if (process.env.HOMEPATH) cleanEnv.HOMEPATH = process.env.HOMEPATH;
+  } else {
+    cleanEnv.HOME = os.tmpdir();
+    cleanEnv.TMPDIR = os.tmpdir();
+  }
+
   if (process.env.JAVA_HOME) {
     cleanEnv.JAVA_HOME = process.env.JAVA_HOME;
   }
@@ -302,8 +428,16 @@ export function killProcessTree(childProcess: any): void {
   if (!childProcess || !childProcess.pid) return;
   if (process.platform === 'win32') {
     try {
-      spawn('taskkill', ['/pid', String(childProcess.pid), '/T', '/F'], {
+      const killer = spawn('taskkill', ['/pid', String(childProcess.pid), '/T', '/F'], {
         windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('error', () => {
+        try {
+          childProcess.kill('SIGKILL');
+        } catch {
+          // Ignore already-exited errors
+        }
       });
     } catch {
       try {
@@ -314,9 +448,13 @@ export function killProcessTree(childProcess: any): void {
     }
   } else {
     try {
-      childProcess.kill('SIGKILL');
+      process.kill(-childProcess.pid, 'SIGKILL');
     } catch {
-      // Ignore already-exited errors
+      try {
+        childProcess.kill('SIGKILL');
+      } catch {
+        // Ignore already-exited errors
+      }
     }
   }
 }
@@ -325,7 +463,7 @@ const MAX_CONCURRENT_SANDBOX_PROCESSES = 4;
 let activeSandboxProcesses = 0;
 const processWaitQueue: Array<() => void> = [];
 
-async function acquireProcessSlot(): Promise<void> {
+export async function acquireProcessSlot(): Promise<void> {
   if (activeSandboxProcesses < MAX_CONCURRENT_SANDBOX_PROCESSES) {
     activeSandboxProcesses += 1;
     return;
@@ -334,7 +472,7 @@ async function acquireProcessSlot(): Promise<void> {
   activeSandboxProcesses += 1;
 }
 
-function releaseProcessSlot(): void {
+export function releaseProcessSlot(): void {
   activeSandboxProcesses = Math.max(0, activeSandboxProcesses - 1);
   const next = processWaitQueue.shift();
   if (next) next();
@@ -359,6 +497,10 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
   let timedOut = false;
   let stdoutData = '';
   let stderrData = '';
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
   let spawnErrorCode: string | undefined;
   let childProcess: any = null;
 
@@ -374,6 +516,7 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
           cwd,
           env: mergedEnv,
           windowsHide: true,
+          detached: process.platform !== 'win32',
           stdio: ['pipe', 'pipe', 'pipe'],
         });
 
@@ -387,11 +530,17 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
           clearTimeout(timer);
           const tailOut = stdoutDecoder.end();
           const tailErr = stderrDecoder.end();
-          if (tailOut && stdoutData.length < maxBufferBytes) stdoutData += tailOut;
-          if (tailErr && stderrData.length < maxBufferBytes) stderrData += tailErr;
+          if (tailOut && !stdoutTruncated) stdoutData += tailOut;
+          if (tailErr && !stderrTruncated) stderrData += tailErr;
+          if (stdoutTruncated) {
+            stdoutData += '\n...[output truncated: exceeded max buffer]';
+          }
+          if (stderrTruncated) {
+            stderrData += '\n...[stderr truncated: exceeded max buffer]';
+          }
           resolve({
             stdout: stdoutData,
-            stderr: stderrData,
+            stderr: sanitizeWorkspacePaths(stderrData, cwd),
             exitCode,
             timedOut,
             executionTimeMs: Date.now() - startTime,
@@ -401,33 +550,42 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
 
         const timer = setTimeout(() => {
           timedOut = true;
-          if (childProcess && childProcess.pid) {
-            // On Windows, use taskkill to kill the whole process tree (/T /F)
-            if (process.platform === 'win32') {
-              try {
-                spawn('taskkill', ['/pid', String(childProcess.pid), '/T', '/F'], {
-                  windowsHide: true,
-                });
-              } catch {
-                childProcess.kill('SIGKILL');
-              }
-            } else {
-              childProcess.kill('SIGKILL');
-            }
-          }
+          killProcessTree(childProcess);
           finish(null);
         }, timeoutMs);
 
         childProcess.stdout.on('data', (chunk: Buffer) => {
-          if (stdoutData.length < maxBufferBytes) {
+          if (stdoutTruncated) return;
+          if (stdoutBytes + chunk.length <= maxBufferBytes) {
+            stdoutBytes += chunk.length;
             stdoutData += stdoutDecoder.write(chunk);
+          } else {
+            const remaining = Math.max(0, maxBufferBytes - stdoutBytes);
+            if (remaining > 0) {
+              stdoutData += stdoutDecoder.write(chunk.subarray(0, remaining));
+            }
+            stdoutBytes = maxBufferBytes;
+            stdoutTruncated = true;
           }
         });
 
         childProcess.stderr.on('data', (chunk: Buffer) => {
-          if (stderrData.length < maxBufferBytes) {
+          if (stderrTruncated) return;
+          if (stderrBytes + chunk.length <= maxBufferBytes) {
+            stderrBytes += chunk.length;
             stderrData += stderrDecoder.write(chunk);
+          } else {
+            const remaining = Math.max(0, maxBufferBytes - stderrBytes);
+            if (remaining > 0) {
+              stderrData += stderrDecoder.write(chunk.subarray(0, remaining));
+            }
+            stderrBytes = maxBufferBytes;
+            stderrTruncated = true;
           }
+        });
+
+        childProcess.stdin.on('error', () => {
+          // Ignore EPIPE when child terminates before consuming all stdin
         });
 
         childProcess.on('error', (err: NodeJS.ErrnoException) => {

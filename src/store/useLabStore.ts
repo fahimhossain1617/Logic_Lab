@@ -162,14 +162,32 @@ function inferLanguageFromFileName(
   if (
     lower.endsWith('.cpp') ||
     lower.endsWith('.cc') ||
+    lower.endsWith('.cxx') ||
     lower.endsWith('.c') ||
-    lower.endsWith('.h')
+    lower.endsWith('.h') ||
+    lower.endsWith('.hpp')
   ) {
     return 'cpp';
   }
   if (lower.endsWith('.java')) return 'java';
-  if (lower.endsWith('.js') || lower.endsWith('.ts')) return 'javascript';
+  if (
+    lower.endsWith('.js') ||
+    lower.endsWith('.mjs') ||
+    lower.endsWith('.cjs') ||
+    lower.endsWith('.ts')
+  ) {
+    return 'javascript';
+  }
   return fallback;
+}
+
+function extractJavaClassNameForFile(code: string): string {
+  const clean = code.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
+  const pubMatch = clean.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
+  if (pubMatch?.[1]) return pubMatch[1];
+  const anyMatch = clean.match(/\bclass\s+([A-Za-z_$][\w$]*)\b/);
+  if (anyMatch?.[1]) return anyMatch[1];
+  return 'Main';
 }
 
 function defaultExtensionForLanguage(lang: SupportedLanguage): string {
@@ -387,12 +405,131 @@ function formatCloudTimestamp(createdMs?: number): string {
 let activeAbortController: AbortController | null = null;
 let fastAbortController: AbortController | null = null;
 let activeEventSource: EventSource | null = null;
+let fastRequestSeq = 0;
+let visualizeRequestSeq = 0;
+
+interface TabExecutionSnapshot {
+  hasExecuted: boolean;
+  trace: ExecutionTrace;
+  currentStepIndex: number;
+  prevStepIndex: number;
+  isPlaying: boolean;
+  canRun: boolean;
+  diagnostics: ExecutionDiagnostic[];
+  executionStatus: LabState['executionStatus'];
+  fastRunResult: FastExecutionResult | null;
+  terminalHistory: TerminalLine[];
+  currentPrompt: string;
+  currentInputValue: string;
+  terminalExecState: TerminalExecState;
+  terminalCollectedInputs: string[];
+  lastTerminalSnapshot: { code: string; stdin: string } | null;
+  apiError: BilingualMessage | null;
+  apiNotice: BilingualMessage | null;
+  stdin: string;
+  stdinDraft: string;
+  stdinSource: LabState['stdinSource'];
+  autoInjectedStdinNotice: LabState['autoInjectedStdinNotice'];
+}
+
+const tabExecSnapshots = new Map<string, TabExecutionSnapshot>();
 
 function closeActiveEventSource() {
   if (activeEventSource) {
     activeEventSource.close();
     activeEventSource = null;
   }
+}
+
+function abortInFlightExecutions(activeSessionId: string | null) {
+  if (activeAbortController) {
+    activeAbortController.abort();
+    activeAbortController = null;
+  }
+  if (fastAbortController) {
+    fastAbortController.abort();
+    fastAbortController = null;
+  }
+  closeActiveEventSource();
+  if (activeSessionId) {
+    void fetch('/api/execute/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: activeSessionId }),
+    }).catch(() => {});
+  }
+}
+
+function saveTabSnapshot(state: LabState): void {
+  if (!state.activeFileId) return;
+  tabExecSnapshots.set(state.activeFileId, {
+    hasExecuted: state.hasExecuted,
+    trace: state.trace,
+    currentStepIndex: state.currentStepIndex,
+    prevStepIndex: state.prevStepIndex,
+    isPlaying: false,
+    canRun: state.canRun,
+    diagnostics: state.diagnostics,
+    executionStatus: state.executionStatus,
+    fastRunResult: state.fastRunResult,
+    terminalHistory: state.terminalHistory,
+    currentPrompt: state.currentPrompt,
+    currentInputValue: state.currentInputValue,
+    terminalExecState:
+      state.terminalExecState === 'RUNNING' ||
+      state.terminalExecState === 'COMPILING' ||
+      state.terminalExecState === 'WAITING_FOR_INPUT'
+        ? 'IDLE'
+        : state.terminalExecState,
+    terminalCollectedInputs: state.terminalCollectedInputs,
+    lastTerminalSnapshot: state.lastTerminalSnapshot,
+    apiError: state.apiError,
+    apiNotice: state.apiNotice,
+    stdin: state.stdin,
+    stdinDraft: state.stdinDraft,
+    stdinSource: state.stdinSource,
+    autoInjectedStdinNotice: state.autoInjectedStdinNotice,
+  });
+}
+
+function getFreshTabReset(fileId?: string): Partial<LabState> {
+  const existing = fileId ? tabExecSnapshots.get(fileId) : undefined;
+  if (existing) {
+    return {
+      ...existing,
+      isTracing: false,
+      isFastRunning: false,
+      traceProgressStage: 0,
+      activeSessionId: null,
+    };
+  }
+  return {
+    hasExecuted: false,
+    trace: EMPTY_INITIAL_TRACE,
+    currentStepIndex: 0,
+    prevStepIndex: 0,
+    isPlaying: false,
+    isTracing: false,
+    isFastRunning: false,
+    traceProgressStage: 0,
+    canRun: true,
+    diagnostics: [],
+    executionStatus: 'idle',
+    fastRunResult: null,
+    terminalHistory: [],
+    currentPrompt: '',
+    currentInputValue: '',
+    terminalExecState: 'IDLE',
+    terminalCollectedInputs: [],
+    lastTerminalSnapshot: null,
+    activeSessionId: null,
+    apiError: null,
+    apiNotice: null,
+    stdin: '',
+    stdinDraft: '',
+    stdinSource: 'none',
+    autoInjectedStdinNotice: null,
+  };
 }
 
 function makeTerminalLineId(): string {
@@ -871,8 +1008,9 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   setLanguage: (language) => {
-    const { fileName, activeFileId, userFiles } = get();
-    const rawBase = fileName.replace(/\.(js|ts|py|cpp|cc|c|h|java)$/i, '') || 'main';
+    const { fileName, activeFileId, userFiles, language: prevLang } = get();
+    const rawBase =
+      fileName.replace(/\.(js|mjs|cjs|ts|py|cpp|cc|cxx|c|h|hpp|java)$/i, '') || 'main';
     const baseName =
       language === 'java' && rawBase.toLowerCase() === 'main'
         ? 'Main'
@@ -888,6 +1026,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       fileName: nextFileName,
       userFiles: updatedFiles,
       apiError: null,
+      ...(language !== prevLang ? { diagnostics: [], executionStatus: 'idle' as const } : {}),
     });
   },
 
@@ -907,12 +1046,18 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   createNewUserFile: () => {
-    const { userFiles, folderName, language } = get();
+    const state = get();
+    const { userFiles, folderName, language } = state;
+    saveTabSnapshot(state);
+    abortInFlightExecutions(state.activeSessionId);
+    fastRequestSeq += 1;
+    visualizeRequestSeq += 1;
+
     const nextIndex = userFiles.length + 1;
     const ext = defaultExtensionForLanguage(language);
     const basePrefix = language === 'java' ? `Main${nextIndex}` : `script${nextIndex}`;
     const newFile: UserCodeFile = {
-      id: `file-${Date.now()}`,
+      id: `file-${Date.now()}-${nextIndex}`,
       folderName: folderName || 'my-project',
       fileName: `${basePrefix}${ext}`,
       language,
@@ -923,48 +1068,54 @@ export const useLabStore = create<LabState>((set, get) => ({
       activeFileId: newFile.id,
       fileName: newFile.fileName,
       code: newFile.code,
-      hasExecuted: false,
-      trace: EMPTY_INITIAL_TRACE,
-      currentStepIndex: 0,
-      prevStepIndex: 0,
-      isPlaying: false,
-      apiError: null,
+      ...getFreshTabReset(),
     });
   },
 
   selectUserFile: (fileId) => {
-    const { userFiles } = get();
-    const target = userFiles.find((f) => f.id === fileId);
+    const state = get();
+    if (fileId === state.activeFileId) return;
+    const target = state.userFiles.find((f) => f.id === fileId);
     if (!target) return;
+
+    saveTabSnapshot(state);
+    abortInFlightExecutions(state.activeSessionId);
+    fastRequestSeq += 1;
+    visualizeRequestSeq += 1;
+
     set({
       activeFileId: target.id,
       folderName: target.folderName,
       fileName: target.fileName,
       language: target.language,
       code: target.code,
-      hasExecuted: false,
-      trace: EMPTY_INITIAL_TRACE,
-      currentStepIndex: 0,
-      prevStepIndex: 0,
-      isPlaying: false,
-      apiError: null,
+      ...getFreshTabReset(target.id),
     });
   },
 
   deleteUserFile: (fileId) => {
-    const { userFiles, activeFileId, user } = get();
+    const state = get();
+    const { userFiles, activeFileId, user } = state;
     if (user && !user.isDemo) {
       void deleteSnippetFromFirestore(user.uid, fileId).catch(() => {});
     }
+    tabExecSnapshots.delete(fileId);
     if (userFiles.length <= 1) {
+      abortInFlightExecutions(state.activeSessionId);
+      fastRequestSeq += 1;
+      visualizeRequestSeq += 1;
       get().resetSnippetToNew();
       return;
     }
     const remaining = userFiles.filter((f) => f.id !== fileId);
-    const nextActive =
-      fileId === activeFileId
-        ? remaining[remaining.length - 1]
-        : userFiles.find((f) => f.id === activeFileId)!;
+    if (fileId !== activeFileId) {
+      set({ userFiles: remaining });
+      return;
+    }
+    abortInFlightExecutions(state.activeSessionId);
+    fastRequestSeq += 1;
+    visualizeRequestSeq += 1;
+    const nextActive = remaining[remaining.length - 1];
     set({
       userFiles: remaining,
       activeFileId: nextActive.id,
@@ -972,8 +1123,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       fileName: nextActive.fileName,
       language: nextActive.language,
       code: nextActive.code,
-      hasExecuted: false,
-      trace: EMPTY_INITIAL_TRACE,
+      ...getFreshTabReset(nextActive.id),
     });
   },
 
@@ -1018,6 +1168,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       userFiles: updated,
       isDirty: true,
       apiError: null,
+      diagnostics: [],
       ...(wasError
         ? {
             executionStatus: 'idle',
@@ -1259,6 +1410,7 @@ export const useLabStore = create<LabState>((set, get) => ({
 
     const controller = new AbortController();
     fastAbortController = controller;
+    const myFastSeq = ++fastRequestSeq;
 
     let {
       code,
@@ -1271,6 +1423,12 @@ export const useLabStore = create<LabState>((set, get) => ({
       activeFileId,
       explainLanguage,
     } = get();
+
+    const requestFileId = activeFileId;
+    const isStaleFastRun = () =>
+      myFastSeq !== fastRequestSeq ||
+      controller.signal.aborted ||
+      get().activeFileId !== requestFileId;
 
     if (typeof overrideCode === 'string') {
       code = overrideCode;
@@ -1346,7 +1504,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       (/\bpublic\s+class\s+[A-Za-z_$]/.test(code) || /\bSystem\.out\.print/.test(code))
     ) {
       language = 'java';
-      fileName = 'Main.java';
+      fileName = `${extractJavaClassNameForFile(code)}.java`;
       const updatedFiles = userFiles.map((f) =>
         f.id === activeFileId ? { ...f, language, fileName } : f
       );
@@ -1375,6 +1533,7 @@ export const useLabStore = create<LabState>((set, get) => ({
         }
         if (!fbData) throw new Error(fallbackErr || 'Execution server returned non-JSON response.');
 
+        if (isStaleFastRun()) return;
         const executionTimeMs =
           typeof fbData.executionTimeMs === 'number'
             ? fbData.executionTimeMs
@@ -1510,7 +1669,7 @@ export const useLabStore = create<LabState>((set, get) => ({
         data = null;
       }
 
-      if (controller.signal.aborted) return;
+      if (isStaleFastRun()) return;
 
       if (!res.ok || !data) {
         await runStaticFallback();
@@ -1569,7 +1728,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       activeEventSource = es;
 
       es.addEventListener('stdout', (ev: MessageEvent) => {
-        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        if (isStaleFastRun() || get().activeSessionId !== sessionId) return;
         try {
           const payload = JSON.parse(ev.data) as { text?: string };
           const chunk = String(payload.text ?? '').replace(/\r\n/g, '\n');
@@ -1595,7 +1754,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       });
 
       es.addEventListener('stderr', (ev: MessageEvent) => {
-        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        if (isStaleFastRun() || get().activeSessionId !== sessionId) return;
         try {
           const payload = JSON.parse(ev.data) as { text?: string };
           const chunk = String(payload.text ?? '').replace(/\r\n/g, '\n');
@@ -1621,7 +1780,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       });
 
       es.addEventListener('prompt', () => {
-        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        if (isStaleFastRun() || get().activeSessionId !== sessionId) return;
         set({
           terminalExecState: 'WAITING_FOR_INPUT',
           isFastRunning: false,
@@ -1630,7 +1789,7 @@ export const useLabStore = create<LabState>((set, get) => ({
 
       es.addEventListener('exit', (ev: MessageEvent) => {
         closeActiveEventSource();
-        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        if (isStaleFastRun() || get().activeSessionId !== sessionId) return;
         try {
           const payload = JSON.parse(ev.data) as {
             exitCode: number | null;
@@ -1643,7 +1802,8 @@ export const useLabStore = create<LabState>((set, get) => ({
             diagnostics?: ExecutionDiagnostic[];
           };
 
-          const executionTimeMs =
+          if (isStaleFastRun()) return;
+        const executionTimeMs =
             typeof payload.executionTimeMs === 'number'
               ? payload.executionTimeMs
               : Math.max(1, Date.now() - startedAt);
@@ -1848,6 +2008,7 @@ export const useLabStore = create<LabState>((set, get) => ({
     }
     const currentAbortController = new AbortController();
     activeAbortController = currentAbortController;
+    const myVizSeq = ++visualizeRequestSeq;
 
     let {
       code,
@@ -1862,6 +2023,12 @@ export const useLabStore = create<LabState>((set, get) => ({
       activeFileId,
       userFiles,
     } = get();
+
+    const requestFileId = activeFileId;
+    const isStaleVizRun = () =>
+      myVizSeq !== visualizeRequestSeq ||
+      currentAbortController.signal.aborted ||
+      get().activeFileId !== requestFileId;
 
     const explainStartedAt = Date.now();
 
@@ -1938,7 +2105,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       (/\bpublic\s+class\s+[A-Za-z_$]/.test(code) || /\bSystem\.out\.print/.test(code))
     ) {
       language = 'java';
-      fileName = 'Main.java';
+      fileName = `${extractJavaClassNameForFile(code)}.java`;
       const updatedFiles = userFiles.map((f) =>
         f.id === activeFileId ? { ...f, language, fileName } : f
       );
@@ -1957,11 +2124,11 @@ export const useLabStore = create<LabState>((set, get) => ({
     const cachedClientHit = isDet ? clientTraceCache.get(cacheKey) : undefined;
 
     const stage2Timer = setTimeout(() => {
-      if (get().isTracing) set({ traceProgressStage: 2 });
+      if (!isStaleVizRun() && get().isTracing) set({ traceProgressStage: 2 });
     }, 60);
 
     const stage3Timer = setTimeout(() => {
-      if (get().isTracing) set({ traceProgressStage: 3 });
+      if (!isStaleVizRun() && get().isTracing) set({ traceProgressStage: 3 });
     }, 120);
 
     try {
@@ -1980,7 +2147,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       clearTimeout(stage2Timer);
       clearTimeout(stage3Timer);
 
-      if (currentAbortController.signal.aborted) {
+      if (isStaleVizRun()) {
         return;
       }
 
@@ -2280,11 +2447,12 @@ export const useLabStore = create<LabState>((set, get) => ({
     } catch (err: any) {
       clearTimeout(stage2Timer);
       clearTimeout(stage3Timer);
-      if (err?.name === 'AbortError' || currentAbortController.signal.aborted) {
+      if (err?.name === 'AbortError' || isStaleVizRun()) {
         return;
       }
     }
 
+    if (isStaleVizRun()) return;
     set({
       hasExecuted: true,
       isTracing: false,

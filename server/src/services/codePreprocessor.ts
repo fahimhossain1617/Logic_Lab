@@ -5,7 +5,44 @@ export interface PreprocessResult {
   originalCode: string;
   injectedImports: string[];
   injectedPrefixLines: number;
+  injectedAfterLine?: number;
+  injectedAfterCount?: number;
   diagnostics: ExecutionDiagnostic[];
+}
+
+/**
+ * Remaps a 1-based line number produced against preprocessed code back to the user's original source line.
+ */
+export function remapPreprocessedLine(line: number, prep: PreprocessResult): number {
+  if (line <= 0) return 1;
+  if (prep.injectedPrefixLines > 0) {
+    return Math.max(1, line - prep.injectedPrefixLines);
+  }
+  if (prep.injectedAfterLine !== undefined && prep.injectedAfterCount && prep.injectedAfterCount > 0) {
+    if (line > prep.injectedAfterLine) {
+      return Math.max(prep.injectedAfterLine, line - prep.injectedAfterCount);
+    }
+  }
+  return line;
+}
+
+/**
+ * Remaps compiler/runtime diagnostics produced on preprocessed code back to original source lines.
+ */
+export function remapDiagnosticsToOriginal(
+  diagnostics: ExecutionDiagnostic[],
+  prep: PreprocessResult
+): ExecutionDiagnostic[] {
+  if (
+    prep.injectedPrefixLines === 0 &&
+    !(prep.injectedAfterCount && prep.injectedAfterCount > 0)
+  ) {
+    return diagnostics;
+  }
+  return diagnostics.map((d) => ({
+    ...d,
+    line: remapPreprocessedLine(d.line, prep),
+  }));
 }
 
 /**
@@ -189,6 +226,8 @@ export function preprocessCode(
 
   let processedCode = code;
   let injectedPrefixLines = 0;
+  let injectedAfterLine: number | undefined;
+  let injectedAfterCount = 0;
 
   // 1. JAVA AUTOMATIC IMPORT INJECTION
   if (language === 'java') {
@@ -236,6 +275,8 @@ export function preprocessCode(
       if (pkgIdx >= 0) {
         lines.splice(pkgIdx + 1, 0, ...importsToInject);
         processedCode = lines.join('\n');
+        injectedAfterLine = pkgIdx + 1;
+        injectedAfterCount = importsToInject.length;
       } else {
         processedCode = `${importsToInject.join('\n')}\n${code}`;
         injectedPrefixLines += importsToInject.length;
@@ -333,6 +374,7 @@ export function preprocessCode(
     originalCode,
     injectedImports,
     injectedPrefixLines,
+    ...(injectedAfterLine !== undefined ? { injectedAfterLine, injectedAfterCount } : {}),
     diagnostics,
   };
 }

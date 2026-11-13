@@ -49,9 +49,9 @@ export async function checkPythonSyntax(
 import ast, json, sys
 
 try:
-    with open(${JSON.stringify(sourceFileName)}, 'r', encoding='utf-8') as f:
+    with open(${JSON.stringify(sourceFileName)}, 'r', encoding='utf-8-sig') as f:
         src = f.read()
-    ast.parse(src)
+    ast.parse(src, filename=${JSON.stringify(sourceFileName)})
     print(json.dumps({"success": True, "diagnostics": []}))
 except SyntaxError as e:
     diag = [{
@@ -123,11 +123,36 @@ export async function executePython(
   try {
     if (!syntaxRes.success) {
       // Fallback to remote sandbox if python is unavailable on host (e.g. serverless)
-      if (isLocalExecutionBlockedError(syntaxRes.stderr)) {
-        const remote = await executeViaRemoteSandbox('python', code, stdin, timeoutMs);
+      if (syntaxRes.compilerUnavailable || isLocalExecutionBlockedError(syntaxRes.stderr)) {
+        const remote = await executeViaRemoteSandbox(
+          'python',
+          code,
+          stdin,
+          timeoutMs,
+          fileName
+        );
         if (remote) {
           return buildRemoteToolchainResult(remote, []);
         }
+      }
+
+      if (syntaxRes.compilerUnavailable) {
+        const configMsg =
+          syntaxRes.compilerError ||
+          syntaxRes.stderr.trim() ||
+          'Python interpreter is unavailable on this host.';
+        return {
+          status: 'error',
+          canRun: false,
+          stdout: '',
+          stderr: configMsg,
+          output: configMsg,
+          exitCode: 1,
+          timedOut: false,
+          runtimeError: configMsg,
+          executionTimeMs: 0,
+          diagnostics: [],
+        };
       }
 
       const firstError = syntaxRes.diagnostics.find((d) => d.severity === 'error');
@@ -173,10 +198,17 @@ export async function executePython(
 
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
-    } else if (runRes.exitCode !== 0 && runRes.stderr) {
-      runtimeError = runRes.stderr.trim();
-      // Parse last line number from traceback
-      const lineMatches = [...runRes.stderr.matchAll(/File\s+["'][^"']+["'],\s+line\s+(\d+)/g)];
+    } else if (runRes.exitCode !== 0 && runRes.exitCode !== null) {
+      runtimeError =
+        runRes.stderr.trim() || `Python process exited with error code ${runRes.exitCode}.`;
+      const escapedFile = sourceFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const fileMatches = [
+        ...runRes.stderr.matchAll(new RegExp(`File\\s+["'][^"']*${escapedFile}["'],\\s+line\\s+(\\d+)`, 'g')),
+      ];
+      const lineMatches =
+        fileMatches.length > 0
+          ? fileMatches
+          : [...runRes.stderr.matchAll(/File\s+["'][^"']+["'],\s+line\s+(\d+)/g)];
       if (lineMatches.length > 0) {
         runtimeErrorLine = parseInt(lineMatches[lineMatches.length - 1][1], 10);
       }
@@ -184,7 +216,7 @@ export async function executePython(
 
     const hasWarnings = syntaxRes.diagnostics.some((d) => d.severity === 'warning');
     const status: 'success' | 'warning' | 'error' =
-      runRes.timedOut || (runRes.exitCode !== 0 && Boolean(runtimeError))
+      runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
         ? 'error'
         : hasWarnings
         ? 'warning'

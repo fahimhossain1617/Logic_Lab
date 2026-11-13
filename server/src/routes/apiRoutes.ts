@@ -9,13 +9,20 @@ import {
   clearTraceCache,
   isGeminiKeyConfigured,
 } from '../services/geminiTraceService';
-import { preprocessCode } from '../services/codePreprocessor';
+import {
+  preprocessCode,
+  remapDiagnosticsToOriginal,
+  remapPreprocessedLine,
+} from '../services/codePreprocessor';
 import { traceRateLimiter } from '../middleware/rateLimitAndSecurity';
 import { SAMPLE_PROGRAMS } from '../../../src/data/sampleTraces';
 import { PROBLEM_LIBRARY } from '../../../src/data/problemLibrary';
 import { runDeterministicMultiLanguage } from '../tracers/realExecutionRunner';
 import { analyzeCode, executeCode } from '../services/toolchains/toolchainManager';
-import { getToolchainAvailability } from '../services/toolchains/sandbox';
+import {
+  getToolchainAvailability,
+  validateSourceFileName,
+} from '../services/toolchains/sandbox';
 import {
   sendSessionInput,
   startInteractiveSession,
@@ -31,6 +38,104 @@ import {
 } from '../../../shared/types';
 
 export const apiRouter = Router();
+
+const SUPPORTED_LANGUAGES: readonly SupportedLanguage[] = ['javascript', 'python', 'cpp', 'java'];
+const LANGUAGE_ALLOWED_EXTS: Record<SupportedLanguage, string[]> = {
+  java: ['.java'],
+  javascript: ['.js', '.mjs', '.cjs'],
+  cpp: ['.cpp', '.cc', '.cxx', '.c'],
+  python: ['.py'],
+};
+const MAX_EXEC_CODE_CHARS = 200_000;
+const MAX_STDIN_CHARS = 200_000;
+
+interface ValidatedExecutionRequest {
+  ok: true;
+  code: string;
+  language: SupportedLanguage;
+  fileName?: string;
+  stdin: string;
+}
+
+interface InvalidExecutionRequest {
+  ok: false;
+  code: string;
+  message: string;
+}
+
+function validateExecutionPayload(
+  body: any,
+  opts: { allowEmptyCode?: boolean; maxCodeChars?: number } = {}
+): ValidatedExecutionRequest | InvalidExecutionRequest {
+  const rawLang = body?.language;
+  let language: SupportedLanguage = 'javascript';
+  if (rawLang !== undefined) {
+    if (typeof rawLang !== 'string' || !SUPPORTED_LANGUAGES.includes(rawLang as SupportedLanguage)) {
+      return {
+        ok: false,
+        code: 'UNSUPPORTED_LANGUAGE',
+        message: `Unsupported language "${String(rawLang)}". Supported languages: java, javascript, cpp, python.`,
+      };
+    }
+    language = rawLang as SupportedLanguage;
+  }
+
+  if (body?.code !== undefined && typeof body.code !== 'string') {
+    return { ok: false, code: 'INVALID_CODE', message: 'Source code must be a string.' };
+  }
+  const code = typeof body?.code === 'string' ? body.code : '';
+  const maxCodeChars = opts.maxCodeChars ?? MAX_EXEC_CODE_CHARS;
+  if (!opts.allowEmptyCode && !code.trim()) {
+    return {
+      ok: false,
+      code: 'EMPTY_CODE',
+      message: 'Please provide non-empty code to execute.',
+    };
+  }
+  if (code.length > maxCodeChars) {
+    return {
+      ok: false,
+      code: 'CODE_TOO_LONG',
+      message: `Source code exceeds maximum allowed size (${maxCodeChars} characters).`,
+    };
+  }
+
+  if (body?.stdin !== undefined && body?.stdin !== null && typeof body.stdin !== 'string') {
+    return { ok: false, code: 'INVALID_STDIN', message: 'STDIN input must be a string.' };
+  }
+  const stdin = typeof body?.stdin === 'string' ? body.stdin : '';
+  if (stdin.length > MAX_STDIN_CHARS) {
+    return {
+      ok: false,
+      code: 'STDIN_TOO_LONG',
+      message: `STDIN input exceeds maximum allowed size (${MAX_STDIN_CHARS} characters).`,
+    };
+  }
+
+  let validatedFileName: string | undefined;
+  if (body?.fileName !== undefined && body?.fileName !== null) {
+    if (typeof body.fileName !== 'string') {
+      return { ok: false, code: 'INVALID_FILENAME', message: 'fileName must be a string.' };
+    }
+    const fnCheck = validateSourceFileName(body.fileName, LANGUAGE_ALLOWED_EXTS[language]);
+    if (!fnCheck.valid) {
+      return {
+        ok: false,
+        code: 'INVALID_FILENAME',
+        message: fnCheck.error || 'Invalid filename for selected language.',
+      };
+    }
+    validatedFileName = fnCheck.sanitized;
+  }
+
+  return {
+    ok: true,
+    code,
+    language,
+    fileName: validatedFileName,
+    stdin,
+  };
+}
 
 const TraceRequestSchema = z.object({
   code: z.string().min(1, 'Code cannot be empty'),
@@ -367,6 +472,23 @@ apiRouter.post('/trace', traceRateLimiter, async (req: Request, res: Response) =
     });
   }
 
+  if (parsed.data.fileName !== undefined) {
+    const fnCheck = validateSourceFileName(
+      parsed.data.fileName,
+      LANGUAGE_ALLOWED_EXTS[parsed.data.language]
+    );
+    if (!fnCheck.valid) {
+      return res.status(400).json({
+        error: {
+          code: 'INVALID_FILENAME',
+          message_bn: 'অবৈধ ফাইল নাম বা ফাইল এক্সটেনশন।',
+          message_en: fnCheck.error || 'Invalid filename for selected language.',
+        },
+      });
+    }
+    parsed.data.fileName = fnCheck.sanitized;
+  }
+
   try {
     const result = await generateExecutionTrace(parsed.data);
     return res.json(result);
@@ -392,19 +514,36 @@ apiRouter.post('/cache/clear', (_req: Request, res: Response) => {
 
 // Real-time Code Analysis Endpoint (/api/analyze)
 apiRouter.post('/analyze', traceRateLimiter, async (req: Request, res: Response) => {
-  const code = typeof req.body?.code === 'string' ? req.body.code : '';
-  const language: SupportedLanguage = req.body?.language || 'javascript';
-  const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
+  const validation = validateExecutionPayload(req.body, { allowEmptyCode: true });
+  if (!validation.ok) {
+    return res.status(400).json({
+      canCompile: false,
+      diagnostics: [
+        {
+          line: 1,
+          severity: 'error' as const,
+          message: validation.message,
+          source: typeof req.body?.language === 'string' ? req.body.language : 'validation',
+        },
+      ],
+      error: {
+        code: validation.code,
+        message_en: validation.message,
+      },
+      language: req.body?.language || 'javascript',
+    });
+  }
 
+  const { code, language, fileName } = validation;
   if (!code.trim()) {
-    return res.json({ canCompile: true, diagnostics: [], language });
+    return res.json({ canCompile: true, diagnostics: [], language, fileName });
   }
 
   try {
     const analysis = await analyzeCode(code, language, fileName);
-    return res.json(analysis);
+    return res.json({ ...analysis, fileName });
   } catch (err: any) {
-    return res.json({
+    return res.status(500).json({
       canCompile: false,
       diagnostics: [
         {
@@ -415,6 +554,7 @@ apiRouter.post('/analyze', traceRateLimiter, async (req: Request, res: Response)
         },
       ],
       language,
+      fileName,
     });
   }
 });
@@ -422,30 +562,26 @@ apiRouter.post('/analyze', traceRateLimiter, async (req: Request, res: Response)
 // Sandboxed Real Execution Endpoint (/api/execute)
 apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response) => {
   const execStartedAt = Date.now();
-  const code = typeof req.body?.code === 'string' ? req.body.code : '';
-  const rawLang = req.body?.language;
-  const language: SupportedLanguage =
-    rawLang === 'python' || rawLang === 'cpp' || rawLang === 'java' || rawLang === 'javascript'
-      ? rawLang
-      : 'javascript';
-  const stdin = typeof req.body?.stdin === 'string' ? req.body.stdin : '';
-  const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
-
-  if (!code.trim()) {
+  const validation = validateExecutionPayload(req.body, { allowEmptyCode: false });
+  if (!validation.ok) {
     return res.status(400).json({
       success: false,
       stdout: '',
-      stderr: 'Please provide non-empty code to execute.',
+      stderr: validation.message,
       exitCode: 1,
       executionTimeMs: 0,
       error: {
-        code: 'EMPTY_CODE',
-        message_bn: 'চালানোর জন্য কোড লিখুন।',
-        message_en: 'Please provide non-empty code to execute.',
+        code: validation.code,
+        message_bn:
+          validation.code === 'EMPTY_CODE'
+            ? 'চালানোর জন্য কোড লিখুন।'
+            : 'অনুরোধের তথ্য সঠিক নয়।',
+        message_en: validation.message,
       },
     });
   }
 
+  const { code, language, stdin, fileName } = validation;
   const prep = preprocessCode(code, language);
 
   // 1. Run actual toolchain compilation and sandboxed execution with real stdin piping (zero AI tokens)
@@ -454,16 +590,23 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
   // 2. Run deterministic step simulation for UI visualization compatibility
   const simResult = runDeterministicMultiLanguage(prep.code, language, stdin, 1200);
 
-  // Adjust line numbers if boilerplate lines were prepended
-  if (prep.injectedPrefixLines > 0) {
-    for (const st of simResult.recordedSteps) {
-      st.line = Math.max(1, st.line - prep.injectedPrefixLines);
-    }
+  // Adjust line numbers if boilerplate lines were injected
+  for (const st of simResult.recordedSteps) {
+    st.line = remapPreprocessedLine(st.line, prep);
   }
+
+  // Remap real compiler/runtime diagnostics to the user's original line numbers
+  const remappedToolchainDiagnostics = remapDiagnosticsToOriginal(
+    toolchainRes.diagnostics,
+    prep
+  );
+  const remappedRuntimeErrorLine = toolchainRes.runtimeErrorLine
+    ? remapPreprocessedLine(toolchainRes.runtimeErrorLine, prep)
+    : undefined;
 
   // Combine real compiler/runtime diagnostics with minor preprocessor warnings
   const combinedDiagnostics: ExecutionDiagnostic[] = [
-    ...toolchainRes.diagnostics,
+    ...remappedToolchainDiagnostics,
     ...prep.diagnostics,
   ];
 
@@ -478,15 +621,12 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
     !toolchainRes.timedOut &&
     (toolchainRes.exitCode === 0 || toolchainRes.exitCode === null);
 
-  const output = toolchainRes.output || simResult.stdout || '';
-  const stdout =
-    typeof toolchainRes.stdout === 'string' && (toolchainRes.stdout.length > 0 || !canRun)
-      ? toolchainRes.stdout
-      : simResult.stdout || '';
+  const stdout = typeof toolchainRes.stdout === 'string' ? toolchainRes.stdout : '';
+  const output = toolchainRes.output || stdout;
   const stderr =
     toolchainRes.stderr ||
     toolchainRes.runtimeError ||
-    (!canRun ? output : simResult.stderr || '');
+    (!canRun ? output : '');
   const executionTimeMs = Math.max(
     1,
     toolchainRes.executionTimeMs > 0
@@ -506,33 +646,32 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
     executionTimeMs,
     timedOut: toolchainRes.timedOut,
     runtimeError: toolchainRes.runtimeError,
+    ...(remappedRuntimeErrorLine !== undefined ? { runtimeErrorLine: remappedRuntimeErrorLine } : {}),
     diagnostics: combinedDiagnostics,
     visualizerData: canRun ? simResult : null,
     traceSource: 'real_execution',
     language,
+    fileName,
   });
 });
 
 // Interactive Terminal Execution Endpoints (/api/execute/start, /stream/:sessionId, /input, /stop)
 apiRouter.post('/execute/start', traceRateLimiter, async (req: Request, res: Response) => {
-  const code = typeof req.body?.code === 'string' ? req.body.code : '';
-  const rawLang = req.body?.language;
-  const language: SupportedLanguage =
-    rawLang === 'python' || rawLang === 'cpp' || rawLang === 'java' || rawLang === 'javascript'
-      ? rawLang
-      : 'javascript';
-  const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
-  const stdin = typeof req.body?.stdin === 'string' ? req.body.stdin : '';
-
-  if (!code.trim()) {
+  const validation = validateExecutionPayload(req.body, { allowEmptyCode: false });
+  if (!validation.ok) {
     return res.status(400).json({
       ok: false,
       diagnostics: [],
-      stderr: 'Please provide non-empty code to execute.',
-      runtimeError: 'Please provide non-empty code to execute.',
+      stderr: validation.message,
+      runtimeError: validation.message,
+      error: {
+        code: validation.code,
+        message_en: validation.message,
+      },
     });
   }
 
+  const { code, language, fileName, stdin } = validation;
   const result = await startInteractiveSession(code, language, fileName, stdin);
   if (!result.ok) {
     return res.status(200).json(result);

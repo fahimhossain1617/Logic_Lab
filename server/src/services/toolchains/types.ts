@@ -6,6 +6,7 @@ export interface ToolchainCompileResult {
   stdout: string;
   stderr: string;
   mainClass?: string;
+  sourceFileName?: string;
   executablePath?: string;
   workingDir?: string;
   compilerUnavailable?: boolean;

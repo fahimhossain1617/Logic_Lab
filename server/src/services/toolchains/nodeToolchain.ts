@@ -18,8 +18,8 @@ export function parseNodeDiagnostics(stderr: string, stdout: string): ExecutionD
   const lines = combined.split('\n');
   const diagnostics: ExecutionDiagnostic[] = [];
 
-  // Match: script.js:5
-  const lineMatchRegex = /^.*?[\\/]?([A-Za-z0-9_.-]+\.js):(\d+)$/;
+  // Match any filename (including .mjs/.cjs, spaces, and Unicode): script.js:5 or script.mjs:5:12
+  const lineMatchRegex = /^(?:.*[\\/])?([^\\/:\r\n]+\.(?:js|mjs|cjs)):(\d+)(?::\d+)?$/i;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -50,6 +50,21 @@ export function parseNodeDiagnostics(stderr: string, stdout: string): ExecutionD
         source: 'node',
       });
       break;
+    }
+  }
+
+  // Fallback if Node emitted an unhandled SyntaxError/Error without the standard file:line header
+  if (diagnostics.length === 0 && stderr.trim()) {
+    const errLine = lines.find((l) =>
+      /^(?:SyntaxError|ReferenceError|TypeError|RangeError|Error):/.test(l.trim())
+    );
+    if (errLine) {
+      diagnostics.push({
+        line: 1,
+        severity: 'error',
+        message: errLine.trim(),
+        source: 'node',
+      });
     }
   }
 
@@ -137,17 +152,22 @@ export async function executeJs(
 
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
-    } else if (runRes.exitCode !== 0 && runRes.stderr) {
-      runtimeError = runRes.stderr.trim();
-      const lineMatch = runRes.stderr.match(/^[\\/]?.*\.js:(\d+)/m);
-      if (lineMatch) {
-        runtimeErrorLine = parseInt(lineMatch[1], 10);
+    } else if (runRes.exitCode !== 0 && runRes.exitCode !== null) {
+      runtimeError =
+        runRes.stderr.trim() || `Node.js process exited with error code ${runRes.exitCode}.`;
+      const escapedFile = sourceFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const fileMatch = runRes.stderr.match(new RegExp(`${escapedFile}:(\\d+)`, 'm'));
+      const genericMatch = runRes.stderr.match(/([^\\/:(\r\n]+\.(?:js|mjs|cjs)):(\d+)/m);
+      if (fileMatch) {
+        runtimeErrorLine = parseInt(fileMatch[1], 10);
+      } else if (genericMatch) {
+        runtimeErrorLine = parseInt(genericMatch[2], 10);
       }
     }
 
     const hasWarnings = syntaxRes.diagnostics.some((d) => d.severity === 'warning');
     const status: 'success' | 'warning' | 'error' =
-      runRes.timedOut || (runRes.exitCode !== 0 && Boolean(runtimeError))
+      runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
         ? 'error'
         : hasWarnings
         ? 'warning'

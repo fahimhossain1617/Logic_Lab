@@ -1125,6 +1125,134 @@ export const useLabStore = create<LabState>((set, get) => ({
     }
 
     const startedAt = Date.now();
+    const runStaticFallback = async (fallbackErr?: string) => {
+      try {
+        const fbRes = await fetch('/api/execute', {
+          method: 'POST',
+          signal: controller.signal,
+          cache: 'no-store',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-uid': user?.uid || 'guest-local',
+          },
+          body: JSON.stringify({ code, language, stdin, fileName }),
+        });
+        const fbRaw = await fbRes.text();
+        let fbData: any = null;
+        try {
+          fbData = fbRaw ? JSON.parse(fbRaw) : null;
+        } catch {
+          fbData = null;
+        }
+        if (!fbData) throw new Error(fallbackErr || 'Execution server returned non-JSON response.');
+
+        const executionTimeMs =
+          typeof fbData.executionTimeMs === 'number'
+            ? fbData.executionTimeMs
+            : Math.max(1, Date.now() - startedAt);
+        const success = Boolean(
+          fbData.success ?? (fbRes.ok && fbData.status !== 'error' && fbData.canRun !== false)
+        );
+        const stdout = typeof fbData.stdout === 'string' ? fbData.stdout : String(fbData.output || '');
+        const stderr =
+          typeof fbData.stderr === 'string' && fbData.stderr
+            ? fbData.stderr
+            : !success
+            ? String(fbData.runtimeError || fbData.output || fbData.error?.message_en || 'Execution error')
+            : '';
+        const exitCode = typeof fbData.exitCode === 'number' ? fbData.exitCode : success ? 0 : 1;
+        const fbDiags: ExecutionDiagnostic[] = Array.isArray(fbData.diagnostics)
+          ? fbData.diagnostics
+          : [];
+
+        const fastRes: FastExecutionResult = {
+          success,
+          stdout,
+          stderr,
+          exitCode,
+          executionTimeMs,
+          timedOut: Boolean(fbData.timedOut),
+          language,
+          stdinUsed: stdin,
+          timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+          diagnostics: fbDiags,
+        };
+
+        const lines: TerminalLine[] = [];
+        if (stdout) {
+          stdout
+            .replace(/\r\n/g, '\n')
+            .split('\n')
+            .forEach((t: string) => {
+              lines.push({ id: makeTerminalLineId(), type: 'output', text: t });
+            });
+        }
+        if (stderr) {
+          stderr
+            .replace(/\r\n/g, '\n')
+            .split('\n')
+            .forEach((t: string) => {
+              lines.push({ id: makeTerminalLineId(), type: 'error', text: t });
+            });
+        }
+
+        const fastHasError = !success || fbDiags.some((d) => d.severity === 'error');
+        const fastHasWarning = !fastHasError && fbDiags.some((d) => d.severity === 'warning');
+        const fastExecStatus: ExecutionStatus = fastHasError
+          ? 'error'
+          : fastHasWarning
+          ? 'warning'
+          : 'success';
+
+        set({
+          isFastRunning: false,
+          activeSessionId: null,
+          currentPrompt: '',
+          currentInputValue: '',
+          terminalExecState: success ? 'COMPLETED' : 'ERROR',
+          terminalHistory: lines,
+          fastRunResult: fastRes,
+          diagnostics: fbDiags,
+          executionStatus: fastExecStatus,
+        });
+
+        const currentUser = get().user;
+        if (currentUser && !currentUser.isDemo) {
+          const record: CodeExecutionRecord = {
+            id: `exec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            userId: currentUser.uid,
+            language,
+            source_code: code,
+            stdin_input: stdin,
+            stdout_output: stdout,
+            stderr_output: stderr,
+            exit_code: exitCode,
+            execution_mode: 'fast',
+            execution_time_ms: executionTimeMs,
+            success,
+            file_name: fileName,
+            created_at: new Date().toISOString(),
+          };
+          set({ recentExecutions: [record, ...get().recentExecutions].slice(0, 30) });
+          void fetch('/api/executions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-user-uid': currentUser.uid },
+            body: JSON.stringify(record),
+          }).catch(() => {});
+          void saveCodeExecutionToFirestore(currentUser.uid, record).catch(() => {});
+        }
+      } catch (fbErr: any) {
+        const errMsg = fbErr?.message || fallbackErr || 'Failed to execute code.';
+        set({
+          isFastRunning: false,
+          activeSessionId: null,
+          terminalExecState: 'ERROR',
+          executionStatus: 'error',
+          terminalHistory: [{ id: makeTerminalLineId(), type: 'error', text: errMsg }],
+        });
+      }
+    };
+
     try {
       const res = await fetch('/api/execute/start', {
         method: 'POST',
@@ -1137,8 +1265,20 @@ export const useLabStore = create<LabState>((set, get) => ({
         body: JSON.stringify({ code, language, fileName }),
       });
 
-      const data = await res.json();
+      let data: any = null;
+      try {
+        const raw = await res.text();
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        data = null;
+      }
+
       if (controller.signal.aborted) return;
+
+      if (!res.ok || !data) {
+        await runStaticFallback();
+        return;
+      }
 
       const diagnostics: ExecutionDiagnostic[] = Array.isArray(data.diagnostics)
         ? data.diagnostics

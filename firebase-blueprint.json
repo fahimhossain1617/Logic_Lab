@@ -237,6 +237,69 @@
         }
       },
       "required": ["title_bn", "title_en", "topic", "difficulty", "analogyType"]
+    },
+    "CodeExecution": {
+      "title": "CodeExecution",
+      "description": "Logged code execution run (fast or AI explain) with stdin, stdout, mode, and runtime duration.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "language": {
+          "type": "string",
+          "enum": ["javascript", "python", "cpp", "java"]
+        },
+        "source_code": {
+          "type": "string",
+          "maxLength": 20000
+        },
+        "stdin_input": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "stdout_output": {
+          "type": "string",
+          "maxLength": 20000
+        },
+        "stderr_output": {
+          "type": "string",
+          "maxLength": 10000
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "execution_mode": {
+          "type": "string",
+          "enum": ["fast", "explain"]
+        },
+        "execution_time_ms": {
+          "type": "number"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "file_name": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "language",
+        "source_code",
+        "stdin_input",
+        "stdout_output",
+        "execution_mode",
+        "execution_time_ms",
+        "createdAt"
+      ]
     }
   },
   "firestore": {
@@ -251,6 +314,10 @@
     "/users/{uid}/history/{historyId}": {
       "schema": { "$ref": "#/entities/HistoryEntry" },
       "description": "User's visualization run history."
+    },
+    "/users/{uid}/code_executions/{executionId}": {
+      "schema": { "$ref": "#/entities/CodeExecution" },
+      "description": "User's logged fast and AI explain code execution runs."
     },
     "/users/{uid}/progress/{docId}": {
       "schema": { "$ref": "#/entities/UserProgress" },

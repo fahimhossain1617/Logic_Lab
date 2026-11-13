@@ -665,11 +665,9 @@ export const SettingsView: React.FC = () => {
     setTheme,
     setExplainLanguage,
     setDepth,
-    setSpeed,
     setReduceMotion,
     setEditorFontSize,
-    signInWithGoogle,
-    signInDemoStudent,
+    openLoginPage,
     signOutUser,
     migrateGuestToAccount,
   } = useLabStore();
@@ -705,26 +703,16 @@ export const SettingsView: React.FC = () => {
 
           <div className="flex flex-wrap items-center gap-2">
             {!user ? (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void signInWithGoogle()}
-                  className="ll-btn-primary px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-2 cursor-pointer"
-                >
-                  <LogIn className="w-3.5 h-3.5" />
-                  <span lang={explainLanguage}>
-                    {explainLanguage === 'bn' ? 'Google দিয়ে সাইন ইন' : 'Sign in with Google'}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={signInDemoStudent}
-                  data-testid="demo-signin-btn"
-                  className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-primary)] hover:border-[#A3C1FF] cursor-pointer"
-                >
-                  {explainLanguage === 'bn' ? 'ডেমো স্টুডেন্ট সাইন ইন' : 'Instant Demo Account'}
-                </button>
-              </>
+              <button
+                type="button"
+                onClick={openLoginPage}
+                className="ll-btn-primary px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-2 cursor-pointer"
+              >
+                <LogIn className="w-3.5 h-3.5" />
+                <span lang={explainLanguage}>
+                  {explainLanguage === 'bn' ? 'Google দিয়ে লগইন করুন' : 'Login with Google'}
+                </span>
+              </button>
             ) : (
               <>
                 {!guestWorkMigrated && (
@@ -883,11 +871,11 @@ export const SettingsView: React.FC = () => {
           />
         </div>
 
-        {/* Font Size & Speed */}
+        {/* Font Size */}
         <div className="flex flex-wrap items-center justify-between gap-4 pt-4 border-t border-[var(--border-subtle)]">
           <div>
             <div className="font-semibold text-sm text-[var(--text-primary)]">
-              {explainLanguage === 'bn' ? 'এডিটর ফন্ট সাইজ' : 'Editor Font Size'}: {editorFontSize}px · Speed: {speed}x
+              {explainLanguage === 'bn' ? 'এডিটর ফন্ট সাইজ' : 'Editor Font Size'}: {editorFontSize}px
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -903,20 +891,6 @@ export const SettingsView: React.FC = () => {
                 }`}
               >
                 {sz}px
-              </button>
-            ))}
-            {[0.5, 1, 2].map((sp) => (
-              <button
-                key={sp}
-                type="button"
-                onClick={() => setSpeed(sp)}
-                className={`px-2.5 py-1 rounded-lg font-mono text-xs cursor-pointer ${
-                  speed === sp
-                    ? 'bg-[#4ADE9B] text-[#070A1A] font-bold'
-                    : 'bg-[var(--bg-gutter)] text-[var(--text-secondary)]'
-                }`}
-              >
-                {sp}x
               </button>
             ))}
           </div>

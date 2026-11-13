@@ -1,9 +1,28 @@
-import React, { useEffect } from 'react';
+import React, { useState } from 'react';
 import { useLabStore } from '../../store/useLabStore';
-import { StageCanvas } from '../stage/StageCanvas';
 import { FormattedText } from '../common/FormattedText';
-import { getStepDurationMs } from '../../utils/playerLogic';
-import { Play, Pause, SkipBack, SkipForward, RotateCcw, BookOpen, Layers } from 'lucide-react';
+import {
+  BookOpen,
+  ListOrdered,
+  Lightbulb,
+  ArrowRight,
+} from 'lucide-react';
+
+function getActionBadgeClasses(tag: string): string {
+  const t = tag.toUpperCase();
+  if (t === 'OUTPUT') return 'bg-[#10B981]/15 text-[var(--text-success)]';
+  if (t === 'COMPARISON' || t === 'CONDITION' || t === 'CONDITION_CHECK') {
+    return 'bg-[#F59E0B]/15 text-[var(--text-warning)]';
+  }
+  if (t === 'LOOP' || t === 'LOOP_CHECK') return 'bg-[#8B5CF6]/15 text-[#A78BFA]';
+  if (t === 'ALLOCATION' || t === 'DECLARATION' || t === 'DECLARE') {
+    return 'bg-[#3B82F6]/15 text-[var(--text-accent)]';
+  }
+  if (t === 'RETURN' || t === 'SCOPE_END' || t === 'BLOCK_END') {
+    return 'bg-[var(--bg-gutter)] text-[var(--text-muted)]';
+  }
+  return 'bg-[var(--bg-gutter)] text-[var(--text-secondary)]';
+}
 
 export const LineByLineWorkspace: React.FC = () => {
   const {
@@ -12,31 +31,14 @@ export const LineByLineWorkspace: React.FC = () => {
     apiError,
     trace,
     explainLanguage,
-    activeResultTab,
     currentStepIndex,
-    isPlaying,
-    speed,
-    setActiveResultTab,
     goToStep,
-    togglePlay,
-    nextStep,
-    prevStep,
-    resetPlayback,
-    setSpeed,
     setHoveredVariable,
   } = useLabStore();
 
-  // Playback timer when in animation mode
-  useEffect(() => {
-    if (!isPlaying || trace.steps.length === 0) return;
-    const intervalMs = getStepDurationMs(speed);
-    const timer = setInterval(() => {
-      nextStep();
-    }, intervalMs);
-    return () => clearInterval(timer);
-  }, [isPlaying, speed, nextStep, trace.steps.length]);
+  const [breakdownTab, setBreakdownTab] = useState<'steps' | 'lines' | 'summary'>('steps');
 
-  // Do not show explanation or animation if code has not been executed or if it has syntax/compile errors
+  // Do not render breakdown when not yet executed or on compile/syntax error
   if (
     !hasExecuted ||
     Boolean(apiError) ||
@@ -48,12 +50,8 @@ export const LineByLineWorkspace: React.FC = () => {
 
   const codeLines = code.split('\n');
   const activeStep = trace.steps[currentStepIndex] || trace.steps[0];
-  const activeCodeLineText =
-    activeStep && codeLines[activeStep.activeLine - 1]
-      ? codeLines[activeStep.activeLine - 1].trim()
-      : '';
 
-  // Build complete line-by-line documentation entries for every non-empty line in the user's code
+  // Build line-by-line reference entries for every non-empty line in the user's code
   const lineBreakdownItems = codeLines
     .map((rawLine, idx) => {
       const lineNumber = idx + 1;
@@ -67,269 +65,235 @@ export const LineByLineWorkspace: React.FC = () => {
         ? trace.steps.findIndex((s) => s.stepIndex === firstStep.stepIndex)
         : -1;
 
-      const changes = matchingSteps.flatMap((s) => s.changes || []);
-
       return {
         lineNumber,
         codeText: trimmed,
-        role: note?.role || firstStep?.action || 'statement',
+        role: (note?.role || firstStep?.actionType || firstStep?.action || 'statement').toUpperCase(),
         whatText:
           note?.text ||
+          firstStep?.whatHappened ||
           firstStep?.explanation ||
           (explainLanguage === 'bn'
             ? `লাইন ${lineNumber} (\`${trimmed}\`) এক্সিকিউট হয়েছে।`
             : `Line ${lineNumber} (\`${trimmed}\`) executed.`),
         whyText:
           note?.why ||
+          firstStep?.whyAndLogic ||
           firstStep?.why ||
           (explainLanguage === 'bn'
-            ? 'প্রোগ্রামের চূড়ান্ত ফলাফলে পৌঁছানোর জন্য এই লাইনটি মেমোরি বা নিয়ন্ত্রণ প্রবাহ এগিয়ে নেয়।'
-            : 'Advances the program state toward the final output.'),
-        changes,
+            ? 'প্রোগ্রামের চূড়ান্ত ফলাফলে পৌঁছানোর জন্য এই লাইনটি স্টেট এগিয়ে নেয়।'
+            : 'Advances program state toward the final output.'),
         executionCount: matchingSteps.length,
         firstStepIdx,
       };
     })
     .filter((item): item is NonNullable<typeof item> => item !== null);
 
-  const speeds = [0.5, 1, 1.5, 2];
-
   return (
     <section
-      className="ll-panel rounded-2xl overflow-hidden"
+      className="pt-6 border-t border-[var(--border-subtle)] space-y-4"
       aria-label={
         explainLanguage === 'bn'
-          ? 'লাইন বাই লাইন ব্যাখ্যা ও অ্যানিমেশন'
-          : 'Line-by-Line Explanation and Animation'
+          ? 'স্টেপ-বাই-স্টেপ টাইমলাইন ও লাইন-বাই-লাইন লজিক ব্যাখ্যা'
+          : 'Step-by-Step Timeline & Line-by-Line Logic Breakdown'
       }
       data-testid="line-by-line-workspace"
     >
-      {/* Top Mode Switcher Bar: Explanation vs Line-by-Line Animation */}
-      <div className="flex flex-wrap items-center justify-between gap-3 sm:gap-4 px-4 sm:px-7 py-3.5 bg-[var(--bg-gutter)] border-b border-[var(--border-subtle)]">
-        <div
-          className="flex items-center gap-2.5"
-          role="tablist"
-          aria-label={explainLanguage === 'bn' ? 'বিশ্লেষণ মোড' : 'Analysis Mode'}
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeResultTab === 'explanation'}
-            onClick={() => setActiveResultTab('explanation')}
-            data-testid="tab-explanation-btn"
-            className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
-              activeResultTab === 'explanation'
-                ? 'bg-blue-600 text-white shadow-sm'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
-            }`}
+      {/* Breakdown Section Header Tabs (Clean horizontal hairline tabs) */}
+      <div>
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[var(--border-subtle)]">
+          <div
+            className="flex flex-wrap items-center gap-2"
+            role="tablist"
+            aria-label={explainLanguage === 'bn' ? 'বিশ্লেষণ ট্যাব' : 'Breakdown Tabs'}
           >
-            <BookOpen className="w-4 h-4" />
-            <span lang={explainLanguage}>
-              {explainLanguage === 'bn' ? 'ব্যাখ্যা' : 'Explanation'}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeResultTab === 'animation'}
-            onClick={() => setActiveResultTab('animation')}
-            data-testid="tab-animation-btn"
-            className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
-              activeResultTab === 'animation'
-                ? 'bg-blue-600 text-white shadow-sm'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
-            }`}
-          >
-            <Layers className="w-4 h-4" />
-            <span lang={explainLanguage}>
-              {explainLanguage === 'bn' ? 'অ্যানিমেশন' : 'Animation'}
-            </span>
-          </button>
-        </div>
-
-        <div className="text-xs font-mono text-[var(--text-secondary)]">
-          {explainLanguage === 'bn'
-            ? `${lineBreakdownItems.length}টি কোড লাইন · ${trace.steps.length}টি এক্সিকিউশন ধাপ`
-            : `${lineBreakdownItems.length} code lines · ${trace.steps.length} execution steps`}
-        </div>
-      </div>
-
-      {/* TAB 1: UNIFIED SINGLE-CONTAINER EXPLANATION SEPARATED BY HORIZONTAL LINES */}
-      {activeResultTab === 'explanation' && (
-        <div
-          className="divide-y divide-[var(--border-subtle)]"
-          data-testid="explanation-view-content"
-        >
-          {/* Section 1: Core AI Logic Summary */}
-          <div className="px-5 sm:px-8 py-6 space-y-4">
-            <div className="flex flex-wrap items-baseline justify-between gap-3">
-              <h2
-                lang={explainLanguage}
-                className="text-base sm:text-lg font-bold text-[var(--text-primary)] m-0"
-              >
-                {trace.logicSummary.title ||
-                  (explainLanguage === 'bn'
-                    ? 'লজিক বিল্ডিং ও প্রোগ্রামের সারসংক্ষেপ'
-                    : 'Logic Building & Program Summary')}
-              </h2>
-              <div className="flex items-center gap-3 text-xs font-mono text-[var(--text-secondary)]">
-                <span>Time: {trace.logicSummary.complexity.time}</span>
-                <span aria-hidden="true">·</span>
-                <span>Space: {trace.logicSummary.complexity.space}</span>
-              </div>
-            </div>
-
-            <div className="space-y-3 text-sm sm:text-base text-[var(--text-primary)] leading-relaxed">
-              <p lang={explainLanguage} className="m-0">
-                <strong className="text-[var(--text-accent)] mr-2">
-                  {explainLanguage === 'bn' ? 'প্রোগ্রামের লক্ষ্য:' : 'Program Goal:'}
-                </strong>
-                <FormattedText text={trace.logicSummary.goal} lang={explainLanguage} />
-              </p>
-
-              <p lang={explainLanguage} className="m-0">
-                <strong className="text-[var(--text-success)] mr-2">
-                  {explainLanguage === 'bn'
-                    ? 'কীভাবে লজিক কাজ করে:'
-                    : 'How the Logic Works:'}
-                </strong>
-                <FormattedText text={trace.logicSummary.idea} lang={explainLanguage} />
-              </p>
-
-              {trace.logicSummary.analogyStory && (
-                <p lang={explainLanguage} className="m-0 text-[var(--text-secondary)]">
-                  <strong className="text-[var(--text-primary)] mr-2">
-                    {explainLanguage === 'bn' ? 'বাস্তব উদাহরণ:' : 'Real-World Analogy:'}
-                  </strong>
-                  <FormattedText
-                    text={trace.logicSummary.analogyStory}
-                    lang={explainLanguage}
-                  />
-                </p>
-              )}
-            </div>
-          </div>
-
-          {/* Section 2: Step-by-Step Execution Flow Header */}
-          <div className="px-5 sm:px-8 py-3.5 bg-[var(--bg-gutter)]/35 flex flex-wrap items-center justify-between gap-3">
-            <h3
-              lang={explainLanguage}
-              className="text-xs sm:text-sm font-bold text-[var(--text-primary)] m-0"
-            >
-              {explainLanguage === 'bn'
-                ? 'ধাপে ধাপে এক্সিকিউশন ও লাইন বাই লাইন ব্যাখ্যা'
-                : 'Step-by-Step Execution & Line-by-Line Breakdown'}
-            </h3>
             <button
               type="button"
-              onClick={() => setActiveResultTab('animation')}
-              className="text-xs font-semibold text-[var(--text-accent)] hover:underline cursor-pointer inline-flex items-center gap-1.5"
+              role="tab"
+              aria-selected={breakdownTab === 'steps'}
+              onClick={() => setBreakdownTab('steps')}
+              data-testid="tab-explanation-btn"
+              className={`px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer inline-flex items-center gap-1.5 ${
+                breakdownTab === 'steps'
+                  ? 'bg-[var(--accent-primary)] text-white'
+                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
             >
-              <span>{explainLanguage === 'bn' ? '৩ডি অ্যানিমেশন দেখুন' : 'Open 3D Animation'}</span>
-              <span>→</span>
+              <ListOrdered className="w-4 h-4" />
+              <span lang={explainLanguage}>
+                {explainLanguage === 'bn' ? 'ধাপে ধাপে এক্সিকিউশন' : 'Step-by-Step Execution'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              role="tab"
+              aria-selected={breakdownTab === 'lines'}
+              onClick={() => setBreakdownTab('lines')}
+              data-testid="tab-animation-btn"
+              className={`px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer inline-flex items-center gap-1.5 ${
+                breakdownTab === 'lines'
+                  ? 'bg-[var(--accent-primary)] text-white'
+                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              <BookOpen className="w-4 h-4" />
+              <span lang={explainLanguage}>
+                {explainLanguage === 'bn' ? 'লাইন বাই লাইন রেফারেন্স' : 'Line-by-Line Reference'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              role="tab"
+              aria-selected={breakdownTab === 'summary'}
+              onClick={() => setBreakdownTab('summary')}
+              data-testid="tab-summary-btn"
+              className={`px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors cursor-pointer inline-flex items-center gap-1.5 ${
+                breakdownTab === 'summary'
+                  ? 'bg-[var(--accent-primary)] text-white'
+                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              <Lightbulb className="w-4 h-4" />
+              <span lang={explainLanguage}>
+                {explainLanguage === 'bn' ? 'লজিক সারসংক্ষেপ' : 'Logic Summary'}
+              </span>
             </button>
           </div>
 
-          {/* Section 3: Every Execution Step separated cleanly by a horizontal rule (No boxy cards) */}
-          <div className="divide-y divide-[var(--border-subtle)]">
+          <div className="text-xs font-mono text-[var(--text-muted)]">
+            {explainLanguage === 'bn'
+              ? `${lineBreakdownItems.length}টি লাইন · ${trace.steps.length}টি ধাপ`
+              : `${lineBreakdownItems.length} lines · ${trace.steps.length} steps`}
+          </div>
+        </div>
+
+        {/* TAB A: Step-by-Step Execution Horizontal Rows (Borderless, thin 1px dividers) */}
+        {breakdownTab === 'steps' && (
+          <div className="divide-y divide-[var(--border-subtle)]" data-testid="explanation-view-content">
             {trace.steps.map((stepItem, idx) => {
+              const isSelected = idx === currentStepIndex;
               const stepLineCode =
                 stepItem.codeSnippet ||
                 codeLines[stepItem.activeLine - 1]?.trim() ||
                 `Line ${stepItem.activeLine}`;
-              const badgeAction = stepItem.actionType || stepItem.action.toUpperCase();
+              const badgeAction = (stepItem.actionType || stepItem.action).toUpperCase();
+
               return (
                 <div
                   key={stepItem.stepIndex}
-                  className="px-5 sm:px-8 py-5 space-y-3 transition-colors hover:bg-[var(--bg-gutter)]/20"
+                  onClick={() => goToStep(idx)}
+                  className={`py-4 px-2 sm:px-3 transition-colors cursor-pointer space-y-2 ${
+                    isSelected
+                      ? 'bg-[var(--code-pill-bg)]/50 border-l-2 border-l-[var(--accent-primary)]'
+                      : 'hover:bg-[var(--bg-panel)]/70 border-l-2 border-l-transparent'
+                  }`}
                   data-testid={`explanation-step-row-${idx + 1}`}
                 >
+                  {/* Top Horizontal Row: Step # + Line # + AST Tag + Code + Sync Button */}
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex flex-wrap items-center gap-3 min-w-0">
+                    <div className="flex flex-wrap items-center gap-2.5 min-w-0">
                       <span className="font-mono text-xs font-bold text-[var(--text-accent)] shrink-0">
                         {explainLanguage === 'bn'
                           ? `ধাপ ${idx + 1} · লাইন ${stepItem.activeLine}`
                           : `Step ${idx + 1} · Line ${stepItem.activeLine}`}
                       </span>
-                      <span className="font-mono text-[11px] font-semibold uppercase px-2 py-0.5 rounded-md bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-muted)] shrink-0">
+                      <span
+                        className={`font-mono text-[11px] font-semibold uppercase px-2 py-0.5 rounded shrink-0 ${getActionBadgeClasses(
+                          badgeAction
+                        )}`}
+                      >
                         {badgeAction}
                       </span>
-                      <span aria-hidden="true" className="text-[var(--text-muted)] select-none">
-                        —
-                      </span>
-                      <code className="font-mono text-xs sm:text-sm font-semibold text-[var(--text-primary)] break-all px-2 py-0.5 rounded bg-[var(--bg-gutter)]/70">
+                      <code className="font-mono text-xs sm:text-sm font-semibold text-[var(--text-primary)] break-all">
                         {stepLineCode}
                       </code>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => {
-                        goToStep(idx);
-                        setActiveResultTab('animation');
-                      }}
-                      className="px-3 py-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-gutter)] hover:border-[#A3C1FF] text-xs font-semibold text-[var(--text-accent)] hover:underline cursor-pointer inline-flex items-center gap-1.5 transition-colors shrink-0"
-                    >
-                      <span>
-                        {explainLanguage === 'bn'
-                          ? `ধাপ ${idx + 1} অ্যানিমেশন`
-                          : `Animate Step ${idx + 1}`}
-                      </span>
-                      <span>→</span>
-                    </button>
+                    <span className="text-xs font-mono text-[var(--text-accent)] inline-flex items-center gap-1 shrink-0">
+                      <span>{isSelected ? (explainLanguage === 'bn' ? 'সক্রিয়' : 'Active') : (explainLanguage === 'bn' ? 'দেখুন' : 'Inspect')}</span>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </span>
                   </div>
 
-                  <p className="text-sm text-[var(--text-primary)] m-0 leading-relaxed" lang={explainLanguage}>
-                    <strong className="text-[var(--text-secondary)] mr-2">
-                      {explainLanguage === 'bn' ? 'কী ঘটল:' : 'What happened:'}
-                    </strong>
-                    <FormattedText
-                      text={stepItem.explanation}
-                      lang={explainLanguage}
-                      onHoverToken={setHoveredVariable}
-                    />
-                  </p>
-
-                  {stepItem.why && (
-                    <p className="text-xs sm:text-sm text-[var(--text-secondary)] m-0 leading-relaxed" lang={explainLanguage}>
-                      <strong className="text-[var(--text-success)] mr-2">
-                        {explainLanguage === 'bn' ? 'কেন দরকার (লজিক):' : 'Why it matters:'}
+                  {/* What Happened & Deep Why/Logic */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs sm:text-sm leading-relaxed">
+                    <p className="text-[var(--text-primary)] m-0" lang={explainLanguage}>
+                      <strong className="text-[var(--text-secondary)] mr-1.5">
+                        {explainLanguage === 'bn' ? 'কী ঘটল:' : 'What happened:'}
                       </strong>
                       <FormattedText
-                        text={stepItem.why}
+                        text={stepItem.whatHappened || stepItem.explanation}
                         lang={explainLanguage}
                         onHoverToken={setHoveredVariable}
                       />
                     </p>
-                  )}
 
+                    {(stepItem.whyAndLogic || stepItem.why) && (
+                      <p className="text-[var(--text-secondary)] m-0" lang={explainLanguage}>
+                        <strong className="text-[var(--text-success)] mr-1.5">
+                          {explainLanguage === 'bn' ? 'লজিক ও কারণ:' : 'Why & Logic:'}
+                        </strong>
+                        <FormattedText
+                          text={stepItem.whyAndLogic || stepItem.why}
+                          lang={explainLanguage}
+                          onHoverToken={setHoveredVariable}
+                        />
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Inline Memory Snapshot / Delta & Stdout */}
                   {((stepItem.changes && stepItem.changes.length > 0) ||
+                    (stepItem.variableSnapshots && stepItem.variableSnapshots.length > 0) ||
                     stepItem.consoleOutput) && (
-                    <div className="flex flex-wrap items-center gap-x-5 gap-y-2 pt-1 font-mono text-xs text-[var(--text-secondary)]">
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-1 font-mono text-xs text-[var(--text-secondary)]">
                       {stepItem.changes && stepItem.changes.length > 0 && (
-                        <>
-                          <span className="text-[var(--text-muted)] font-semibold">
-                            {explainLanguage === 'bn' ? 'মেমোরি ডেল্টা:' : 'Memory delta:'}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-[var(--text-muted)]">
+                            {explainLanguage === 'bn' ? 'পরিবর্তন:' : 'Delta:'}
                           </span>
                           {stepItem.changes.map((chg, cIdx) => (
                             <span
                               key={`${chg.name}-${cIdx}`}
                               onMouseEnter={() => setHoveredVariable(chg.name)}
                               onMouseLeave={() => setHoveredVariable(null)}
-                              className="px-2 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-success)] font-semibold"
+                              className="text-[var(--text-success)] font-semibold"
                             >
                               {chg.name}:{' '}
-                              {chg.from === null || chg.from === undefined
-                                ? 'null'
-                                : String(chg.from)}{' '}
-                              → {String(chg.to)}
+                              {chg.from === null || chg.from === undefined ? '∅' : String(chg.from)} →{' '}
+                              {String(chg.to)}
                             </span>
                           ))}
-                        </>
+                        </div>
                       )}
+
+                      {stepItem.variableSnapshots && stepItem.variableSnapshots.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-[var(--text-muted)]">
+                            {explainLanguage === 'bn' ? 'মেমোরি:' : 'Memory:'}
+                          </span>
+                          {stepItem.variableSnapshots.map((vs) => (
+                            <span
+                              key={vs.name}
+                              onMouseEnter={() => setHoveredVariable(vs.name)}
+                              onMouseLeave={() => setHoveredVariable(null)}
+                              className="px-1.5 py-0.5 rounded bg-[var(--bg-gutter)] text-[var(--text-primary)]"
+                            >
+                              {vs.name}
+                              <span className="text-[var(--text-muted)]">:{vs.type}</span>=
+                              {typeof vs.value === 'object' ? JSON.stringify(vs.value) : String(vs.value)}
+                              {vs.referenceId ? (
+                                <span className="text-[var(--text-accent)] ml-1">{vs.referenceId}</span>
+                              ) : null}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
                       {stepItem.consoleOutput && (
-                        <span className="px-2 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-accent)] font-semibold">
+                        <span className="text-[var(--text-accent)] font-semibold">
                           stdout: {JSON.stringify(stepItem.consoleOutput)}
                         </span>
                       )}
@@ -339,305 +303,146 @@ export const LineByLineWorkspace: React.FC = () => {
               );
             })}
           </div>
+        )}
 
-          {/* Section 4: Line-by-Line Reference (Line 1 to End) separated by horizontal lines */}
-          <div className="px-5 sm:px-8 py-4 bg-[var(--bg-gutter)]/35">
-            <h3
-              lang={explainLanguage}
-              className="text-xs sm:text-sm font-bold text-[var(--text-primary)] m-0"
-            >
-              {explainLanguage === 'bn'
-                ? 'কোডের প্রতিটি লাইনের সারসংক্ষেপ (১ম লাইন থেকে শেষ লাইন)'
-                : 'Line-by-Line Code Reference (Line 1 to End)'}
-            </h3>
-          </div>
-
+        {/* TAB B: Line-by-Line Reference (Line 1 to End, Unboxed horizontal rows) */}
+        {breakdownTab === 'lines' && (
           <div className="divide-y divide-[var(--border-subtle)]">
             {lineBreakdownItems.map((item) => (
               <div
                 key={item.lineNumber}
-                className="px-5 sm:px-8 py-4 space-y-2 hover:bg-[var(--bg-gutter)]/20 transition-colors"
+                onClick={() => {
+                  if (item.firstStepIdx >= 0) goToStep(item.firstStepIdx);
+                }}
+                className={`py-3.5 px-2 sm:px-3 space-y-1.5 transition-colors hover:bg-[var(--bg-panel)]/70 ${
+                  item.firstStepIdx >= 0 ? 'cursor-pointer' : ''
+                }`}
                 data-testid={`explanation-line-row-${item.lineNumber}`}
               >
                 <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex flex-wrap items-center gap-3 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2.5 min-w-0">
                     <span className="font-mono text-xs font-bold text-[var(--text-accent)] shrink-0">
                       {explainLanguage === 'bn'
                         ? `লাইন ${item.lineNumber}`
                         : `Line ${item.lineNumber}`}
                     </span>
-                    <span className="text-[11px] font-mono uppercase px-2 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-muted)]">
+                    <span
+                      className={`text-[11px] font-mono uppercase px-2 py-0.5 rounded font-semibold ${getActionBadgeClasses(
+                        item.role
+                      )}`}
+                    >
                       {item.role}
                     </span>
-                    <code className="font-mono text-xs sm:text-sm font-semibold text-[var(--text-primary)] break-all px-2 py-0.5 rounded bg-[var(--bg-gutter)]/70">
+                    <code className="font-mono text-xs sm:text-sm font-semibold text-[var(--text-primary)] break-all">
                       {item.codeText}
                     </code>
                   </div>
 
                   {item.firstStepIdx >= 0 && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        goToStep(item.firstStepIdx);
-                        setActiveResultTab('animation');
-                      }}
-                      className="px-3 py-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-gutter)] hover:border-[#A3C1FF] text-xs font-semibold text-[var(--text-accent)] hover:underline cursor-pointer inline-flex items-center gap-1.5 transition-colors shrink-0"
-                    >
+                    <span className="text-xs font-mono text-[var(--text-accent)] inline-flex items-center gap-1 shrink-0">
                       <span>
                         {explainLanguage === 'bn'
-                          ? `লাইন ${item.lineNumber} অ্যানিমেশন`
-                          : `Animate Line ${item.lineNumber}`}
+                          ? `ধাপ ${item.firstStepIdx + 1}-এ যান`
+                          : `Jump to Step ${item.firstStepIdx + 1}`}
                       </span>
-                      <span>→</span>
-                    </button>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </span>
                   )}
                 </div>
 
-                <p className="text-sm text-[var(--text-primary)] m-0 leading-relaxed" lang={explainLanguage}>
-                  <FormattedText text={item.whatText} lang={explainLanguage} />
-                </p>
-
-                <p className="text-xs sm:text-sm text-[var(--text-secondary)] m-0 leading-relaxed" lang={explainLanguage}>
-                  <strong className="text-[var(--text-success)] mr-2">
-                    {explainLanguage === 'bn' ? 'লজিক:' : 'Logic:'}
-                  </strong>
-                  <FormattedText text={item.whyText} lang={explainLanguage} />
-                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs sm:text-sm leading-relaxed">
+                  <p className="text-[var(--text-primary)] m-0" lang={explainLanguage}>
+                    <FormattedText text={item.whatText} lang={explainLanguage} />
+                  </p>
+                  <p className="text-[var(--text-secondary)] m-0" lang={explainLanguage}>
+                    <strong className="text-[var(--text-success)] mr-1.5">
+                      {explainLanguage === 'bn' ? 'লজিক:' : 'Logic:'}
+                    </strong>
+                    <FormattedText text={item.whyText} lang={explainLanguage} />
+                  </p>
+                </div>
               </div>
             ))}
           </div>
-        </div>
-      )}
+        )}
 
-      {/* TAB 2: SCROLLABLE LINE-BY-LINE 3D ANIMATION TIMELINE + STAGE */}
-      {activeResultTab === 'animation' && (
-        <div
-          className="divide-y divide-[var(--border-subtle)]"
-          data-testid="animation-view-content"
-        >
-          {/* Step Playback Controls Row */}
-          <div className="flex flex-wrap items-center justify-between gap-3 sm:gap-4 px-4 sm:px-7 py-3.5 bg-[var(--bg-gutter)]/50">
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={prevStep}
-                disabled={currentStepIndex <= 0}
-                className="px-3 sm:px-3.5 py-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-xs font-medium text-[var(--text-primary)] hover:border-[#A3C1FF] disabled:opacity-40 cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
-                aria-label="Previous step"
-                data-testid="anim-prev-btn"
-              >
-                <SkipBack className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">
-                  {explainLanguage === 'bn' ? 'পূর্ববর্তী ধাপ' : 'Prev'}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={togglePlay}
-                className="ll-btn-primary px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-2 cursor-pointer whitespace-nowrap shrink-0"
-                aria-label={isPlaying ? 'Pause animation' : 'Play animation'}
-                data-testid="anim-play-pause-btn"
-              >
-                {isPlaying ? (
-                  <>
-                    <Pause className="w-3.5 h-3.5 fill-current" />
-                    <span>{explainLanguage === 'bn' ? 'বিরতি' : 'Pause'}</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-3.5 h-3.5 fill-current" />
-                    <span>{explainLanguage === 'bn' ? 'অটো প্লে' : 'Auto Play'}</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={nextStep}
-                disabled={currentStepIndex >= trace.steps.length - 1}
-                className="px-3 sm:px-3.5 py-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-xs font-medium text-[var(--text-primary)] hover:border-[#A3C1FF] disabled:opacity-40 cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
-                aria-label="Next step"
-                data-testid="anim-next-btn"
-              >
-                <span className="hidden sm:inline">
-                  {explainLanguage === 'bn' ? 'পরবর্তী ধাপ' : 'Next'}
-                </span>
-                <SkipForward className="w-3.5 h-3.5" />
-              </button>
-
-              <button
-                type="button"
-                onClick={resetPlayback}
-                className="px-3 sm:px-3.5 py-2 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ml-1"
-                aria-label="Reset to step 1"
-                data-testid="anim-reset-btn"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">
-                  {explainLanguage === 'bn' ? 'প্রথম থেকে' : 'Reset'}
-                </span>
-              </button>
-            </div>
-
-            {/* Speed selector */}
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-1 text-xs font-mono">
-                <span className="text-[var(--text-muted)] mr-1.5 font-medium">
-                  {explainLanguage === 'bn' ? 'গতি:' : 'Speed:'}
-                </span>
-                {speeds.map((s) => (
-                  <button
-                    key={s}
-                    type="button"
-                    onClick={() => setSpeed(s)}
-                    className={`px-2.5 py-1 rounded-lg cursor-pointer transition-colors ${
-                      speed === s
-                        ? 'bg-blue-600 text-white font-bold'
-                        : 'text-slate-400 hover:text-white hover:bg-slate-800'
-                    }`}
-                  >
-                    {s}x
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Split Layout: Left Scrollable Step List | Right 3D Stage + Step Explanation */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-[var(--border-subtle)]">
-            {/* Left Column: Unified Scrollable Execution Steps List separated by horizontal lines */}
-            <div
-              className="lg:col-span-5 max-h-[640px] overflow-y-auto divide-y divide-[var(--border-subtle)]"
-              aria-label={
-                explainLanguage === 'bn'
-                  ? 'লাইন বাই লাইন অ্যানিমেশন টাইমলাইন'
-                  : 'Line-by-Line Animation Timeline'
-              }
-              data-testid="line-by-line-timeline-list"
-            >
-              {trace.steps.map((stepItem, idx) => {
-                const isSelected = idx === currentStepIndex;
-                const lineCode =
-                  codeLines[stepItem.activeLine - 1]?.trim() ||
-                  `Line ${stepItem.activeLine}`;
-                const isLastStep = idx === trace.steps.length - 1;
-
-                return (
-                  <button
-                    key={stepItem.stepIndex}
-                    type="button"
-                    onClick={() => goToStep(idx)}
-                    data-testid={`timeline-step-item-${idx}`}
-                    className={`w-full text-left px-5 py-4 transition-colors cursor-pointer block ${
-                      isSelected
-                        ? 'bg-blue-600/15 border-l-4 border-l-blue-500'
-                        : 'hover:bg-slate-800/40 border-l-4 border-l-transparent'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2 mb-1.5">
-                      <span
-                        className={`font-mono text-xs font-bold ${
-                          isSelected ? 'text-[var(--text-accent)]' : 'text-[var(--text-secondary)]'
-                        }`}
-                      >
-                        {explainLanguage === 'bn'
-                          ? `ধাপ ${idx + 1} · লাইন ${stepItem.activeLine}`
-                          : `Step ${idx + 1} · Line ${stepItem.activeLine}`}
-                      </span>
-                      <span className="font-mono text-[10px] uppercase px-2 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-muted)]">
-                        {isLastStep
-                          ? explainLanguage === 'bn'
-                            ? 'চূড়ান্ত ধাপ'
-                            : 'FINAL STEP'
-                          : stepItem.action}
-                      </span>
-                    </div>
-
-                    <div className="font-mono text-xs font-semibold text-[var(--text-primary)] break-all mb-1.5 px-2 py-1 rounded bg-[var(--bg-gutter)]/60">
-                      {lineCode}
-                    </div>
-
-                    <div
-                      className="text-xs text-[var(--text-secondary)] leading-relaxed"
-                      lang={explainLanguage}
-                    >
-                      <FormattedText text={stepItem.explanation} lang={explainLanguage} />
-                    </div>
-
-                    {stepItem.changes && stepItem.changes.length > 0 && (
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 font-mono text-[11px] text-[var(--text-success)]">
-                        {stepItem.changes.map((c, cIdx) => (
-                          <span key={`${c.name}-${cIdx}`} className="px-1.5 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)]">
-                            {c.name}:{' '}
-                            {c.from === null || c.from === undefined
-                              ? '∅'
-                              : String(c.from)}{' '}
-                            → {String(c.to)}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Right Column: Active Line Source Banner + 3D Stage Canvas + Synced Step Explanation */}
-            <div className="lg:col-span-7 flex flex-col justify-between bg-[var(--bg-panel)] divide-y divide-[var(--border-subtle)] min-w-0">
-              {/* Active Executed Code Line Header */}
-              <div className="px-5 sm:px-7 py-3.5 flex flex-wrap items-center justify-between gap-3 bg-[var(--bg-gutter)]/30">
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <span className="font-mono text-xs font-bold text-[var(--text-accent)] shrink-0">
-                    {explainLanguage === 'bn'
-                      ? `সক্রিয় লাইন ${activeStep?.activeLine || 1}:`
-                      : `Active Line ${activeStep?.activeLine || 1}:`}
-                  </span>
-                  <code className="font-mono text-xs sm:text-sm font-semibold text-[var(--text-primary)] break-all px-2 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)]">
-                    {activeCodeLineText || '—'}
-                  </code>
+        {/* TAB C: Core AI Logic Summary (Unboxed hairline sections) */}
+        {breakdownTab === 'summary' && (
+          <div className="divide-y divide-[var(--border-subtle)] py-2">
+            <div className="py-4 space-y-2.5">
+              <div className="flex flex-wrap items-baseline justify-between gap-3">
+                <h2
+                  lang={explainLanguage}
+                  className="text-base sm:text-lg font-bold text-[var(--text-primary)] m-0"
+                >
+                  {trace.logicSummary.title ||
+                    (explainLanguage === 'bn'
+                      ? 'লজিক বিল্ডিং ও প্রোগ্রামের সারসংক্ষেপ'
+                      : 'Logic Building & Program Summary')}
+                </h2>
+                <div className="flex items-center gap-3 text-xs font-mono text-[var(--text-secondary)]">
+                  <span>Time: {trace.logicSummary.complexity.time}</span>
+                  <span>·</span>
+                  <span>Space: {trace.logicSummary.complexity.space}</span>
                 </div>
-                <span className="font-mono text-xs font-semibold px-2 py-0.5 rounded bg-[var(--bg-gutter)] text-[var(--text-muted)] shrink-0">
-                  {currentStepIndex + 1} / {trace.steps.length}
-                </span>
               </div>
 
-              {/* 3D Tactile Stage Canvas */}
-              <div className="p-4 sm:p-7">
-                <StageCanvas />
-              </div>
+              <p lang={explainLanguage} className="text-sm text-[var(--text-primary)] m-0 leading-relaxed">
+                <strong className="text-[var(--text-accent)] mr-2">
+                  {explainLanguage === 'bn' ? 'প্রোগ্রামের লক্ষ্য:' : 'Program Goal:'}
+                </strong>
+                <FormattedText text={trace.logicSummary.goal} lang={explainLanguage} />
+              </p>
 
-              {/* Synced Step-by-Step Explanation Details (Separated by Horizontal Line, No Inner Boxes) */}
-              {activeStep && (
-                <div className="px-5 sm:px-7 py-4.5 space-y-2.5 text-xs sm:text-sm bg-[var(--bg-gutter)]/15">
-                  <p className="m-0 text-[var(--text-primary)] leading-relaxed" lang={explainLanguage}>
-                    <strong className="text-[var(--text-accent)] mr-2">
-                      {explainLanguage === 'bn' ? 'কী ঘটল:' : 'What happened:'}
-                    </strong>
-                    <FormattedText
-                      text={activeStep.explanation}
-                      lang={explainLanguage}
-                      onHoverToken={setHoveredVariable}
-                    />
-                  </p>
-                  {activeStep.why && (
-                    <p className="m-0 text-[var(--text-secondary)] leading-relaxed" lang={explainLanguage}>
-                      <strong className="text-[var(--text-success)] mr-2">
-                        {explainLanguage === 'bn' ? 'কেন দরকার:' : 'Why this matters:'}
-                      </strong>
-                      <FormattedText
-                        text={activeStep.why}
-                        lang={explainLanguage}
-                        onHoverToken={setHoveredVariable}
-                      />
-                    </p>
-                  )}
-                </div>
+              <p lang={explainLanguage} className="text-sm text-[var(--text-primary)] m-0 leading-relaxed">
+                <strong className="text-[var(--text-success)] mr-2">
+                  {explainLanguage === 'bn' ? 'কীভাবে লজিক কাজ করে:' : 'How the Logic Works:'}
+                </strong>
+                <FormattedText text={trace.logicSummary.idea} lang={explainLanguage} />
+              </p>
+
+              {trace.logicSummary.analogyStory && (
+                <p lang={explainLanguage} className="text-sm text-[var(--text-secondary)] m-0 leading-relaxed">
+                  <strong className="text-[var(--text-primary)] mr-2">
+                    {explainLanguage === 'bn' ? 'বাস্তব উদাহরণ:' : 'Real-World Analogy:'}
+                  </strong>
+                  <FormattedText text={trace.logicSummary.analogyStory} lang={explainLanguage} />
+                </p>
               )}
             </div>
+
+            {trace.logicSummary.keyPoints && trace.logicSummary.keyPoints.length > 0 && (
+              <div className="py-4 space-y-1.5">
+                <h3 className="text-xs font-semibold text-[var(--text-secondary)] m-0" lang={explainLanguage}>
+                  {explainLanguage === 'bn' ? 'মূল পয়েন্টসমূহ' : 'Key Takeaways'}
+                </h3>
+                <ul className="m-0 pl-5 space-y-1 text-xs sm:text-sm text-[var(--text-primary)]">
+                  {trace.logicSummary.keyPoints.map((kp, i) => (
+                    <li key={i} lang={explainLanguage}>
+                      <FormattedText text={kp} lang={explainLanguage} />
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {trace.logicSummary.commonMistakes && trace.logicSummary.commonMistakes.length > 0 && (
+              <div className="py-4 space-y-1.5">
+                <h3 className="text-xs font-semibold text-[var(--text-warning)] m-0" lang={explainLanguage}>
+                  {explainLanguage === 'bn' ? 'সাধারণ ভুলগুলো এড়িয়ে চলুন' : 'Common Pitfalls to Avoid'}
+                </h3>
+                <ul className="m-0 pl-5 space-y-1 text-xs sm:text-sm text-[var(--text-secondary)]">
+                  {trace.logicSummary.commonMistakes.map((cm, i) => (
+                    <li key={i} lang={explainLanguage}>
+                      <FormattedText text={cm} lang={explainLanguage} />
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </section>
   );
 };

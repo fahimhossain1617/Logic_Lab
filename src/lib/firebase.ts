@@ -3,11 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type { CodeExecutionRecord } from '../../shared/types';
 import { initializeApp } from 'firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  setPersistence,
+  browserLocalPersistence,
   signOut as firebaseSignOut,
   onAuthStateChanged,
   User,
@@ -62,6 +67,9 @@ export const db = resolvedDatabaseId && resolvedDatabaseId !== '(default)'
   ? getFirestore(app, resolvedDatabaseId)
   : getFirestore(app);
 export const auth = getAuth(app);
+if (typeof window !== 'undefined' && isFirebaseConfigured) {
+  void setPersistence(auth, browserLocalPersistence).catch(() => {});
+}
 
 // Validate connection to Firestore on startup as required by guidelines
 async function testFirestoreConnection() {
@@ -164,24 +172,62 @@ function sanitizeVerdictStatus(
   return 'ok';
 }
 
-export async function signInWithGooglePopup(): Promise<AppUserProfile> {
-  if (!isFirebaseConfigured) {
-    alert(
-      'Firebase কনফিগারেশন পাওয়া যায়নি। ক্লাউড সিঙ্ক ব্যবহার করতে Vercel-এ VITE_FIREBASE_* এনভায়রনমেন্ট ভেরিয়েবলগুলো যুক্ত করুন।'
-    );
-    throw new Error('Firebase configuration missing');
-  }
-  const provider = new GoogleAuthProvider();
-  const result = await signInWithPopup(auth, provider);
-  const user = result.user;
-  const profile: AppUserProfile = {
+function buildUserProfile(user: User): AppUserProfile {
+  return {
     uid: user.uid,
-    displayName: user.displayName || 'Logic Lab Student',
+    displayName: user.displayName || user.email?.split('@')[0] || 'Logic Lab User',
     email: user.email || '',
     photoURL: user.photoURL || '',
   };
-  await syncUserProfileToFirestore(user);
-  return profile;
+}
+
+export async function getFirebaseIdToken(): Promise<string | null> {
+  if (!isFirebaseConfigured || !auth.currentUser) return null;
+  try {
+    return await auth.currentUser.getIdToken();
+  } catch {
+    return null;
+  }
+}
+
+export async function signInWithGooglePopup(): Promise<AppUserProfile | null> {
+  if (!isFirebaseConfigured) {
+    throw new Error('Firebase configuration missing');
+  }
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+
+  try {
+    const result = await signInWithPopup(auth, provider);
+    const user = result.user;
+    const profile = buildUserProfile(user);
+    void syncUserProfileToFirestore(user).catch((err) => {
+      console.warn('Non-fatal Firestore profile sync error:', err);
+    });
+    return profile;
+  } catch (err: any) {
+    if (err?.code === 'auth/popup-blocked') {
+      await signInWithRedirect(auth, provider);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function completeGoogleRedirectSignIn(): Promise<AppUserProfile | null> {
+  if (!isFirebaseConfigured || typeof window === 'undefined') return null;
+  try {
+    const result = await getRedirectResult(auth);
+    if (!result?.user) return null;
+    const profile = buildUserProfile(result.user);
+    void syncUserProfileToFirestore(result.user).catch((err) => {
+      console.warn('Non-fatal Firestore profile sync error:', err);
+    });
+    return profile;
+  } catch (err) {
+    console.warn('Redirect sign-in check notice:', err);
+    return null;
+  }
 }
 
 export async function signOutFirebase(): Promise<void> {
@@ -386,6 +432,44 @@ export async function saveHistoryToFirestore(
   }
 }
 
+export async function deleteHistoryFromFirestore(uid: string, historyId: string): Promise<void> {
+  if (!isFirebaseConfigured || !auth.currentUser || auth.currentUser.uid !== uid) return;
+  const docId = sanitizeId(historyId, 'run');
+  try {
+    await deleteDoc(doc(db, 'users', uid, 'history', docId));
+  } catch (err) {
+    console.warn('Non-fatal Firestore history delete skip:', err);
+  }
+}
+
+export async function clearHistoryFromFirestore(uid: string): Promise<void> {
+  if (!isFirebaseConfigured || !auth.currentUser || auth.currentUser.uid !== uid) return;
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'users', uid, 'history'), where('ownerUid', '==', uid), limit(50))
+    );
+    await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
+  } catch (err) {
+    console.warn('Non-fatal Firestore history clear skip:', err);
+  }
+}
+
+export async function clearCodeExecutionsFromFirestore(uid: string): Promise<void> {
+  if (!isFirebaseConfigured || !auth.currentUser || auth.currentUser.uid !== uid) return;
+  try {
+    const snap = await getDocs(
+      query(
+        collection(db, 'users', uid, 'code_executions'),
+        where('ownerUid', '==', uid),
+        limit(50)
+      )
+    );
+    await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
+  } catch (err) {
+    console.warn('Non-fatal Firestore code_executions clear skip:', err);
+  }
+}
+
 /**
  * Syncs `/users/{uid}/progress/main` strictly matching `isValidUserProgress` in `firestore.rules`:
  * Required/Allowed keys: ['ownerUid', 'streak', 'lastActiveDate', 'completedProblemIds', 'badges', 'topicsCovered', 'updatedAt']
@@ -503,28 +587,123 @@ export async function fetchUserCloudData(uid: string) {
   if (!isFirebaseConfigured || !auth.currentUser || auth.currentUser.uid !== uid) return null;
   try {
     await ensureParentUserExists(uid);
-    const snippetsSnap = await getDocs(
-      query(
-        collection(db, 'users', uid, 'snippets'),
-        where('ownerUid', '==', uid),
-        limit(50)
-      )
-    );
-    const historySnap = await getDocs(
-      query(
-        collection(db, 'users', uid, 'history'),
-        where('ownerUid', '==', uid),
-        limit(30)
-      )
-    );
-    const progressSnap = await getDoc(doc(db, 'users', uid, 'progress', 'main'));
+    const [snippetsRes, historyRes, progressRes] = await Promise.allSettled([
+      getDocs(
+        query(collection(db, 'users', uid, 'snippets'), where('ownerUid', '==', uid), limit(50))
+      ),
+      getDocs(
+        query(collection(db, 'users', uid, 'history'), where('ownerUid', '==', uid), limit(30))
+      ),
+      getDoc(doc(db, 'users', uid, 'progress', 'main')),
+    ]);
 
-    return {
-      snippets: snippetsSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
-      history: historySnap.docs.map((d) => ({ id: d.id, ...d.data() })),
-      progress: progressSnap.exists() ? progressSnap.data() : null,
-    };
+    const snippets =
+      snippetsRes.status === 'fulfilled'
+        ? snippetsRes.value.docs.map((d) => ({ id: d.id, ...d.data() }))
+        : [];
+    const history =
+      historyRes.status === 'fulfilled'
+        ? historyRes.value.docs
+            .map((d) => {
+              const data = d.data();
+              const createdMs =
+                data.createdAt && typeof data.createdAt.toDate === 'function'
+                  ? data.createdAt.toDate().getTime()
+                  : 0;
+              return { id: d.id, ...data, createdMs };
+            })
+            .sort((a, b) => (b.createdMs || 0) - (a.createdMs || 0))
+        : [];
+    const progress =
+      progressRes.status === 'fulfilled' && progressRes.value.exists()
+        ? progressRes.value.data()
+        : null;
+
+    return { snippets, history, progress };
   } catch (err) {
-    handleFirestoreError(err, OperationType.GET, `users/${uid}`);
+    console.warn('Non-fatal Firestore cloud data fetch skip:', err);
+    return null;
+  }
+}
+
+/**
+ * Asynchronously logs a code execution run to `/users/{uid}/code_executions/{executionId}`
+ * matching `isValidCodeExecution` in `firestore.rules`. Never throws into UI flows.
+ */
+export async function saveCodeExecutionToFirestore(
+  uid: string,
+  execution: CodeExecutionRecord
+): Promise<void> {
+  if (!isFirebaseConfigured || !auth.currentUser || auth.currentUser.uid !== uid) return;
+  const docId = sanitizeId(execution.id, 'exec');
+  try {
+    await ensureParentUserExists(uid);
+    const ref = doc(db, 'users', uid, 'code_executions', docId);
+    const payload: Record<string, any> = {
+      ownerUid: uid,
+      language: sanitizeLanguage(execution.language),
+      source_code: String(execution.source_code || '').slice(0, 20000),
+      stdin_input: String(execution.stdin_input || '').slice(0, 4000),
+      stdout_output: String(execution.stdout_output || '').slice(0, 20000),
+      stderr_output: String(execution.stderr_output || '').slice(0, 10000),
+      exit_code: typeof execution.exit_code === 'number' ? execution.exit_code : null,
+      execution_mode: execution.execution_mode === 'explain' ? 'explain' : 'fast',
+      execution_time_ms: Math.max(0, Math.round(Number(execution.execution_time_ms) || 0)),
+      success: Boolean(execution.success),
+      createdAt: serverTimestamp(),
+    };
+    if (execution.file_name) {
+      payload.file_name = String(execution.file_name).slice(0, 140);
+    }
+    await setDoc(ref, payload);
+  } catch (err) {
+    console.warn('Non-fatal Firestore code_executions write skip:', err);
+  }
+}
+
+/**
+ * Fetches recent logged code executions from `/users/{uid}/code_executions`.
+ * Returns [] gracefully if unavailable or not yet deployed.
+ */
+export async function fetchCodeExecutionsFromFirestore(
+  uid: string,
+  maxItems = 25
+): Promise<CodeExecutionRecord[]> {
+  if (!isFirebaseConfigured || !auth.currentUser || auth.currentUser.uid !== uid) return [];
+  try {
+    await ensureParentUserExists(uid);
+    const snap = await getDocs(
+      query(
+        collection(db, 'users', uid, 'code_executions'),
+        where('ownerUid', '==', uid),
+        limit(maxItems)
+      )
+    );
+    const items: CodeExecutionRecord[] = snap.docs.map((d) => {
+      const data = d.data();
+      const createdIso =
+        data.createdAt && typeof data.createdAt.toDate === 'function'
+          ? data.createdAt.toDate().toISOString()
+          : new Date().toISOString();
+      return {
+        id: d.id,
+        userId: uid,
+        language: sanitizeLanguage(String(data.language || 'javascript')),
+        source_code: String(data.source_code || ''),
+        stdin_input: String(data.stdin_input || ''),
+        stdout_output: String(data.stdout_output || ''),
+        stderr_output: String(data.stderr_output || ''),
+        exit_code: typeof data.exit_code === 'number' ? data.exit_code : null,
+        execution_mode: data.execution_mode === 'explain' ? 'explain' : 'fast',
+        execution_time_ms: Number(data.execution_time_ms) || 0,
+        success: Boolean(data.success ?? true),
+        file_name: data.file_name ? String(data.file_name) : undefined,
+        created_at: createdIso,
+      };
+    });
+    return items.sort((a, b) => b.created_at.localeCompare(a.created_at));
+  } catch (err) {
+    console.warn('Non-fatal Firestore code_executions fetch skip:', err);
+    return [];
   }
 }

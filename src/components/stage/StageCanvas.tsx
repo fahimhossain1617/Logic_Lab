@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useLabStore } from '../../store/useLabStore';
 import { SwapBucketsRenderer } from './SwapBucketsRenderer';
@@ -40,18 +40,27 @@ export const StageCanvas: React.FC = () => {
     Boolean(step?.structure?.values && step.structure.values.length > 0) ||
     Object.values(step?.variables || {}).some((v) => Array.isArray(v));
 
-  const progressLabelsBn = [
-    '',
-    '১/৩ আপনার কোড বিশ্লেষণ করা হচ্ছে...',
-    '২/৩ লাইন বাই লাইন ৩ডি অ্যানিমেশন ধাপ তৈরি হচ্ছে...',
-    '৩/৩ এআই ব্যাখ্যা তৈরি হচ্ছে...',
-  ];
-  const progressLabelsEn = [
-    '',
-    '1/3 Analyzing your code...',
-    '2/3 Building line-by-line 3D animation steps...',
-    '3/3 Generating AI line-by-line explanation...',
-  ];
+  const [loadingProgress, setLoadingProgress] = useState(12);
+
+  useEffect(() => {
+    if (!isTracing) {
+      setLoadingProgress(12);
+      return;
+    }
+
+    setLoadingProgress(14);
+    const timer = setInterval(() => {
+      setLoadingProgress((prev) => {
+        const floor = traceProgressStage > 0 ? Math.min(88, traceProgressStage * 26) : 14;
+        const base = Math.max(prev, floor);
+        if (base >= 94) return 94;
+        const step = Math.max(0.8, (95 - base) * 0.08);
+        return Math.min(94, Number((base + step).toFixed(1)));
+      });
+    }, 150);
+
+    return () => clearInterval(timer);
+  }, [isTracing, traceProgressStage]);
 
   return (
     <section
@@ -98,7 +107,7 @@ export const StageCanvas: React.FC = () => {
         </div>
       </div>
 
-      {/* Three-step AI / Trace Progress Overlay */}
+      {/* Continuous AI / Trace Progress Overlay */}
       <AnimatePresence>
         {isTracing && (
           <motion.div
@@ -108,28 +117,31 @@ export const StageCanvas: React.FC = () => {
             className="absolute inset-0 z-20 bg-[var(--bg-gutter)]/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center"
             data-testid="trace-progress-overlay"
           >
-            <p
-              lang={explainLanguage}
-              className="text-base font-semibold text-[var(--text-primary)] mb-3"
-            >
-              {explainLanguage === 'bn'
-                ? progressLabelsBn[traceProgressStage]
-                : progressLabelsEn[traceProgressStage]}
-            </p>
-            <div className="w-56 h-2 rounded-full bg-[#16224A] overflow-hidden border border-[var(--border-subtle)]">
+            <div className="flex items-center gap-2.5 mb-3">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#38BDF8] animate-pulse" />
+              <p
+                lang={explainLanguage}
+                className="text-base font-semibold text-[var(--text-primary)] m-0"
+              >
+                {explainLanguage === 'bn'
+                  ? 'অ্যানিমেশন ও ব্যাখ্যা লোড হচ্ছে...'
+                  : 'Loading animation & explanation...'}
+              </p>
+            </div>
+            <div className="w-64 h-2 rounded-full bg-[#16224A] overflow-hidden border border-[var(--border-subtle)]">
               <motion.div
-                className="h-full bg-gradient-to-r from-[#A3C1FF] to-[#4ADE9B]"
-                initial={{ width: '15%' }}
-                animate={{ width: `${traceProgressStage * 33}%` }}
-                transition={{ duration: 0.16 }}
+                className="h-full bg-gradient-to-r from-[#3B82F6] via-[#38BDF8] to-[#34D399]"
+                initial={{ width: '12%' }}
+                animate={{ width: `${loadingProgress}%` }}
+                transition={{ duration: 0.15, ease: 'easeOut' }}
               />
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Active 3D Analogy Renderer */}
-      <div className="flex-1 flex items-center justify-center py-2 overflow-hidden">
+      {/* Active 3D / Memory & Reference Analogy Renderer */}
+      <div className="flex-1 flex items-center justify-center py-3 overflow-hidden">
         {isCompileError ? (
           <GenericMemoryRenderer
             trace={trace}
@@ -215,29 +227,49 @@ export const StageCanvas: React.FC = () => {
         )}
       </div>
 
-      {/* Final Step 3D Output Showcase Banner */}
+      {/* Synced Step What Happened & Why Logic Strip (Unboxed hairline divider) */}
+      {!isCompileError && step && (
+        <div className="pt-3 border-t border-[var(--border-subtle)] space-y-1.5 text-xs leading-relaxed">
+          <p className="m-0 text-[var(--text-primary)]" lang={explainLanguage}>
+            <strong className="text-[var(--text-accent)] mr-2">
+              {explainLanguage === 'bn' ? 'কী ঘটল:' : 'What happened:'}
+            </strong>
+            <FormattedText text={step.whatHappened || step.explanation} lang={explainLanguage} />
+          </p>
+          {(step.whyAndLogic || step.why) && (
+            <p className="m-0 text-[var(--text-secondary)]" lang={explainLanguage}>
+              <strong className="text-[var(--text-success)] mr-2">
+                {explainLanguage === 'bn' ? 'লজিক ও কারণ:' : 'Why & Logic:'}
+              </strong>
+              <FormattedText text={step.whyAndLogic || step.why} lang={explainLanguage} />
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Final Step Output Showcase Banner (Unboxed hairline divider) */}
       {isFinalStep && (
         <motion.div
-          initial={{ y: 12, opacity: 0 }}
+          initial={reduceMotion ? false : { y: 8, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
-          className="mt-3 pt-4 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 overflow-hidden"
+          className="mt-3 pt-3 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row sm:items-center justify-between gap-3 overflow-hidden"
           data-testid="stage-final-output-banner"
         >
-          <div className="min-w-0 space-y-1">
-            <div className="text-xs font-bold text-[#4ADE9B]" lang={explainLanguage}>
+          <div className="min-w-0 space-y-0.5">
+            <div className="text-xs font-bold text-[var(--text-success)]" lang={explainLanguage}>
               {explainLanguage === 'bn'
-                ? 'চূড়ান্ত ধাপ সম্পন্ন — প্রোগ্রামের ফাইনাল আউটপুট:'
-                : 'Final Step Reached — Program Final Output:'}
+                ? 'চূড়ান্ত ধাপ সম্পন্ন — ফাইনাল আউটপুট:'
+                : 'Final Step Reached — Final Output:'}
             </div>
             <div className="text-xs text-[var(--text-secondary)] break-words leading-relaxed" lang={explainLanguage}>
               <FormattedText text={trace.outputExplanation} lang={explainLanguage} />
             </div>
           </div>
-          <div className="px-4 py-2.5 rounded-xl ll-3d-cube-changed bg-[#070A1A] border border-[#4ADE9B] font-mono text-sm font-bold text-[#4ADE9B] break-all max-w-full sm:max-w-[280px] shrink-0 text-center">
+          <div className="px-3 py-1.5 rounded-lg bg-[var(--bg-gutter)] border border-[#10B981]/50 font-mono text-xs font-bold text-[var(--text-success)] break-all max-w-full sm:max-w-[260px] shrink-0 text-center">
             {trace.finalOutput
               ? trace.finalOutput
               : explainLanguage === 'bn'
-              ? '(কোনো কনসোল আউটপুট নেই)'
+              ? '(কোনো stdout আউটপুট নেই)'
               : '(No stdout output)'}
           </div>
         </motion.div>

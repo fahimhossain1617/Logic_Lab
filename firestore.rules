@@ -91,6 +91,22 @@ service cloud.firestore {
         data.code is string && data.code.size() >= 1 && data.code.size() <= 6000;
     }
 
+    function isValidCodeExecution(data, uid) {
+      return data.keys().hasAll(['ownerUid', 'language', 'source_code', 'stdin_input', 'stdout_output', 'execution_mode', 'execution_time_ms', 'createdAt']) &&
+        data.keys().hasOnly(['ownerUid', 'language', 'source_code', 'stdin_input', 'stdout_output', 'stderr_output', 'exit_code', 'execution_mode', 'execution_time_ms', 'success', 'file_name', 'createdAt']) &&
+        data.ownerUid is string && data.ownerUid == uid && data.ownerUid == request.auth.uid &&
+        data.language is string && data.language in ['javascript', 'python', 'cpp', 'java'] &&
+        data.source_code is string && data.source_code.size() <= 20000 &&
+        data.stdin_input is string && data.stdin_input.size() <= 4000 &&
+        data.stdout_output is string && data.stdout_output.size() <= 20000 &&
+        (!('stderr_output' in data) || (data.stderr_output is string && data.stderr_output.size() <= 10000)) &&
+        (!('exit_code' in data) || data.exit_code == null || data.exit_code is int) &&
+        data.execution_mode is string && data.execution_mode in ['fast', 'explain'] &&
+        data.execution_time_ms is number && data.execution_time_ms >= 0 && data.execution_time_ms <= 600000 &&
+        (!('success' in data) || data.success is bool) &&
+        (!('file_name' in data) || (data.file_name is string && data.file_name.size() <= 140));
+    }
+
     // 1. User Profile (/users/{uid})
     match /users/{uid} {
       allow get: if isOwner(uid) && isValidId(uid);
@@ -162,6 +178,20 @@ service cloud.firestore {
           incoming().diff(existing()).affectedKeys().hasOnly(['streak', 'lastActiveDate', 'completedProblemIds', 'badges', 'topicsCovered', 'updatedAt']) &&
           parentUserExists(uid);
         allow delete: if false;
+      }
+
+      // 5. User Code Executions (/users/{uid}/code_executions/{executionId})
+      match /code_executions/{executionId} {
+        allow get: if isOwner(uid) && isValidId(uid) && parentUserExists(uid);
+        allow list: if isOwner(uid) && existing().ownerUid == request.auth.uid;
+        allow create: if isOwner(uid) && isValidId(uid) && isValidId(executionId) &&
+          isValidCodeExecution(incoming(), uid) &&
+          incoming().createdAt == request.time &&
+          parentUserExists(uid);
+        allow update: if false;
+        allow delete: if isOwner(uid) && isValidId(uid) && isValidId(executionId) &&
+          existing().ownerUid == request.auth.uid &&
+          parentUserExists(uid);
       }
     }
 

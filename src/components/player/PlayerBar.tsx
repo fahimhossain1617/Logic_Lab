@@ -15,7 +15,6 @@ export const PlayerBar: React.FC = () => {
     prevStep,
     resetPlayback,
     goToStep,
-    setSpeed,
   } = useLabStore();
 
   useEffect(() => {
@@ -26,8 +25,6 @@ export const PlayerBar: React.FC = () => {
     }, duration);
     return () => clearInterval(timer);
   }, [isPlaying, speed, nextStep]);
-
-  const speeds = [0.5, 1, 1.5, 2];
 
   return (
     <div
@@ -121,25 +118,6 @@ export const PlayerBar: React.FC = () => {
             />
           );
         })}
-      </div>
-
-      {/* Speed Selector */}
-      <div className="flex items-center gap-1.5 p-1 rounded-xl bg-[var(--bg-gutter)]/70 border border-[var(--border-subtle)]">
-        {speeds.map((s) => (
-          <button
-            key={s}
-            type="button"
-            onClick={() => setSpeed(s)}
-            aria-label={`Speed ${s}x`}
-            className={`px-2.5 py-1 rounded-lg text-xs font-mono font-medium transition-colors cursor-pointer ${
-              speed === s
-                ? 'bg-[#A3C1FF] text-[#070A1A] font-semibold'
-                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
-            }`}
-          >
-            {s}x
-          </button>
-        ))}
       </div>
     </div>
   );

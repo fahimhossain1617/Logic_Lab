@@ -4,17 +4,24 @@ import { useLabStore } from '../../store/useLabStore';
 import { SupportedLanguage, ExecutionDiagnostic } from '../../../shared/types';
 import {
   Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  RotateCcw,
   Plus,
   Minus,
   Trash2,
-  Terminal,
   FileCode,
   AlignLeft,
-  AlertCircle,
-  AlertTriangle,
-  Info,
+  Clock,
+  Cpu,
 } from 'lucide-react';
 import { registerMonacoLanguageProviders } from './monacoProviders';
+import { registerIntelliSense } from '../../lib/monaco/intellisense/registerIntelliSense';
+import { DisposableHandle } from '../../lib/monaco/intellisense/types';
+import { StageCanvas } from '../stage/StageCanvas';
+import { OutputConsole } from './OutputConsole';
+import { getStepDurationMs } from '../../utils/playerLogic';
 
 export const CodeEditorPanel: React.FC = () => {
   const {
@@ -27,6 +34,9 @@ export const CodeEditorPanel: React.FC = () => {
     fileName,
     hasExecuted,
     isTracing,
+    isFastRunning,
+    isPlaying,
+    speed,
     trace,
     apiError,
     diagnostics,
@@ -43,7 +53,12 @@ export const CodeEditorPanel: React.FC = () => {
     deleteUserFile,
     setEditorFontSize,
     resetSnippetToNew,
+    runFast,
     runVisualize,
+    togglePlay,
+    nextStep,
+    prevStep,
+    resetPlayback,
     toggleBreakpoint,
     jumpToLine,
     setHoveredLine,
@@ -53,16 +68,22 @@ export const CodeEditorPanel: React.FC = () => {
   const editorRef = useRef<any>(null);
   const monacoRef = useRef<any>(null);
   const decorationsRef = useRef<string[]>([]);
+  const intelliSenseDisposableRef = useRef<DisposableHandle | null>(null);
+  const providersDisposableRef = useRef<DisposableHandle | null>(null);
   const [monacoReady, setMonacoReady] = useState(false);
+  const [contentLeft, setContentLeft] = useState(46);
 
-  // Resizable panel state
+  // Resizable panel state (vertical editor height & horizontal split width)
   const [editorHeight, setEditorHeight] = useState(360);
   const [isDragging, setIsDragging] = useState(false);
   const dragStartY = useRef(0);
   const startHeight = useRef(360);
 
-  // Output vs Problems console tab
-  const [activeConsoleTab, setActiveConsoleTab] = useState<'output' | 'problems'>('output');
+  const splitContainerRef = useRef<HTMLDivElement | null>(null);
+  const [leftPanePct, setLeftPanePct] = useState(50);
+  const [isSplitDragging, setIsSplitDragging] = useState(false);
+
+  // Live syntax/compiler diagnostics for Monaco + OutputConsole
   const [liveDiagnostics, setLiveDiagnostics] = useState<ExecutionDiagnostic[]>([]);
 
   const currentStep = trace.steps[currentStepIndex] || trace.steps[0];
@@ -73,15 +94,6 @@ export const CodeEditorPanel: React.FC = () => {
     (executionStatus === 'error' ||
       Boolean(apiError) ||
       trace.verdict.status === 'compile_error');
-  const hasWarnings =
-    hasExecuted &&
-    !isCompileError &&
-    (executionStatus === 'warning' || diagnostics.some((d) => d.severity === 'warning'));
-
-  // Effective diagnostics to show (compiler truth from execution or live diagnostics)
-  const displayDiagnostics = diagnostics.length > 0 ? diagnostics : liveDiagnostics;
-  const errorCount = displayDiagnostics.filter((d) => d.severity === 'error').length;
-  const warningCount = displayDiagnostics.filter((d) => d.severity === 'warning').length;
 
   const handleBeforeMount: BeforeMount = (monaco) => {
     // Register custom dark & light themes
@@ -139,8 +151,12 @@ export const CodeEditorPanel: React.FC = () => {
       },
     });
 
-    // Register professional autocompletion, hover documentation, and document formatters
-    registerMonacoLanguageProviders(monaco);
+    // Register hover documentation, document formatters, and enterprise IntelliSense idempotently
+    providersDisposableRef.current?.dispose();
+    providersDisposableRef.current = registerMonacoLanguageProviders(monaco);
+
+    intelliSenseDisposableRef.current?.dispose();
+    intelliSenseDisposableRef.current = registerIntelliSense(monaco);
   };
 
   const handleOnMount: OnMount = (editor, monaco) => {
@@ -148,7 +164,34 @@ export const CodeEditorPanel: React.FC = () => {
     monacoRef.current = monaco;
     (window as any).__monacoEditor = editor;
     (window as any).__monacoInstance = monaco;
+
+    // Ensure providers are registered even if StrictMode skipped beforeMount on remount
+    if (!providersDisposableRef.current) {
+      providersDisposableRef.current = registerMonacoLanguageProviders(monaco);
+    }
+    if (!intelliSenseDisposableRef.current) {
+      intelliSenseDisposableRef.current = registerIntelliSense(monaco);
+    }
+
+    editor.onDidDispose(() => {
+      intelliSenseDisposableRef.current?.dispose();
+      intelliSenseDisposableRef.current = null;
+      providersDisposableRef.current?.dispose();
+      providersDisposableRef.current = null;
+    });
+
     setMonacoReady(true);
+    const updatePlaceholderAnchor = () => {
+      const layout = editor.getLayoutInfo();
+      const visiblePos = editor.getScrolledVisiblePosition({ lineNumber: 1, column: 1 });
+      const contentStart = Math.max(layout.contentLeft, visiblePos?.left ?? layout.contentLeft);
+      setContentLeft(contentStart + 6);
+    };
+    updatePlaceholderAnchor();
+
+    editor.onDidLayoutChange(() => {
+      updatePlaceholderAnchor();
+    });
 
     editor.onDidChangeCursorPosition((e) => {
       setCursorPosition({
@@ -181,6 +224,16 @@ export const CodeEditorPanel: React.FC = () => {
       setHoveredLine(line);
     });
   };
+
+  // Cleanup IntelliSense & language providers on component unmount
+  useEffect(() => {
+    return () => {
+      intelliSenseDisposableRef.current?.dispose();
+      intelliSenseDisposableRef.current = null;
+      providersDisposableRef.current?.dispose();
+      providersDisposableRef.current = null;
+    };
+  }, []);
 
   // Real-time debounced compiler diagnostics (350ms)
   useEffect(() => {
@@ -307,6 +360,55 @@ export const CodeEditorPanel: React.FC = () => {
     }
   }, [theme, monacoReady]);
 
+  // Horizontal Split-Pane Resizing (Mouse & Touch)
+  const updateSplitFromClientX = useCallback((clientX: number) => {
+    const container = splitContainerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const minPct = Math.max(25, (280 / rect.width) * 100);
+    const maxPct = 100 - minPct;
+    const rawPct = ((clientX - rect.left) / rect.width) * 100;
+    const clamped = Math.max(minPct, Math.min(maxPct, rawPct));
+    setLeftPanePct(Number(clamped.toFixed(2)));
+  }, []);
+
+  const handleMouseDownSplit = (e: React.MouseEvent) => {
+    e.preventDefault();
+    setIsSplitDragging(true);
+  };
+
+  const handleTouchStartSplit = () => {
+    setIsSplitDragging(true);
+  };
+
+  useEffect(() => {
+    if (!isSplitDragging) return;
+    const prevUserSelect = document.body.style.userSelect;
+    const prevCursor = document.body.style.cursor;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+
+    const onMouseMove = (e: MouseEvent) => updateSplitFromClientX(e.clientX);
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches[0]) updateSplitFromClientX(e.touches[0].clientX);
+    };
+    const onStop = () => setIsSplitDragging(false);
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onStop);
+    window.addEventListener('touchmove', onTouchMove, { passive: true });
+    window.addEventListener('touchend', onStop);
+    return () => {
+      document.body.style.userSelect = prevUserSelect;
+      document.body.style.cursor = prevCursor;
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onStop);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onStop);
+    };
+  }, [isSplitDragging, updateSplitFromClientX]);
+
   // Panel Resizing Drag Handling
   const handleMouseDownDivider = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -349,15 +451,25 @@ export const CodeEditorPanel: React.FC = () => {
     }
   };
 
+  // Auto-play timer synced with playback speed
+  useEffect(() => {
+    if (!isPlaying || trace.steps.length === 0) return;
+    const intervalMs = getStepDurationMs(speed);
+    const timer = setInterval(() => {
+      nextStep();
+    }, intervalMs);
+    return () => clearInterval(timer);
+  }, [isPlaying, speed, nextStep, trace.steps.length]);
+
   const codeLines = code.split('\n');
 
   return (
     <section
-      className="ll-panel rounded-2xl flex flex-col overflow-hidden"
-      aria-label={explainLanguage === 'bn' ? 'কোড এডিটর এবং আউটপুট' : 'Code Editor and Output'}
+      className="ll-panel rounded-xl flex flex-col overflow-hidden"
+      aria-label={explainLanguage === 'bn' ? 'কোড এডিটর, ভিজ্যুয়ালাইজার এবং আউটপুট' : 'Code Editor, Visualizer and Output'}
     >
-      {/* 1. Header Toolbar Row */}
-      <div className="flex flex-wrap items-center justify-between px-3 sm:px-5 py-2.5 bg-[#080C14] border-b border-[#1E293B] gap-3">
+      {/* 1. Unified Horizontal Top Toolbar */}
+      <div className="flex flex-wrap items-center justify-between px-3 sm:px-5 py-2.5 bg-[var(--bg-gutter)] border-b border-[var(--border-subtle)] gap-3">
         {/* Left: Active File Inline Rename, Other File Tabs, and + New File */}
         <div
           className="flex items-center gap-2 overflow-x-auto max-w-full"
@@ -369,13 +481,13 @@ export const CodeEditorPanel: React.FC = () => {
             return (
               <div
                 key={f.id}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono transition-colors border ${
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono transition-colors border ${
                   isSelected
-                    ? 'bg-[#111827] border-blue-500/80 text-white font-semibold'
-                    : 'bg-transparent border-transparent text-slate-400 hover:text-white hover:bg-slate-800/60'
+                    ? 'bg-[var(--bg-panel-raised)] border-[var(--border-active)]/70 text-[var(--text-primary)] font-semibold'
+                    : 'bg-transparent border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-panel)]'
                 }`}
               >
-                <FileCode className={`w-3.5 h-3.5 ${isSelected ? 'text-blue-400' : 'text-slate-500'}`} />
+                <FileCode className={`w-3.5 h-3.5 ${isSelected ? 'text-[var(--text-accent)]' : 'text-[var(--text-muted)]'}`} />
                 {isSelected ? (
                   <input
                     type="text"
@@ -384,7 +496,7 @@ export const CodeEditorPanel: React.FC = () => {
                     placeholder="main.js"
                     aria-label={explainLanguage === 'bn' ? 'ফাইলের নাম' : 'File name'}
                     data-testid="file-name-input"
-                    className="w-24 sm:w-32 bg-transparent text-white font-semibold focus:outline-none"
+                    className="w-24 sm:w-28 bg-transparent text-[var(--text-primary)] font-semibold focus:outline-none"
                   />
                 ) : (
                   <button
@@ -401,7 +513,7 @@ export const CodeEditorPanel: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => deleteUserFile(f.id)}
-                    className="text-slate-500 hover:text-red-400 cursor-pointer ml-0.5 p-0.5 rounded hover:bg-slate-800"
+                    className="text-[var(--text-muted)] hover:text-[var(--text-danger)] cursor-pointer ml-0.5 p-0.5 rounded"
                     aria-label={`Close ${f.fileName}`}
                     title="Close file"
                   >
@@ -415,7 +527,7 @@ export const CodeEditorPanel: React.FC = () => {
           <button
             type="button"
             onClick={createNewUserFile}
-            className="px-2.5 py-1.5 rounded-lg text-xs font-medium text-blue-400 hover:bg-blue-500/10 border border-transparent hover:border-blue-500/30 transition-colors cursor-pointer whitespace-nowrap inline-flex items-center gap-1"
+            className="px-2 py-1 rounded-lg text-xs font-medium text-[var(--text-accent)] hover:bg-[var(--code-pill-bg)] transition-colors cursor-pointer whitespace-nowrap inline-flex items-center gap-1"
             data-testid="new-user-file-btn"
             title={explainLanguage === 'bn' ? 'নতুন ফাইল তৈরি করুন' : 'Create new file'}
           >
@@ -424,8 +536,76 @@ export const CodeEditorPanel: React.FC = () => {
           </button>
         </div>
 
-        {/* Right: Language Selector, Format, Zoom (+ / -), Run Button, and Clear */}
-        <div className="flex items-center gap-2.5 shrink-0 ml-auto">
+        {/* Right: Complexity Pills, Playback Controls, Language Selector, Format, Zoom, Run, Clear */}
+        <div className="flex flex-wrap items-center gap-2 shrink-0 ml-auto">
+          {/* Time & Space Complexity Pills */}
+          {hasExecuted && !isCompileError && trace.logicSummary?.complexity && (
+            <div className="hidden xl:flex items-center gap-1.5 pr-2 border-r border-[var(--border-subtle)] text-[11px] font-mono">
+              <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[var(--bg-panel)] border border-[var(--border-subtle)] text-[var(--text-accent)]">
+                <Clock className="w-3 h-3" />
+                {trace.logicSummary.complexity.time}
+              </span>
+              <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[var(--bg-panel)] border border-[var(--border-subtle)] text-[var(--text-success)]">
+                <Cpu className="w-3 h-3" />
+                {trace.logicSummary.complexity.space}
+              </span>
+            </div>
+          )}
+
+          {/* Playback Quick Controls */}
+          {hasExecuted && !isCompileError && trace.steps.length > 0 && (
+            <div
+              className="flex items-center gap-1 pr-2 border-r border-[var(--border-subtle)]"
+              data-testid="player-controls"
+            >
+              <button
+                type="button"
+                onClick={prevStep}
+                disabled={currentStepIndex <= 0}
+                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-40 cursor-pointer transition-colors"
+                aria-label="Previous step"
+                title={explainLanguage === 'bn' ? 'পূর্ববর্তী ধাপ' : 'Previous step'}
+              >
+                <SkipBack className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={togglePlay}
+                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-accent)] hover:border-[var(--border-active)] cursor-pointer transition-colors"
+                aria-label={isPlaying ? 'Pause' : 'Play'}
+                title={isPlaying ? 'Pause' : 'Play'}
+              >
+                {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+              </button>
+              <button
+                type="button"
+                onClick={nextStep}
+                disabled={currentStepIndex >= trace.steps.length - 1}
+                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-40 cursor-pointer transition-colors"
+                aria-label="Next step"
+                title={explainLanguage === 'bn' ? 'পরবর্তী ধাপ' : 'Next step'}
+              >
+                <SkipForward className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={resetPlayback}
+                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer transition-colors"
+                aria-label="Reset playback"
+                title={explainLanguage === 'bn' ? 'প্রথম থেকে' : 'Reset'}
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+              </button>
+
+              {/* Step Counter */}
+              <span className="text-[11px] font-mono text-[var(--text-secondary)] px-1 select-none whitespace-nowrap">
+                {explainLanguage === 'bn'
+                  ? `ধাপ ${currentStepIndex + 1}/${trace.steps.length}`
+                  : `Step ${currentStepIndex + 1}/${trace.steps.length}`}
+              </span>
+            </div>
+          )}
+
           {/* Language Select */}
           <div className="relative">
             <label className="sr-only" htmlFor="editor-language-select">
@@ -435,7 +615,7 @@ export const CodeEditorPanel: React.FC = () => {
               id="editor-language-select"
               value={language}
               onChange={(e) => setLanguage(e.target.value as SupportedLanguage)}
-              className="px-2.5 py-1.5 rounded-lg bg-[#111827] border border-[#1E293B] text-xs font-mono font-medium text-slate-200 cursor-pointer focus:outline-none focus:border-blue-500 transition-colors"
+              className="px-2.5 py-1.5 rounded-lg bg-[var(--bg-select)] border border-[var(--border-subtle)] text-xs font-mono font-medium text-[var(--text-primary)] cursor-pointer focus:outline-none focus:border-[var(--border-active)] transition-colors"
             >
               <option value="javascript">JavaScript (.js)</option>
               <option value="python">Python (.py)</option>
@@ -448,7 +628,7 @@ export const CodeEditorPanel: React.FC = () => {
           <button
             type="button"
             onClick={handleFormatCode}
-            className="p-1.5 rounded-lg border border-[#1E293B] bg-[#111827] text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+            className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-select)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors cursor-pointer"
             aria-label="Format Document (Shift+Alt+F)"
             title="Format Code (Shift+Alt+F)"
           >
@@ -456,23 +636,23 @@ export const CodeEditorPanel: React.FC = () => {
           </button>
 
           {/* Zoom: Minus & Plus icons */}
-          <div className="flex items-center rounded-lg border border-[#1E293B] bg-[#111827] px-1 py-0.5">
+          <div className="hidden sm:flex items-center rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-select)] px-1 py-0.5">
             <button
               type="button"
               onClick={() => setEditorFontSize(-2, true)}
-              className="p-1 text-slate-400 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer"
+              className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors cursor-pointer"
               aria-label="Decrease font size (-)"
               title="Decrease font size (-)"
             >
               <Minus className="w-3.5 h-3.5" />
             </button>
-            <span className="text-[11px] font-mono text-slate-400 px-1 font-semibold select-none">
+            <span className="text-[11px] font-mono text-[var(--text-secondary)] px-1 font-semibold select-none">
               {editorFontSize}
             </span>
             <button
               type="button"
               onClick={() => setEditorFontSize(2, true)}
-              className="p-1 text-slate-400 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer"
+              className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors cursor-pointer"
               aria-label="Increase font size (+)"
               title="Increase font size (+)"
             >
@@ -480,21 +660,27 @@ export const CodeEditorPanel: React.FC = () => {
             </button>
           </div>
 
-          {/* Run Button */}
+          {/* Dual Execution Modes: Run vs. Explain & Animate */}
           <button
             type="button"
             onClick={() => {
               const bufferCode = editorRef.current ? editorRef.current.getValue() : code;
-              void runVisualize(bufferCode);
+              void runFast(bufferCode);
             }}
-            className="px-3 sm:px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap transition-colors shadow-sm"
-            data-testid="visualize-primary-btn"
+            disabled={isFastRunning}
+            className="px-3.5 py-1.5 rounded-lg font-semibold text-xs inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap border border-[#10B981]/35 bg-[#10B981]/12 text-[#34D399] hover:bg-[#10B981]/22 disabled:opacity-60 transition-colors"
+            data-testid="fast-run-btn"
+            title={
+              explainLanguage === 'bn'
+                ? 'কোড রান করুন'
+                : 'Run code'
+            }
           >
-            <Play className={`w-3.5 h-3.5 ${isTracing ? 'animate-spin' : 'fill-current'}`} />
+            <Play className={`w-3.5 h-3.5 ${isFastRunning ? 'animate-spin' : 'fill-current'}`} />
             <span lang={explainLanguage}>
-              {isTracing
+              {isFastRunning
                 ? explainLanguage === 'bn'
-                  ? 'পুনরায় রান...'
+                  ? 'চলছে...'
                   : 'Running...'
                 : explainLanguage === 'bn'
                 ? 'রান'
@@ -502,11 +688,41 @@ export const CodeEditorPanel: React.FC = () => {
             </span>
           </button>
 
+          <button
+            type="button"
+            onClick={() => {
+              const bufferCode = editorRef.current ? editorRef.current.getValue() : code;
+              void runVisualize(bufferCode);
+            }}
+            className="px-3.5 sm:px-4 py-1.5 rounded-lg font-semibold text-xs inline-flex items-center justify-center cursor-pointer whitespace-nowrap border border-[#60A5FA]/35 bg-[#2563EB] hover:bg-[#3B82F6] text-white shadow-sm transition-colors"
+            data-testid="visualize-primary-btn"
+            title={
+              explainLanguage === 'bn'
+                ? 'সহজ বাংলা/ইংরেজি ব্যাখ্যা ও মেমোরি অ্যানিমেশন দেখুন'
+                : 'Generate beginner-friendly explanation & memory animation'
+            }
+          >
+            <span lang={explainLanguage}>
+              {isTracing
+                ? explainLanguage === 'bn'
+                  ? 'বিশ্লেষণ চলছে...'
+                  : 'Explaining...'
+                : explainLanguage === 'bn'
+                ? 'ব্যাখ্যা ও অ্যানিমেট'
+                : 'Explain & Animate'}
+            </span>
+            {!isTracing && (
+              <span className="sr-only">
+                {explainLanguage === 'bn' ? ' রান' : ' Run'}
+              </span>
+            )}
+          </button>
+
           {/* Delete / Clear Button */}
           <button
             type="button"
             onClick={resetSnippetToNew}
-            className="p-1.5 rounded-lg border border-[#1E293B] bg-[#111827] text-slate-400 hover:text-red-400 hover:border-red-500/40 hover:bg-red-500/10 transition-colors cursor-pointer"
+            className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-select)] text-[var(--text-secondary)] hover:text-[var(--text-danger)] hover:border-[#EF4444]/40 transition-colors cursor-pointer"
             data-testid="clear-editor-btn"
             title={explainLanguage === 'bn' ? 'মুছে ফেলুন' : 'Clear code'}
             aria-label="Clear code"
@@ -516,341 +732,197 @@ export const CodeEditorPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* 2. Monaco Code Editor Surface */}
+      {/* 2. Main Split View: Code Editor (Left) | Draggable Divider | Live Logic & Memory Visualizer (Right) */}
       <div
-        style={{ height: `${editorHeight}px` }}
-        className="relative bg-[#0A1027] dark:bg-[#0A1027]"
+        ref={splitContainerRef}
+        style={{ '--left-pane-w': `${leftPanePct}%` } as React.CSSProperties}
+        className="flex flex-col lg:flex-row divide-y lg:divide-y-0"
       >
-        {!code.trim() && (
-          <div className="pointer-events-none absolute top-4 left-16 z-10 font-mono text-xs text-slate-500 select-none">
-            // Start writing here...
-          </div>
-        )}
-
-        <Editor
-          height="100%"
-          language={language === 'cpp' ? 'cpp' : language}
-          theme={theme === 'dark' ? 'LogicLab-Midnight' : 'LogicLab-Daybreak'}
-          value={code}
-          beforeMount={handleBeforeMount}
-          onMount={handleOnMount}
-          onChange={(val) => setCode(val ?? '')}
-          options={{
-            fontSize: editorFontSize,
-            fontFamily: '"JetBrains Mono", monospace',
-            fontLigatures: true,
-            minimap: { enabled: false },
-            glyphMargin: true,
-            lineNumbers: 'on',
-            lineNumbersMinChars: 4,
-            lineDecorationsWidth: 16,
-            lineHeight: Math.max(22, Math.round(editorFontSize * 1.55)),
-            roundedSelection: true,
-            scrollBeyondLastLine: false,
-            smoothScrolling: true,
-            cursorSmoothCaretAnimation: 'on',
-            bracketPairColorization: { enabled: true },
-            guides: { indentation: true, bracketPairs: true },
-            padding: { top: 16, bottom: 16 },
-            automaticLayout: true,
-            autoClosingBrackets: 'always',
-            autoClosingQuotes: 'always',
-            autoIndent: 'full',
-            folding: true,
-            showFoldingControls: 'always',
-            multiCursorModifier: 'alt',
-            tabSize: 4,
-            insertSpaces: true,
-            formatOnPaste: true,
-            formatOnType: true,
-            suggestOnTriggerCharacters: true,
-            acceptSuggestionOnEnter: 'on',
-            quickSuggestions: { other: true, comments: false, strings: true },
-          }}
-          loading={
-            <div className="p-4 sm:p-5 font-mono text-xs space-y-1.5 bg-[#0A1027] text-[#E4ECFF] h-full overflow-auto">
-              {codeLines.map((lineText, idx) => (
-                <div key={idx + 1} className="flex items-center gap-4 px-2 py-0.5">
-                  <span className="w-8 text-right text-[#5B78B8] select-none font-semibold">{idx + 1}</span>
-                  <span className="whitespace-pre pl-2">{lineText}</span>
-                </div>
-              ))}
-            </div>
-          }
-        />
-      </div>
-
-      {/* 3. Resizable Drag Handle */}
-      <div
-        onMouseDown={handleMouseDownDivider}
-        onDoubleClick={() => setEditorHeight(360)}
-        title={explainLanguage === 'bn' ? 'ড্র্যাগ করে এডিটরের আকার পরিবর্তন করুন (রিসেট করতে ডাবল ক্লিক)' : 'Drag to resize editor (double click to reset)'}
-        className="h-2 bg-[#080C14] hover:bg-blue-600/40 cursor-row-resize flex items-center justify-center transition-colors group select-none border-t border-b border-[#1E293B]"
-      >
-        <div className="w-10 h-1 bg-slate-600 group-hover:bg-blue-400 rounded-full transition-colors" />
-      </div>
-
-      {/* 4. Editor Status Bar */}
-      <div className="flex items-center justify-between px-4 sm:px-6 py-1.5 bg-[#080C14] border-b border-[#1E293B] text-xs font-mono text-slate-400 select-none">
-        <div className="flex items-center gap-4 sm:gap-6">
-          <span className="font-semibold text-slate-200">
-            {fileName}
-          </span>
-          <span>
-            Ln {cursorPosition.lineNumber}, Col {cursorPosition.column}
-          </span>
-        </div>
-        <div className="flex items-center gap-4">
-          <span>{code ? `${codeLines.length} lines` : '0 lines'}</span>
-          <span className="uppercase text-blue-400 font-semibold">{language}</span>
-        </div>
-      </div>
-
-      {/* 5. Console Section: Program Output & Problems Tabs */}
-      <div
-        className="px-4 sm:px-6 py-4 bg-[#0E1422] space-y-3"
-        data-testid="real-output-section"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-3 pb-2.5 border-b border-[#1E293B]">
-          <div className="flex items-center gap-3">
-            {/* Tab: Output */}
-            <button
-              type="button"
-              onClick={() => setActiveConsoleTab('output')}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
-                activeConsoleTab === 'output'
-                  ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              <Terminal className="w-3.5 h-3.5" />
-              <span>{explainLanguage === 'bn' ? 'প্রোগ্রাম আউটপুট' : 'Program Output'}</span>
-            </button>
-
-            {/* Tab: Problems / Diagnostics */}
-            <button
-              type="button"
-              onClick={() => setActiveConsoleTab('problems')}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
-                activeConsoleTab === 'problems'
-                  ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              {errorCount > 0 ? (
-                <AlertCircle className="w-3.5 h-3.5 text-red-400" />
-              ) : warningCount > 0 ? (
-                <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
-              ) : (
-                <Info className="w-3.5 h-3.5 text-slate-400" />
-              )}
-              <span>{explainLanguage === 'bn' ? 'সমস্যা ও সতর্কতা' : 'Problems'}</span>
-              {(errorCount > 0 || warningCount > 0) && (
-                <span
-                  className={`px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold ${
-                    errorCount > 0
-                      ? 'bg-red-500/20 text-red-400'
-                      : 'bg-amber-500/20 text-amber-400'
-                  }`}
-                >
-                  {errorCount + warningCount}
-                </span>
-              )}
-            </button>
-
-            {/* Execution Verdict Badge */}
-            {hasExecuted && activeConsoleTab === 'output' && (
-              <span
-                className={`text-[11px] font-mono font-semibold px-2 py-0.5 rounded-md ${
-                  isCompileError
-                    ? 'bg-red-500/15 text-red-400 border border-red-500/30'
-                    : hasWarnings
-                    ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
-                    : 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                }`}
+        {/* LEFT PANE: Monaco Code Editor + Resize Handle + Status Strip */}
+        <div className="w-full lg:w-[var(--left-pane-w)] lg:shrink-0 lg:min-w-[280px] flex flex-col min-w-0">
+          <div
+            style={{ height: `${editorHeight}px` }}
+            className="relative bg-[#0A1027] dark:bg-[#0A1027]"
+          >
+            {code.length === 0 && (
+              <div
+                style={{
+                  top: 12,
+                  left: `${contentLeft}px`,
+                  fontSize: `${editorFontSize}px`,
+                  lineHeight: `${Math.max(22, Math.round(editorFontSize * 1.55))}px`,
+                }}
+                className="pointer-events-none absolute z-10 font-mono italic text-slate-500/80 select-none whitespace-nowrap"
               >
-                {isCompileError
-                  ? explainLanguage === 'bn'
-                    ? 'ত্রুটি (Error)'
-                    : 'Error'
-                  : hasWarnings
-                  ? explainLanguage === 'bn'
-                    ? 'সতর্কতা (Warning)'
-                    : 'Warning'
-                  : explainLanguage === 'bn'
-                  ? 'সফল'
-                  : 'Success'}
+                Start writing your code.
+              </div>
+            )}
+
+            <Editor
+              height="100%"
+              language={language === 'cpp' ? 'cpp' : language}
+              theme={theme === 'dark' ? 'LogicLab-Midnight' : 'LogicLab-Daybreak'}
+              value={code}
+              beforeMount={handleBeforeMount}
+              onMount={handleOnMount}
+              onChange={(val) => setCode(val ?? '')}
+              options={{
+                fontSize: editorFontSize,
+                fontFamily: '"JetBrains Mono", monospace',
+                fontLigatures: true,
+                minimap: { enabled: false },
+                glyphMargin: false,
+                lineNumbers: 'on',
+                lineNumbersMinChars: 3,
+                lineDecorationsWidth: 12,
+                lineHeight: Math.max(22, Math.round(editorFontSize * 1.55)),
+                roundedSelection: true,
+                scrollBeyondLastLine: false,
+                smoothScrolling: true,
+                cursorSmoothCaretAnimation: 'on',
+                bracketPairColorization: { enabled: true },
+                guides: { indentation: true, bracketPairs: true },
+                padding: { top: 12, bottom: 16 },
+                automaticLayout: true,
+                autoClosingBrackets: 'always',
+                autoClosingQuotes: 'always',
+                autoIndent: 'full',
+                folding: false,
+                multiCursorModifier: 'alt',
+                tabSize: 4,
+                insertSpaces: true,
+                formatOnPaste: true,
+                formatOnType: true,
+                suggestOnTriggerCharacters: true,
+                acceptSuggestionOnEnter: 'on',
+                tabCompletion: 'on',
+                wordBasedSuggestions: 'currentDocument',
+                snippetSuggestions: 'top',
+                quickSuggestions: { other: true, comments: false, strings: true },
+                quickSuggestionsDelay: 0,
+                suggest: {
+                  showIcons: true,
+                  showSnippets: true,
+                  showKeywords: true,
+                  showMethods: true,
+                  showFunctions: true,
+                  showClasses: true,
+                  showVariables: true,
+                  showConstants: true,
+                  showStructs: true,
+                  showModules: true,
+                  showProperties: true,
+                  showInlineDetails: true,
+                  showStatusBar: true,
+                  preview: true,
+                  previewMode: 'subwordSmart',
+                  localityBonus: true,
+                  snippetsPreventQuickSuggestions: false,
+                },
+              }}
+              loading={
+                <div className="py-4 px-2 font-mono text-xs space-y-1.5 bg-[#0A1027] text-[#E4ECFF] h-full overflow-auto">
+                  {codeLines.map((lineText, idx) => (
+                    <div key={idx + 1} className="flex items-center gap-2.5 px-1 py-0.5">
+                      <span className="w-6 text-right text-[#5B78B8] select-none font-semibold">{idx + 1}</span>
+                      <span className="whitespace-pre">{lineText}</span>
+                    </div>
+                  ))}
+                </div>
+              }
+            />
+          </div>
+
+          {/* Resizable Drag Handle */}
+          <div
+            onMouseDown={handleMouseDownDivider}
+            onDoubleClick={() => setEditorHeight(360)}
+            title={explainLanguage === 'bn' ? 'ড্র্যাগ করে এডিটরের আকার পরিবর্তন করুন (রিসেট করতে ডাবল ক্লিক)' : 'Drag to resize editor (double click to reset)'}
+            className="h-2 bg-[var(--bg-gutter)] hover:bg-[var(--accent-primary)]/30 cursor-row-resize flex items-center justify-center transition-colors group select-none border-t border-b border-[var(--border-subtle)]"
+          >
+            <div className="w-10 h-1 bg-slate-600 group-hover:bg-[var(--text-accent)] rounded-full transition-colors" />
+          </div>
+
+          {/* Editor Status Bar */}
+          <div className="flex items-center justify-between px-4 py-1.5 bg-[var(--bg-gutter)] text-xs font-mono text-[var(--text-secondary)] select-none">
+            <div className="flex items-center gap-4">
+              <span className="font-semibold text-[var(--text-primary)]">{fileName}</span>
+              <span>
+                Ln {cursorPosition.lineNumber}, Col {cursorPosition.column}
               </span>
-            )}
+            </div>
+            <div className="flex items-center gap-4">
+              <span>{code ? `${codeLines.length} lines` : '0 lines'}</span>
+              <span className="uppercase text-[var(--text-accent)] font-semibold">{language}</span>
+            </div>
           </div>
-
-          {hasExecuted && !isCompileError && (
-            <span className="text-xs font-mono text-slate-400">
-              {explainLanguage === 'bn'
-                ? `মোট ধাপ: ${trace.steps.length}`
-                : `Total steps: ${trace.steps.length}`}
-            </span>
-          )}
         </div>
 
-        {/* Tab 1: Problems / Diagnostics Panel */}
-        {activeConsoleTab === 'problems' ? (
-          <div className="space-y-2">
-            {displayDiagnostics.length === 0 ? (
-              <div className="p-3.5 rounded-xl bg-[#080C14] border border-[#1E293B] font-mono text-xs text-slate-500 select-none">
-                // {explainLanguage === 'bn' ? 'কোডে কোনো ত্রুটি বা সতর্কতা পাওয়া যায়নি।' : 'No problems detected in the file.'}
-              </div>
+        {/* DRAGGABLE VERTICAL SPLIT DIVIDER (Desktop) */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={explainLanguage === 'bn' ? 'প্যানেল আকার পরিবর্তন করুন' : 'Resize split panes'}
+          onMouseDown={handleMouseDownSplit}
+          onTouchStart={handleTouchStartSplit}
+          onDoubleClick={() => setLeftPanePct(50)}
+          title={
+            explainLanguage === 'bn'
+              ? 'ড্র্যাগ করে এডিটর ও ভিজ্যুয়ালাইজার আকার পরিবর্তন করুন (রিসেট করতে ডাবল ক্লিক)'
+              : 'Drag to resize editor and visualizer (double-click to reset)'
+          }
+          data-testid="split-pane-divider"
+          className={`hidden lg:flex w-1.5 shrink-0 cursor-col-resize items-center justify-center relative group select-none transition-colors ${
+            isSplitDragging
+              ? 'bg-indigo-500/25'
+              : 'bg-transparent hover:bg-indigo-500/15'
+          }`}
+        >
+          <div
+            className={`w-px h-full transition-colors ${
+              isSplitDragging
+                ? 'bg-indigo-400 shadow-[0_0_8px_rgba(99,102,241,0.6)]'
+                : 'bg-[var(--border-subtle)] group-hover:bg-indigo-400/70'
+            }`}
+          />
+          <div
+            className={`absolute w-1 h-8 rounded-full transition-all ${
+              isSplitDragging
+                ? 'bg-indigo-400 scale-y-110'
+                : 'bg-slate-600/70 group-hover:bg-indigo-400'
+            }`}
+          />
+        </div>
+
+        {/* RIGHT PANE: Live Logic & Memory Visualizer */}
+        <div className="w-full lg:flex-1 lg:min-w-[280px] flex flex-col justify-center min-w-0 bg-[var(--bg-panel)]">
+          <div className="flex-1 p-4 sm:p-5 flex flex-col justify-center min-h-[260px]">
+            {hasExecuted || isTracing ? (
+              <StageCanvas />
             ) : (
-              <div className="space-y-1.5 max-h-60 overflow-y-auto">
-                {displayDiagnostics.map((d, idx) => (
-                  <button
-                    key={idx}
-                    type="button"
-                    onClick={() => handleJumpToDiagnostic(d)}
-                    className="w-full text-left p-2.5 rounded-lg bg-[#080C14] border border-[#1E293B] hover:border-blue-500/40 hover:bg-slate-800/40 flex items-start gap-2.5 transition-colors cursor-pointer group"
-                  >
-                    {d.severity === 'error' ? (
-                      <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                    ) : d.severity === 'warning' ? (
-                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                    ) : (
-                      <Info className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
-                    )}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 text-xs font-mono">
-                        <span
-                          className={`font-bold uppercase text-[10px] px-1.5 py-0.5 rounded ${
-                            d.severity === 'error'
-                              ? 'bg-red-500/20 text-red-400'
-                              : d.severity === 'warning'
-                              ? 'bg-amber-500/20 text-amber-400'
-                              : 'bg-blue-500/20 text-blue-400'
-                          }`}
-                        >
-                          {d.severity}
-                        </span>
-                        <span className="text-slate-400 group-hover:text-blue-400">
-                          {fileName}:{d.line}{d.column ? `:${d.column}` : ''}
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-200 mt-1 font-mono whitespace-pre-wrap leading-relaxed m-0">
-                        {d.message}
-                      </p>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        ) : (
-          /* Tab 2: Program Output Panel */
-          <div>
-            {!hasExecuted ? (
-              <div
-                className="p-3.5 rounded-xl bg-[#080C14] border border-[#1E293B] font-mono text-xs text-slate-500 select-none"
-                data-testid="output-zero-state"
-              >
-                // {explainLanguage === 'bn' ? 'কোড রান করলে আউটপুট এখানে দেখাবে' : 'Program output will appear here'}
-              </div>
-            ) : isCompileError ? (
-              <div
-                className="p-4 rounded-xl bg-red-950/20 border border-red-900/40 space-y-2.5"
-                role="alert"
-                data-testid="output-error-state"
-              >
-                {trace.errorDetails && (
-                  <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
-                    <span className="px-2 py-0.5 rounded bg-red-500/20 border border-red-500/40 text-red-400 font-bold">
-                      {trace.errorDetails.errorType || 'ERROR'}
-                    </span>
-                    <span className="text-slate-300 font-semibold">
-                      {explainLanguage === 'bn'
-                        ? `লাইন ${trace.errorDetails.lineNumber || trace.errorDetails.line || 1}`
-                        : `Line ${trace.errorDetails.lineNumber || trace.errorDetails.line || 1}`}
-                    </span>
-                    {trace.errorDetails.lineCode && (
-                      <code className="px-2 py-0.5 rounded bg-[#080C14] text-amber-300 break-all border border-[#1E293B]">
-                        {trace.errorDetails.lineCode}
-                      </code>
-                    )}
-                  </div>
-                )}
-                <p className="font-mono text-xs sm:text-sm text-red-400 font-medium whitespace-pre-wrap leading-relaxed m-0">
-                  {apiError
-                    ? explainLanguage === 'bn'
-                      ? apiError.message_bn
-                      : apiError.message_en
-                    : trace.errorDetails?.messageBn ||
-                      trace.errorDetails?.message ||
-                      trace.verdict.message}
+              <div className="flex flex-col items-center justify-center text-center py-10 px-4 space-y-1.5 select-none">
+                <p className="text-sm font-semibold text-[var(--text-primary)] m-0" lang={explainLanguage}>
+                  {explainLanguage === 'bn'
+                    ? 'লাইভ লজিক ভিজ্যুয়ালাইজার'
+                    : 'Live Logic Visualizer'}
                 </p>
-                {trace.errorDetails?.solutionBn && (
-                  <div
-                    lang={explainLanguage}
-                    className="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-900/50 text-xs text-emerald-400 font-medium leading-relaxed"
-                  >
-                    <strong className="mr-1.5 text-emerald-300">
-                      {explainLanguage === 'bn' ? '💡 সমাধান:' : '💡 Solution:'}
-                    </strong>
-                    <span>{trace.errorDetails.solutionBn}</span>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {hasWarnings && (
-                  <div
-                    className="p-3.5 rounded-xl bg-amber-950/20 border border-amber-900/40 space-y-2"
-                    role="status"
-                    data-testid="output-warning-state"
-                  >
-                    <div className="flex items-center gap-2 font-mono text-xs text-amber-400 font-bold">
-                      <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40">
-                        WARNING
-                      </span>
-                      <span>
-                        {explainLanguage === 'bn'
-                          ? `${diagnostics.filter((d) => d.severity === 'warning').length}টি সতর্কতা (কোড কার্যকরভাবে চলছে)`
-                          : `${diagnostics.filter((d) => d.severity === 'warning').length} warning(s) found (code execution proceeded)`}
-                      </span>
-                    </div>
-                    <div className="space-y-1">
-                      {diagnostics
-                        .filter((d) => d.severity === 'warning')
-                        .map((diag, i) => (
-                          <div key={i} className="text-xs font-mono text-amber-300/90 flex items-start gap-2">
-                            <span className="text-slate-400 font-semibold shrink-0">Ln {diag.line}:</span>
-                            <span>{diag.message}</span>
-                          </div>
-                        ))}
-                    </div>
-                  </div>
-                )}
-                <div
-                  className="p-3.5 sm:p-4 rounded-xl bg-[#080C14] border border-[#1E293B] space-y-2"
-                  data-testid="output-success-state"
-                >
-                  <pre className="font-mono text-xs sm:text-sm font-semibold text-emerald-400 whitespace-pre-wrap break-words m-0 leading-relaxed">
-                    {trace.finalOutput
-                      ? trace.finalOutput
-                      : explainLanguage === 'bn'
-                      ? '(প্রোগ্রামটি কোনো টেক্সট প্রিন্ট করেনি — মেমোরি পরিবর্তন নিচে দেখুন)'
-                      : '(Program printed no stdout text — inspect memory state changes below)'}
-                  </pre>
-                  {trace.outputExplanation && (
-                    <p
-                      lang={explainLanguage}
-                      className="text-xs text-slate-400 leading-relaxed m-0 pt-1.5 border-t border-slate-800"
-                    >
-                      {trace.outputExplanation}
-                    </p>
-                  )}
-                </div>
+                <p className="text-xs text-[var(--text-secondary)] max-w-xs m-0 leading-relaxed" lang={explainLanguage}>
+                  {explainLanguage === 'bn'
+                    ? 'কোড রান করলে এখানে ধাপে ধাপে অ্যানিমেশন দেখাবে।'
+                    : 'Run your code to see step-by-step animation here.'}
+                </p>
               </div>
             )}
           </div>
-        )}
+        </div>
       </div>
+
+      {/* 3. Unified Program Output, Problems & Input Console */}
+      <OutputConsole
+        getEditorCode={() => (editorRef.current ? editorRef.current.getValue() : code)}
+        liveDiagnostics={liveDiagnostics}
+        onJumpToDiagnostic={handleJumpToDiagnostic}
+      />
     </section>
   );
 };

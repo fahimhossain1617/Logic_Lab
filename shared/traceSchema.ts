@@ -48,6 +48,36 @@ export const ProgramSummarySchema = z.object({
   finalOutput: z.string(),
 });
 
+export const VariableSnapshotSchema = z.object({
+  name: z.string(),
+  type: z.string(),
+  value: z.any(),
+  memoryAddress: z.string().nullable().optional(),
+  referenceId: z.string().nullable().optional(),
+  pointsTo: z.string().nullable().optional(),
+  changed: z.boolean().optional(),
+});
+
+export const ComparisonVisualSchema = z.object({
+  leftVar: z.string().nullable().optional(),
+  rightVar: z.string().nullable().optional(),
+  leftLabel: z.string(),
+  rightLabel: z.string(),
+  operator: z.string(),
+  result: z.boolean(),
+  reason: z.string().nullable().optional(),
+});
+
+export const VisualCueSchema = z.object({
+  mode: z
+    .enum(['memory', 'compare', 'reference', 'mutate', 'loop', 'output', 'call', 'return'])
+    .optional(),
+  highlightVars: z.array(z.string()).optional(),
+  compareVars: z.tuple([z.string(), z.string()]).nullable().optional(),
+  linkVars: z.array(z.string()).nullable().optional(),
+  comparison: ComparisonVisualSchema.nullable().optional(),
+});
+
 export const TraceStepSchema = z.object({
   stepIndex: z.number(),
   activeLine: z.number(),
@@ -97,11 +127,19 @@ export const TraceStepSchema = z.object({
   codeSnippet: z.string().optional(),
   actionType: z
     .enum([
+      'DECLARATION',
+      'ALLOCATION',
       'DECLARE',
       'ASSIGN',
+      'CONDITION',
+      'LOOP',
       'LOOP_CHECK',
       'CONDITION_CHECK',
+      'COMPARISON',
+      'CALL',
       'OUTPUT',
+      'RETURN',
+      'SCOPE_END',
       'METHOD_ENTRY',
       'BLOCK_END',
     ])
@@ -111,18 +149,26 @@ export const TraceStepSchema = z.object({
   consoleOutput: z.string().nullable().optional(),
   whatHappenedBn: z.string().optional(),
   logicBuildingBn: z.string().optional(),
+  whatHappened: z.string().optional(),
+  whyAndLogic: z.string().optional(),
+  variableSnapshots: z.array(VariableSnapshotSchema).nullable().optional(),
+  visualCue: VisualCueSchema.nullable().optional(),
 });
 
 export const LineNoteSchema = z.object({
   line: z.number(),
   role: z.enum([
+    'declaration',
     'declare',
+    'allocation',
     'assign',
     'condition',
+    'comparison',
     'loop',
     'call',
     'return',
     'output',
+    'scope_end',
     'block_end',
     'comment',
   ]),

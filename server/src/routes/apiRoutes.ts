@@ -1,4 +1,7 @@
 import { Router, Request, Response } from 'express';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { z } from 'zod';
 import {
   generateExecutionTrace,
@@ -12,7 +15,19 @@ import { SAMPLE_PROGRAMS } from '../../../src/data/sampleTraces';
 import { PROBLEM_LIBRARY } from '../../../src/data/problemLibrary';
 import { runDeterministicMultiLanguage } from '../tracers/realExecutionRunner';
 import { analyzeCode, executeCode } from '../services/toolchains/toolchainManager';
-import { ExecutionDiagnostic, ExecutionStatus, ExecutionTrace, SupportedLanguage } from '../../../shared/types';
+import {
+  sendSessionInput,
+  startInteractiveSession,
+  stopInteractiveSession,
+  subscribeToSession,
+} from '../services/interactiveRunner';
+import {
+  CodeExecutionRecord,
+  ExecutionDiagnostic,
+  ExecutionStatus,
+  ExecutionTrace,
+  SupportedLanguage,
+} from '../../../shared/types';
 
 export const apiRouter = Router();
 
@@ -76,11 +91,134 @@ interface StoredShare {
   createdAt: string;
 }
 
+interface StoredUserAccount {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL: string;
+  lastLoginAt: string;
+}
+
 const snippetsByUid = new Map<string, StoredSnippet[]>();
 const historyByUid = new Map<string, StoredHistoryItem[]>();
+const executionsByUid = new Map<string, CodeExecutionRecord[]>();
 const progressByUid = new Map<string, StoredProgress>();
 const settingsByUid = new Map<string, Record<string, any>>();
+const userAccountsByUid = new Map<string, StoredUserAccount>();
 const sharesById = new Map<string, StoredShare>();
+
+const PERSIST_FILE_PATH = path.join(os.tmpdir(), 'logic-lab-auth-store.json');
+const IS_TEST_RUNNER = Boolean(process.env.NODE_TEST_CONTEXT || process.argv.some((a) => a.includes('test')));
+
+function loadPersistedAuthStore() {
+  if (IS_TEST_RUNNER) return;
+  try {
+    if (!fs.existsSync(PERSIST_FILE_PATH)) return;
+    const raw = fs.readFileSync(PERSIST_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.users && typeof parsed.users === 'object') {
+        for (const [k, v] of Object.entries(parsed.users)) {
+          userAccountsByUid.set(k, v as StoredUserAccount);
+        }
+      }
+      if (parsed.history && typeof parsed.history === 'object') {
+        for (const [k, v] of Object.entries(parsed.history)) {
+          if (Array.isArray(v)) historyByUid.set(k, v as StoredHistoryItem[]);
+        }
+      }
+      if (parsed.executions && typeof parsed.executions === 'object') {
+        for (const [k, v] of Object.entries(parsed.executions)) {
+          if (Array.isArray(v)) executionsByUid.set(k, v as CodeExecutionRecord[]);
+        }
+      }
+      if (parsed.snippets && typeof parsed.snippets === 'object') {
+        for (const [k, v] of Object.entries(parsed.snippets)) {
+          if (Array.isArray(v)) snippetsByUid.set(k, v as StoredSnippet[]);
+        }
+      }
+    }
+  } catch {
+    // Non-fatal on read-only environments
+  }
+}
+
+function savePersistedAuthStore() {
+  if (IS_TEST_RUNNER) return;
+  try {
+    const serializeAuthenticated = <T>(m: Map<string, T>) => {
+      const out: Record<string, T> = {};
+      for (const [k, v] of m.entries()) {
+        if (k !== 'guest-local' && !k.startsWith('user-')) {
+          out[k] = v;
+        }
+      }
+      return out;
+    };
+    const payload = {
+      users: Object.fromEntries(userAccountsByUid.entries()),
+      history: serializeAuthenticated(historyByUid),
+      executions: serializeAuthenticated(executionsByUid),
+      snippets: serializeAuthenticated(snippetsByUid),
+    };
+    fs.writeFileSync(PERSIST_FILE_PATH, JSON.stringify(payload), 'utf8');
+  } catch {
+    // Non-fatal on read-only/serverless environments
+  }
+}
+
+loadPersistedAuthStore();
+
+async function verifyFirebaseIdToken(idToken: string): Promise<{
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL: string;
+} | null> {
+  const apiKey = process.env.VITE_FIREBASE_API_KEY;
+  if (apiKey && !apiKey.startsWith('YOUR_')) {
+    try {
+      const res = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        const user = data?.users?.[0];
+        if (user?.localId) {
+          return {
+            uid: String(user.localId),
+            email: String(user.email || ''),
+            displayName: String(user.displayName || user.email?.split('@')[0] || 'Logic Lab User'),
+            photoURL: String(user.photoUrl || ''),
+          };
+        }
+      }
+    } catch {
+      // Fallback to JWT claim decode below if network unavailable
+    }
+  }
+
+  try {
+    const parts = idToken.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    const uid = payload.user_id || payload.sub;
+    if (!uid || typeof uid !== 'string') return null;
+    return {
+      uid,
+      email: String(payload.email || ''),
+      displayName: String(payload.name || payload.email?.split('@')[0] || 'Logic Lab User'),
+      photoURL: String(payload.picture || ''),
+    };
+  } catch {
+    return null;
+  }
+}
 
 // Seed default demo share link so `/s/demo-swap` always works
 sharesById.set('demo-swap', {
@@ -114,6 +252,83 @@ apiRouter.get('/health', (_req: Request, res: Response) => {
     sharesCount: sharesById.size,
     timestamp: new Date().toISOString(),
   });
+});
+
+// Auth Session Endpoints (/api/auth/session, /api/auth/logout)
+apiRouter.post('/auth/session', async (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  const bearerToken =
+    typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : '';
+
+  let verifiedUser: {
+    uid: string;
+    email: string;
+    displayName: string;
+    photoURL: string;
+  } | null = null;
+
+  if (bearerToken) {
+    verifiedUser = await verifyFirebaseIdToken(bearerToken);
+  }
+
+  const uid = verifiedUser?.uid || resolveUid(req);
+  if (!uid || uid === 'guest-local') {
+    return res.status(401).json({
+      error: {
+        code: 'UNAUTHORIZED',
+        message_bn: 'বৈধ লগইন সেশন পাওয়া যায়নি।',
+        message_en: 'No valid authenticated session found.',
+      },
+    });
+  }
+
+  const account: StoredUserAccount = {
+    uid,
+    email: verifiedUser?.email || String(req.body?.email || '').slice(0, 200),
+    displayName:
+      verifiedUser?.displayName ||
+      String(req.body?.displayName || 'Logic Lab User').slice(0, 120),
+    photoURL: verifiedUser?.photoURL || String(req.body?.photoURL || '').slice(0, 500),
+    lastLoginAt: new Date().toISOString(),
+  };
+
+  userAccountsByUid.set(uid, account);
+  savePersistedAuthStore();
+
+  return res.json({
+    authenticated: true,
+    user: account,
+    history: historyByUid.get(uid) || [],
+    executions: executionsByUid.get(uid) || [],
+    snippets: snippetsByUid.get(uid) || [],
+  });
+});
+
+apiRouter.get('/auth/session', async (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  const bearerToken =
+    typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : '';
+  let uid = resolveUid(req);
+  if (bearerToken) {
+    const verified = await verifyFirebaseIdToken(bearerToken);
+    if (verified?.uid) uid = verified.uid;
+  }
+  if (!uid || uid === 'guest-local') {
+    return res.json({ authenticated: false, user: null });
+  }
+  const account = userAccountsByUid.get(uid) || null;
+  return res.json({
+    authenticated: Boolean(account),
+    user: account,
+  });
+});
+
+apiRouter.post('/auth/logout', (_req: Request, res: Response) => {
+  return res.json({ authenticated: false, ok: true });
 });
 
 apiRouter.post('/trace', traceRateLimiter, async (req: Request, res: Response) => {
@@ -198,13 +413,23 @@ apiRouter.post('/analyze', traceRateLimiter, async (req: Request, res: Response)
 
 // Sandboxed Real Execution Endpoint (/api/execute)
 apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response) => {
+  const execStartedAt = Date.now();
   const code = typeof req.body?.code === 'string' ? req.body.code : '';
-  const language: SupportedLanguage = req.body?.language || 'javascript';
+  const rawLang = req.body?.language;
+  const language: SupportedLanguage =
+    rawLang === 'python' || rawLang === 'cpp' || rawLang === 'java' || rawLang === 'javascript'
+      ? rawLang
+      : 'javascript';
   const stdin = typeof req.body?.stdin === 'string' ? req.body.stdin : '';
   const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
 
   if (!code.trim()) {
     return res.status(400).json({
+      success: false,
+      stdout: '',
+      stderr: 'Please provide non-empty code to execute.',
+      exitCode: 1,
+      executionTimeMs: 0,
       error: {
         code: 'EMPTY_CODE',
         message_bn: 'চালানোর জন্য কোড লিখুন।',
@@ -215,10 +440,10 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
 
   const prep = preprocessCode(code, language);
 
-  // 1. Run actual toolchain compilation and sandboxed execution
+  // 1. Run actual toolchain compilation and sandboxed execution with real stdin piping (zero AI tokens)
   const toolchainRes = await executeCode(prep.code, language, stdin, 4000, fileName);
 
-  // 2. Run deterministic step simulation for UI visualization
+  // 2. Run deterministic step simulation for UI visualization compatibility
   const simResult = runDeterministicMultiLanguage(prep.code, language, stdin, 1200);
 
   // Adjust line numbers if boilerplate lines were prepended
@@ -240,17 +465,37 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
   const hasWarnings = combinedDiagnostics.some((d) => d.severity === 'warning');
   const status: ExecutionStatus = hasErrors ? 'error' : hasWarnings ? 'warning' : 'success';
   const canRun = !hasErrors;
+  const success =
+    canRun &&
+    !toolchainRes.timedOut &&
+    (toolchainRes.exitCode === 0 || toolchainRes.exitCode === null);
 
   const output = toolchainRes.output || simResult.stdout || '';
+  const stdout =
+    typeof toolchainRes.stdout === 'string' && (toolchainRes.stdout.length > 0 || !canRun)
+      ? toolchainRes.stdout
+      : simResult.stdout || '';
+  const stderr =
+    toolchainRes.stderr ||
+    toolchainRes.runtimeError ||
+    (!canRun ? output : simResult.stderr || '');
+  const executionTimeMs = Math.max(
+    1,
+    toolchainRes.executionTimeMs > 0
+      ? toolchainRes.executionTimeMs
+      : Date.now() - execStartedAt
+  );
 
   return res.json({
     ...simResult,
+    success,
     status,
     canRun,
     output,
-    stdout: toolchainRes.stdout || simResult.stdout,
-    stderr: toolchainRes.stderr || simResult.stderr,
+    stdout,
+    stderr,
     exitCode: toolchainRes.exitCode,
+    executionTimeMs,
     timedOut: toolchainRes.timedOut,
     runtimeError: toolchainRes.runtimeError,
     diagnostics: combinedDiagnostics,
@@ -258,6 +503,144 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
     traceSource: 'real_execution',
     language,
   });
+});
+
+// Interactive Terminal Execution Endpoints (/api/execute/start, /stream/:sessionId, /input, /stop)
+apiRouter.post('/execute/start', traceRateLimiter, async (req: Request, res: Response) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code : '';
+  const rawLang = req.body?.language;
+  const language: SupportedLanguage =
+    rawLang === 'python' || rawLang === 'cpp' || rawLang === 'java' || rawLang === 'javascript'
+      ? rawLang
+      : 'javascript';
+  const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
+
+  if (!code.trim()) {
+    return res.status(400).json({
+      ok: false,
+      diagnostics: [],
+      stderr: 'Please provide non-empty code to execute.',
+      runtimeError: 'Please provide non-empty code to execute.',
+    });
+  }
+
+  const result = await startInteractiveSession(code, language, fileName);
+  if (!result.ok) {
+    return res.status(200).json(result);
+  }
+  return res.json(result);
+});
+
+apiRouter.get('/execute/stream/:sessionId', (req: Request, res: Response) => {
+  const sessionId = String(req.params.sessionId || '');
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const unsubscribe = subscribeToSession(sessionId, (ev) => {
+    res.write(`event: ${ev.type}\n`);
+    res.write(`data: ${JSON.stringify(ev.data)}\n\n`);
+    if (ev.type === 'exit') {
+      res.end();
+    }
+  });
+
+  if (!unsubscribe) {
+    res.write(`event: exit\n`);
+    res.write(
+      `data: ${JSON.stringify({
+        exitCode: 1,
+        timedOut: false,
+        executionTimeMs: 0,
+        success: false,
+        stdout: '',
+        stderr: 'Execution session not found or expired.',
+      })}\n\n`
+    );
+    res.end();
+    return;
+  }
+
+  req.on('close', () => {
+    unsubscribe();
+  });
+});
+
+apiRouter.post('/execute/input', (req: Request, res: Response) => {
+  const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
+  const input = typeof req.body?.input === 'string' ? req.body.input : '';
+
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: 'Missing sessionId' });
+  }
+
+  const ok = sendSessionInput(sessionId, input);
+  return res.json({ ok });
+});
+
+apiRouter.post('/execute/stop', (req: Request, res: Response) => {
+  const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
+  if (!sessionId) {
+    return res.status(400).json({ ok: false });
+  }
+  const ok = stopInteractiveSession(sessionId);
+  return res.json({ ok });
+});
+
+// Code Executions Log CRUD (/api/executions) — guest & signed-in fallback store
+apiRouter.get('/executions', (req: Request, res: Response) => {
+  const uid = resolveUid(req);
+  const list = executionsByUid.get(uid) || [];
+  res.json({ executions: list });
+});
+
+apiRouter.post('/executions', (req: Request, res: Response) => {
+  const uid = resolveUid(req);
+  const list = executionsByUid.get(uid) || [];
+  const rawLang = req.body?.language;
+  const language: SupportedLanguage =
+    rawLang === 'python' || rawLang === 'cpp' || rawLang === 'java' || rawLang === 'javascript'
+      ? rawLang
+      : 'javascript';
+  const execution_mode = req.body?.execution_mode === 'explain' ? 'explain' : 'fast';
+
+  const record: CodeExecutionRecord = {
+    id: String(req.body?.id || `exec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`).slice(0, 120),
+    userId: uid === 'guest-local' ? null : uid,
+    language,
+    source_code: String(req.body?.source_code || '').slice(0, 20000),
+    stdin_input: String(req.body?.stdin_input || '').slice(0, 4000),
+    stdout_output: String(req.body?.stdout_output || '').slice(0, 20000),
+    stderr_output: req.body?.stderr_output ? String(req.body.stderr_output).slice(0, 10000) : '',
+    exit_code: typeof req.body?.exit_code === 'number' ? req.body.exit_code : null,
+    execution_mode,
+    execution_time_ms: Math.max(0, Math.round(Number(req.body?.execution_time_ms) || 0)),
+    success: Boolean(req.body?.success ?? true),
+    file_name: req.body?.file_name ? String(req.body.file_name).slice(0, 140) : undefined,
+    created_at: req.body?.created_at ? String(req.body.created_at) : new Date().toISOString(),
+  };
+
+  const next = [record, ...list.filter((item) => item.id !== record.id)].slice(0, 30);
+  executionsByUid.set(uid, next);
+  savePersistedAuthStore();
+  res.json({ execution: record, executions: next });
+});
+
+apiRouter.delete('/executions', (req: Request, res: Response) => {
+  const uid = resolveUid(req);
+  executionsByUid.set(uid, []);
+  savePersistedAuthStore();
+  res.json({ executions: [] });
+});
+
+apiRouter.delete('/executions/:id', (req: Request, res: Response) => {
+  const uid = resolveUid(req);
+  const list = executionsByUid.get(uid) || [];
+  const next = list.filter((item) => item.id !== req.params.id);
+  executionsByUid.set(uid, next);
+  savePersistedAuthStore();
+  res.json({ executions: next });
 });
 
 // Curated 13-problem library endpoints
@@ -306,6 +689,7 @@ apiRouter.post('/snippets', (req: Request, res: Response) => {
   };
   const next = [item, ...list.filter((s) => s.id !== item.id)].slice(0, 50);
   snippetsByUid.set(uid, next);
+  savePersistedAuthStore();
   res.json({ snippet: item, snippets: next });
 });
 
@@ -324,6 +708,7 @@ apiRouter.put('/snippets/:id', (req: Request, res: Response) => {
       : s
   );
   snippetsByUid.set(uid, next);
+  savePersistedAuthStore();
   res.json({ snippets: next });
 });
 
@@ -332,6 +717,7 @@ apiRouter.delete('/snippets/:id', (req: Request, res: Response) => {
   const list = snippetsByUid.get(uid) || [];
   const next = list.filter((s) => s.id !== req.params.id);
   snippetsByUid.set(uid, next);
+  savePersistedAuthStore();
   res.json({ snippets: next });
 });
 
@@ -345,9 +731,10 @@ apiRouter.get('/history', (req: Request, res: Response) => {
 apiRouter.post('/history', (req: Request, res: Response) => {
   const uid = resolveUid(req);
   const list = historyByUid.get(uid) || [];
-  const entry: StoredHistoryItem = {
+  const entry: StoredHistoryItem & { fileName?: string } = {
     id: req.body?.id || `run-${Date.now()}`,
     uid,
+    fileName: req.body?.fileName ? String(req.body.fileName).slice(0, 140) : undefined,
     title_bn: String(req.body?.title_bn || 'কোড রান').slice(0, 160),
     title_en: String(req.body?.title_en || 'Code Run').slice(0, 160),
     language: req.body?.language || 'javascript',
@@ -359,7 +746,15 @@ apiRouter.post('/history', (req: Request, res: Response) => {
   };
   const next = [entry, ...list.filter((h) => h.id !== entry.id)].slice(0, 30);
   historyByUid.set(uid, next);
+  savePersistedAuthStore();
   res.json({ entry, history: next });
+});
+
+apiRouter.delete('/history', (req: Request, res: Response) => {
+  const uid = resolveUid(req);
+  historyByUid.set(uid, []);
+  savePersistedAuthStore();
+  res.json({ history: [] });
 });
 
 apiRouter.delete('/history/:id', (req: Request, res: Response) => {
@@ -367,6 +762,7 @@ apiRouter.delete('/history/:id', (req: Request, res: Response) => {
   const list = historyByUid.get(uid) || [];
   const next = list.filter((h) => h.id !== req.params.id);
   historyByUid.set(uid, next);
+  savePersistedAuthStore();
   res.json({ history: next });
 });
 

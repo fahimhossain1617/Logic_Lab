@@ -9,10 +9,17 @@ import {
   ExplainLanguage,
   ExplanationDepth,
   ProgramSummary,
+  RuntimeActionType,
   SupportedLanguage,
   TraceErrorDetails,
   TraceStep,
+  VariableSnapshot,
+  VisualCue,
 } from '../../../shared/types';
+import {
+  extractDeclaredVariableTypes,
+  resolveAccurateVariableType,
+} from '../../../shared/declaredTypeHelper';
 import { preprocessCode } from './codePreprocessor';
 import { ExecutionTraceSchema } from '../../../shared/traceSchema';
 import {
@@ -37,6 +44,8 @@ export interface ApiNotice {
   message_en: string;
 }
 
+const modelCooldownUntil = new Map<string, number>();
+
 export interface TraceServiceResult extends ExecutionResultPayload {
   hasError: boolean;
   errorDetails: TraceErrorDetails | null;
@@ -59,9 +68,11 @@ export function computeTraceHash(params: {
   explainLanguage: ExplainLanguage;
   depth: ExplanationDepth;
   fileName?: string;
+  stdin?: string;
 }): string {
   const filePart = params.fileName ? `::${params.fileName.trim()}` : '';
-  const payload = `v4::${params.language}::${params.explainLanguage}::${params.depth}${filePart}::${params.code.trim()}`;
+  const stdinPart = params.stdin ? `::stdin=${params.stdin}` : '';
+  const payload = `v7::${params.language}::${params.explainLanguage}::${params.depth}${filePart}${stdinPart}::${params.code.trim()}`;
   return crypto.createHash('sha256').update(payload).digest('hex');
 }
 
@@ -95,15 +106,37 @@ const VALID_ANALOGIES = new Set<AnalogyType>([
 ]);
 
 const VALID_ROLES = new Set([
+  'declaration',
   'declare',
+  'allocation',
   'assign',
   'condition',
+  'comparison',
   'loop',
   'call',
   'return',
   'output',
+  'scope_end',
   'block_end',
   'comment',
+]);
+
+const VALID_OPERATION_TAGS = new Set<RuntimeActionType>([
+  'DECLARATION',
+  'ALLOCATION',
+  'DECLARE',
+  'ASSIGN',
+  'CONDITION',
+  'LOOP',
+  'LOOP_CHECK',
+  'CONDITION_CHECK',
+  'COMPARISON',
+  'CALL',
+  'OUTPUT',
+  'RETURN',
+  'SCOPE_END',
+  'METHOD_ENTRY',
+  'BLOCK_END',
 ]);
 
 const VALID_ACTIONS = new Set([
@@ -216,6 +249,11 @@ const TRACE_RESPONSE_SCHEMA = {
           activeLine: { type: Type.INTEGER },
           analogyType: { type: Type.STRING },
           action: { type: Type.STRING },
+          operationTag: {
+            type: Type.STRING,
+            description:
+              'AST-accurate tag: DECLARATION, ALLOCATION, ASSIGN, CONDITION, LOOP, COMPARISON, CALL, OUTPUT, RETURN, or SCOPE_END',
+          },
           from: { type: Type.STRING, nullable: true },
           to: { type: Type.STRING, nullable: true },
           explanation: { type: Type.STRING },
@@ -237,6 +275,82 @@ const TRACE_RESPONSE_SCHEMA = {
             type: Type.STRING,
             description:
               'JSON object string of all current variables and their exact values after this step executes, e.g. {"a":5,"b":10}',
+          },
+          variableSnapshotsJson: {
+            type: Type.STRING,
+            nullable: true,
+            description:
+              'JSON array string of variable objects: [{"name":"a","type":"Integer","value":127,"memoryAddress":"@IntegerCache[127]","referenceId":"@IntegerCache[127]","pointsTo":null,"changed":true}]',
+          },
+          visualCue: {
+            type: Type.OBJECT,
+            nullable: true,
+            properties: {
+              mode: { type: Type.STRING },
+              highlightVars: {
+                type: Type.ARRAY,
+                nullable: true,
+                items: { type: Type.STRING },
+              },
+              compareVars: {
+                type: Type.ARRAY,
+                nullable: true,
+                items: { type: Type.STRING },
+              },
+              linkVars: {
+                type: Type.ARRAY,
+                nullable: true,
+                items: { type: Type.STRING },
+              },
+              comparison: {
+                type: Type.OBJECT,
+                nullable: true,
+                properties: {
+                  leftVar: { type: Type.STRING, nullable: true },
+                  rightVar: { type: Type.STRING, nullable: true },
+                  leftLabel: { type: Type.STRING },
+                  rightLabel: { type: Type.STRING },
+                  operator: { type: Type.STRING },
+                  result: { type: Type.BOOLEAN },
+                  reason: { type: Type.STRING, nullable: true },
+                },
+                required: ['leftLabel', 'rightLabel', 'operator', 'result'],
+              },
+            },
+          },
+          structure: {
+            type: Type.OBJECT,
+            nullable: true,
+            properties: {
+              kind: { type: Type.STRING },
+              valuesJson: {
+                type: Type.STRING,
+                nullable: true,
+                description:
+                  'JSON array string of structure values, e.g. "[5,2,8,1]" or "["fact(3)","fact(2)"]"',
+              },
+              highlight: {
+                type: Type.ARRAY,
+                nullable: true,
+                items: { type: Type.INTEGER },
+              },
+              swapping: {
+                type: Type.ARRAY,
+                nullable: true,
+                items: { type: Type.INTEGER },
+                description: 'Two-element index pair [i, j] when swapping elements, else null',
+              },
+              sortedFrom: { type: Type.INTEGER, nullable: true },
+              pointersJson: {
+                type: Type.STRING,
+                nullable: true,
+                description: 'JSON object string of pointer indices, e.g. "{\\"i\\":0,\\"j\\":1}"',
+              },
+              lap: { type: Type.INTEGER, nullable: true },
+              maxLaps: { type: Type.INTEGER, nullable: true },
+              conditionText: { type: Type.STRING, nullable: true },
+            },
+            required: ['kind'],
           },
           fault: {
             type: Type.OBJECT,
@@ -296,6 +410,40 @@ function normalizeGeminiRawOutput(
   const cleanCode = stripCommentsPreservingLines(code, fallbackLang);
   const codeLines = cleanCode.split('\n');
   const maxLine = Math.max(1, codeLines.length);
+  const declaredTypesByVar = extractDeclaredVariableTypes(cleanCode, fallbackLang);
+  let heapAllocCounter = 0;
+  const resolveMissingRef = (
+    name: string,
+    resolvedType: string,
+    val: any,
+    lineText: string
+  ): { memoryAddress: string | null; referenceId: string | null; pointsTo: string | null } => {
+    const aliasMatch = lineText.match(
+      new RegExp(`\\b${name}\\s*=\\s*(&?)([A-Za-z_$][\\w$]*)\\s*;?`)
+    );
+    if (aliasMatch && runningSnapshotMeta[aliasMatch[2]]) {
+      const targetSnap = runningSnapshotMeta[aliasMatch[2]];
+      const targetAddr = targetSnap.referenceId || targetSnap.memoryAddress;
+      if (targetAddr) {
+        return {
+          memoryAddress: targetAddr,
+          referenceId: targetAddr,
+          pointsTo: aliasMatch[1] === '&' ? aliasMatch[2] : targetSnap.pointsTo ?? null,
+        };
+      }
+    }
+    if (fallbackLang === 'java' && resolvedType === 'Integer' && typeof val === 'number' && Number.isInteger(val)) {
+      const usesNew = /\bnew\s+Integer\s*\(/.test(lineText);
+      if (!usesNew && val >= -128 && val <= 127) {
+        const addr = `@IntegerCache[${val}]`;
+        return { memoryAddress: addr, referenceId: addr, pointsTo: null };
+      }
+      heapAllocCounter++;
+      const hex = `@0x${(0x4a1 + heapAllocCounter * 0x17).toString(16).toUpperCase()}`;
+      return { memoryAddress: hex, referenceId: hex, pointsTo: null };
+    }
+    return { memoryAddress: null, referenceId: null, pointsTo: null };
+  };
 
   const topAnalogy: AnalogyType = VALID_ANALOGIES.has(rawObj.analogyType)
     ? rawObj.analogyType
@@ -308,9 +456,28 @@ function normalizeGeminiRawOutput(
             ? ln.line
             : Math.min(maxLine, i + 1);
         const rawLineText = (codeLines[lineNum - 1] || '').trim();
+        const isPrintLineNote =
+          /\b(System\.out\.print|console\.log|print\s*\(|cout\s*<<|printf\s*\()/.test(
+            rawLineText
+          );
+        const isScopeCloseNote = /^[\}\s;]*$/.test(rawLineText) && rawLineText.includes('}');
+        const isDeclNote =
+          /^(?:public|private|protected|class|interface|def|function|int\s+main\s*\(|void\s+\w+\s*\()/.test(
+            rawLineText
+          );
+        const rawRoleLower = typeof ln.role === 'string' ? ln.role.toLowerCase() : '';
+        const normalizedRole = isPrintLineNote
+          ? 'output'
+          : isScopeCloseNote
+          ? 'scope_end'
+          : isDeclNote
+          ? 'declaration'
+          : VALID_ROLES.has(rawRoleLower)
+          ? rawRoleLower
+          : inferLineRole(rawLineText);
         return {
           line: lineNum,
-          role: VALID_ROLES.has(ln.role) ? ln.role : inferLineRole(rawLineText),
+          role: normalizedRole,
           text: String(ln.text || ''),
           why: ln.why ? String(ln.why) : undefined,
         };
@@ -318,6 +485,7 @@ function normalizeGeminiRawOutput(
     : [];
 
   let runningVars: Record<string, any> = {};
+  let runningSnapshotMeta: Record<string, VariableSnapshot> = {};
 
   const steps = Array.isArray(rawObj.steps)
     ? rawObj.steps.slice(0, 120).map((s: any, idx: number) => {
@@ -392,19 +560,359 @@ function normalizeGeminiRawOutput(
           rawLineText
         );
 
+        let normalizedStructure = autoStructure;
+        if (
+          s.structure &&
+          typeof s.structure === 'object' &&
+          ['array', 'loop', 'stack', 'queue', 'list'].includes(s.structure.kind)
+        ) {
+          let parsedValues: (number | string)[] | null = null;
+          if (Array.isArray(s.structure.values)) {
+            parsedValues = s.structure.values.map((v: any) =>
+              typeof v === 'number' || typeof v === 'string' ? v : String(v)
+            );
+          } else if (typeof s.structure.valuesJson === 'string' && s.structure.valuesJson.trim()) {
+            try {
+              const arr = JSON.parse(s.structure.valuesJson);
+              if (Array.isArray(arr)) {
+                parsedValues = arr.map((v: any) =>
+                  typeof v === 'number' || typeof v === 'string' ? v : String(v)
+                );
+              }
+            } catch {}
+          }
+
+          let parsedPointers: Record<string, number> | null = null;
+          if (s.structure.pointers && typeof s.structure.pointers === 'object') {
+            parsedPointers = {};
+            for (const [pk, pv] of Object.entries(s.structure.pointers)) {
+              if (typeof pv === 'number' && Number.isFinite(pv)) {
+                parsedPointers[pk] = pv;
+              }
+            }
+          } else if (
+            typeof s.structure.pointersJson === 'string' &&
+            s.structure.pointersJson.trim()
+          ) {
+            try {
+              const obj = JSON.parse(s.structure.pointersJson);
+              if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+                parsedPointers = {};
+                for (const [pk, pv] of Object.entries(obj)) {
+                  if (typeof pv === 'number' && Number.isFinite(pv)) {
+                    parsedPointers[pk] = pv;
+                  }
+                }
+              }
+            } catch {}
+          }
+
+          const rawSwap = Array.isArray(s.structure.swapping) ? s.structure.swapping : null;
+          const normalizedSwapping: [number, number] | null =
+            rawSwap &&
+            rawSwap.length >= 2 &&
+            typeof rawSwap[0] === 'number' &&
+            typeof rawSwap[1] === 'number'
+              ? [rawSwap[0], rawSwap[1]]
+              : null;
+
+          const normalizedHighlight: number[] | null = Array.isArray(s.structure.highlight)
+            ? s.structure.highlight.filter((n: any) => typeof n === 'number' && Number.isFinite(n))
+            : null;
+
+          normalizedStructure = {
+            kind: s.structure.kind,
+            values: parsedValues ?? autoStructure?.values ?? null,
+            highlight: normalizedHighlight ?? autoStructure?.highlight ?? null,
+            swapping: normalizedSwapping,
+            sortedFrom:
+              typeof s.structure.sortedFrom === 'number' && Number.isFinite(s.structure.sortedFrom)
+                ? s.structure.sortedFrom
+                : null,
+            pointers: parsedPointers ?? autoStructure?.pointers ?? null,
+            lap:
+              typeof s.structure.lap === 'number' && Number.isFinite(s.structure.lap)
+                ? s.structure.lap
+                : autoStructure?.lap ?? null,
+            maxLaps:
+              typeof s.structure.maxLaps === 'number' && Number.isFinite(s.structure.maxLaps)
+                ? s.structure.maxLaps
+                : autoStructure?.maxLaps ?? null,
+            conditionText:
+              typeof s.structure.conditionText === 'string'
+                ? s.structure.conditionText
+                : autoStructure?.conditionText ?? null,
+          };
+        }
+
         const uiAct = VALID_ACTIONS.has(s.action) ? s.action : 'assign';
-        const mappedActionType =
-          uiAct === 'declare'
-            ? 'DECLARE'
+        const isPrintLine =
+          /\b(System\.out\.print|console\.log|print\s*\(|cout\s*<<|printf\s*\()/.test(
+            rawLineText
+          );
+        const isScopeClose = /^[\}\s;]*$/.test(rawLineText) && rawLineText.includes('}');
+
+        let mappedActionType: RuntimeActionType =
+          typeof s.operationTag === 'string' &&
+          VALID_OPERATION_TAGS.has(s.operationTag.toUpperCase() as RuntimeActionType)
+            ? (s.operationTag.toUpperCase() as RuntimeActionType)
+            : uiAct === 'declare'
+            ? 'DECLARATION'
             : uiAct === 'loop_check'
-            ? 'LOOP_CHECK'
+            ? 'LOOP'
             : uiAct === 'compare'
-            ? 'CONDITION_CHECK'
+            ? 'COMPARISON'
+            : uiAct === 'call'
+            ? 'CALL'
             : uiAct === 'return'
-            ? 'BLOCK_END'
+            ? 'RETURN'
             : s.stdout
             ? 'OUTPUT'
             : 'ASSIGN';
+
+        if (s.stdout || isPrintLine) {
+          mappedActionType = 'OUTPUT';
+        } else if (isScopeClose && mappedActionType === 'ASSIGN') {
+          mappedActionType = 'SCOPE_END';
+        }
+
+        // Parse language-accurate variableSnapshots (with memoryAddress, referenceId, pointsTo)
+        const changedNameSet = new Set(rawChanges.map((c: any) => c.name));
+        let normalizedSnapshots: VariableSnapshot[] | null = null;
+        const parseSnapshotsArray = (arr: any[]): VariableSnapshot[] =>
+          arr
+            .filter((item) => item && typeof item === 'object' && item.name)
+            .map((item) => {
+              const name = String(item.name);
+              const prevMeta = runningSnapshotMeta[name];
+              const val = item.value !== undefined ? item.value : variables[name];
+              const sameVal =
+                prevMeta && JSON.stringify(prevMeta.value) === JSON.stringify(val);
+              const resolvedType = resolveAccurateVariableType(
+                item.type || prevMeta?.type,
+                val,
+                fallbackLang,
+                name,
+                declaredTypesByVar
+              );
+              const explicitAddr = item.memoryAddress ? String(item.memoryAddress) : null;
+              const explicitRef = item.referenceId ? String(item.referenceId) : null;
+              const fallbackRef =
+                explicitAddr || explicitRef || (sameVal && prevMeta?.memoryAddress)
+                  ? null
+                  : resolveMissingRef(name, resolvedType, val, rawLineText);
+              return {
+                name,
+                type: resolvedType,
+                value: val,
+                memoryAddress:
+                  explicitAddr ||
+                  (sameVal ? prevMeta?.memoryAddress : null) ||
+                  fallbackRef?.memoryAddress ||
+                  null,
+                referenceId:
+                  explicitRef ||
+                  (sameVal ? prevMeta?.referenceId : null) ||
+                  fallbackRef?.referenceId ||
+                  explicitAddr ||
+                  null,
+                pointsTo: item.pointsTo
+                  ? String(item.pointsTo)
+                  : (sameVal ? prevMeta?.pointsTo : null) ||
+                    fallbackRef?.pointsTo ||
+                    null,
+                changed:
+                  typeof item.changed === 'boolean'
+                    ? item.changed
+                    : changedNameSet.has(name),
+              };
+            });
+
+        if (Array.isArray(s.variableSnapshots)) {
+          normalizedSnapshots = parseSnapshotsArray(s.variableSnapshots);
+        } else if (
+          typeof s.variableSnapshotsJson === 'string' &&
+          s.variableSnapshotsJson.trim()
+        ) {
+          try {
+            const parsedSnaps = JSON.parse(s.variableSnapshotsJson);
+            if (Array.isArray(parsedSnaps)) {
+              normalizedSnapshots = parseSnapshotsArray(parsedSnaps);
+            }
+          } catch {}
+        }
+
+        if (normalizedSnapshots && normalizedSnapshots.length > 0) {
+          for (const snap of normalizedSnapshots) {
+            runningSnapshotMeta[snap.name] = snap;
+            if (variables[snap.name] === undefined) {
+              variables[snap.name] = snap.value;
+            }
+          }
+          runningVars = { ...runningVars, ...variables };
+        } else if (Object.keys(variables).length > 0) {
+          normalizedSnapshots = Object.entries(variables).map(([vName, vVal]) => {
+            const prevMeta = runningSnapshotMeta[vName];
+            const sameVal =
+              prevMeta && JSON.stringify(prevMeta.value) === JSON.stringify(vVal);
+            const resolvedType = resolveAccurateVariableType(
+              prevMeta?.type,
+              vVal,
+              fallbackLang,
+              vName,
+              declaredTypesByVar
+            );
+            const missingRef =
+              sameVal && (prevMeta?.memoryAddress || prevMeta?.referenceId)
+                ? null
+                : resolveMissingRef(vName, resolvedType, vVal, rawLineText);
+            const snap: VariableSnapshot = {
+              name: vName,
+              type: resolvedType,
+              value: vVal,
+              memoryAddress:
+                (sameVal ? prevMeta?.memoryAddress : null) ||
+                missingRef?.memoryAddress ||
+                null,
+              referenceId:
+                (sameVal ? prevMeta?.referenceId : null) ||
+                missingRef?.referenceId ||
+                null,
+              pointsTo:
+                (sameVal ? prevMeta?.pointsTo : null) ||
+                missingRef?.pointsTo ||
+                null,
+              changed: changedNameSet.has(vName),
+            };
+            runningSnapshotMeta[vName] = snap;
+            return snap;
+          });
+        }
+
+        // Parse explicit visualCue (compareVars, linkVars, comparison pill)
+        const VALID_CUE_MODES = new Set([
+          'memory',
+          'compare',
+          'reference',
+          'mutate',
+          'loop',
+          'output',
+          'call',
+          'return',
+        ]);
+        let normalizedVisualCue: VisualCue | null = null;
+        if (s.visualCue && typeof s.visualCue === 'object') {
+          const rawCompare = Array.isArray(s.visualCue.compareVars)
+            ? s.visualCue.compareVars.map(String).filter(Boolean)
+            : null;
+          const comparePair: [string, string] | null =
+            rawCompare && rawCompare.length >= 2 ? [rawCompare[0], rawCompare[1]] : null;
+
+          const compObj =
+            s.visualCue.comparison &&
+            typeof s.visualCue.comparison === 'object' &&
+            s.visualCue.comparison.leftLabel &&
+            s.visualCue.comparison.rightLabel
+              ? {
+                  leftVar: s.visualCue.comparison.leftVar
+                    ? String(s.visualCue.comparison.leftVar)
+                    : comparePair?.[0] || null,
+                  rightVar: s.visualCue.comparison.rightVar
+                    ? String(s.visualCue.comparison.rightVar)
+                    : comparePair?.[1] || null,
+                  leftLabel: String(s.visualCue.comparison.leftLabel),
+                  rightLabel: String(s.visualCue.comparison.rightLabel),
+                  operator: String(s.visualCue.comparison.operator || '=='),
+                  result: Boolean(s.visualCue.comparison.result),
+                  reason: s.visualCue.comparison.reason
+                    ? String(s.visualCue.comparison.reason)
+                    : null,
+                }
+              : null;
+
+          normalizedVisualCue = {
+            mode: VALID_CUE_MODES.has(s.visualCue.mode) ? s.visualCue.mode : undefined,
+            highlightVars: Array.isArray(s.visualCue.highlightVars)
+              ? s.visualCue.highlightVars.map(String)
+              : undefined,
+            compareVars: comparePair,
+            linkVars: Array.isArray(s.visualCue.linkVars)
+              ? s.visualCue.linkVars.map(String)
+              : null,
+            comparison: compObj,
+          };
+        }
+
+        // Synthesize comparison visualCue if the line performs == / === / != / .equals() / < / > on known variables
+        if (!normalizedVisualCue?.comparison && normalizedSnapshots && normalizedSnapshots.length > 0) {
+          const snapByName = new Map(normalizedSnapshots.map((sn) => [sn.name, sn]));
+          const equalsCallMatch = rawLineText.match(/\b([A-Za-z_$][\w$]*)\.equals\(\s*([A-Za-z_$][\w$]*)\s*\)/);
+          const binOpMatch = rawLineText.match(/\b([A-Za-z_$][\w$]*)\s*(===|==|!==|!=|<=|>=|<|>)\s*([A-Za-z_$][\w$]*)\b/);
+
+          if (equalsCallMatch && snapByName.has(equalsCallMatch[1]) && snapByName.has(equalsCallMatch[2])) {
+            const left = snapByName.get(equalsCallMatch[1])!;
+            const right = snapByName.get(equalsCallMatch[2])!;
+            const res = JSON.stringify(left.value) === JSON.stringify(right.value);
+            normalizedVisualCue = {
+              ...(normalizedVisualCue || {}),
+              mode: 'compare',
+              compareVars: [left.name, right.name],
+              highlightVars: [left.name, right.name],
+              comparison: {
+                leftVar: left.name,
+                rightVar: right.name,
+                leftLabel: `value(${String(left.value)})`,
+                rightLabel: `value(${String(right.value)})`,
+                operator: '.equals()',
+                result: res,
+                reason: normalizedVisualCue?.comparison?.reason || null,
+              },
+            };
+          } else if (binOpMatch && snapByName.has(binOpMatch[1]) && snapByName.has(binOpMatch[3])) {
+            const left = snapByName.get(binOpMatch[1])!;
+            const op = binOpMatch[2];
+            const right = snapByName.get(binOpMatch[3])!;
+            const useRefCompare =
+              (op === '==' || op === '===') &&
+              Boolean(left.referenceId && right.referenceId) &&
+              (fallbackLang === 'java' || typeof left.value === 'object');
+            const leftLbl = useRefCompare
+              ? String(left.referenceId)
+              : `${left.name}(${String(left.value)})`;
+            const rightLbl = useRefCompare
+              ? String(right.referenceId)
+              : `${right.name}(${String(right.value)})`;
+            let res = false;
+            if (op === '==' || op === '===') {
+              res = useRefCompare
+                ? left.referenceId === right.referenceId
+                : left.value === right.value;
+            } else if (op === '!=' || op === '!==') {
+              res = useRefCompare
+                ? left.referenceId !== right.referenceId
+                : left.value !== right.value;
+            } else if (op === '<') res = Number(left.value) < Number(right.value);
+            else if (op === '>') res = Number(left.value) > Number(right.value);
+            else if (op === '<=') res = Number(left.value) <= Number(right.value);
+            else if (op === '>=') res = Number(left.value) >= Number(right.value);
+
+            normalizedVisualCue = {
+              ...(normalizedVisualCue || {}),
+              mode: 'compare',
+              compareVars: [left.name, right.name],
+              highlightVars: [left.name, right.name],
+              comparison: {
+                leftVar: left.name,
+                rightVar: right.name,
+                leftLabel: leftLbl,
+                rightLabel: rightLbl,
+                operator: op,
+                result: res,
+                reason: normalizedVisualCue?.comparison?.reason || null,
+              },
+            };
+          }
+        }
 
         return {
           stepIndex: idx + 1,
@@ -419,7 +927,7 @@ function normalizeGeminiRawOutput(
           changes: rawChanges,
           variables,
           fault: normalizedFault,
-          structure: s.structure && typeof s.structure === 'object' ? s.structure : autoStructure,
+          structure: normalizedStructure,
           step: idx + 1,
           lineNumber: activeLine,
           codeSnippet: rawLineText,
@@ -435,6 +943,10 @@ function normalizeGeminiRawOutput(
           consoleOutput: s.stdout ? String(s.stdout) : null,
           whatHappenedBn: String(s.explanation || ''),
           logicBuildingBn: String(s.why || ''),
+          whatHappened: String(s.explanation || ''),
+          whyAndLogic: String(s.why || ''),
+          variableSnapshots: normalizedSnapshots,
+          visualCue: normalizedVisualCue,
         };
       })
     : [];
@@ -795,24 +1307,30 @@ export async function generateExecutionTrace(params: {
     return formatResult(deterministicTrace, false, combinedDiagnostics);
   }
 
-  const stepPreview = (sandboxResult.recordedSteps || [])
-    .slice(0, 45)
-    .map(
-      (st, i) =>
-        `  Step ${i + 1}: Line ${st.line} [${st.actionType}] (${st.codeSnippet}) -> memoryState=${JSON.stringify(
-          st.variables
-        )}, delta=${JSON.stringify(st.memoryDelta)}${
-          st.consoleOutput ? `, consoleOutput=${JSON.stringify(st.consoleOutput)}` : ''
-        }`
-    )
-    .join('\n');
+  const stepPreview =
+    params.language === 'javascript'
+      ? (sandboxResult.recordedSteps || [])
+          .slice(0, 45)
+          .map((st, i) => {
+            const userLine =
+              prep.injectedPrefixLines > 0
+                ? Math.max(1, st.line - prep.injectedPrefixLines)
+                : st.line;
+            return `  Step ${i + 1}: Line ${userLine} [${st.actionType}] (${st.codeSnippet}) -> memoryState=${JSON.stringify(
+              st.variables
+            )}, delta=${JSON.stringify(st.memoryDelta)}${
+              st.consoleOutput ? `, consoleOutput=${JSON.stringify(st.consoleOutput)}` : ''
+            }`;
+          })
+          .join('\n')
+      : '';
 
   const groundTruthContext = [
     `- Real Compiler Status: Succeeded without errors`,
     `- Real Runtime Exit Code: ${realExec.exitCode}`,
     `- Real Runtime Execution Timed Out: ${realExec.timedOut}`,
     `- Real Runtime Error: ${realExec.runtimeError || 'None'}`,
-    `- Real Runtime Final Stdout: ${JSON.stringify(realExec.stdout || sandboxResult.stdout)}`,
+    `- Real Runtime Final Stdout: ${JSON.stringify(cleanedStdout)}`,
     `- Real Runtime Final Variables: ${JSON.stringify(sandboxResult.finalVariables)}`,
     stepPreview ? `- Real Runtime Recorded Step Sequence:\n${stepPreview}` : '',
   ]
@@ -821,20 +1339,25 @@ export async function generateExecutionTrace(params: {
 
   const ai = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
   });
 
+  const DEPRECATED_MODEL_PREFIXES = ['gemini-2.5-', 'gemini-2.0-', 'gemini-1.5-', 'gemini-1.0-'];
   const configuredModel = process.env.GEMINI_MODEL?.trim();
-  const primaryModel = configuredModel || 'gemini-2.5-flash';
-  const candidateModels = [
+  const isDeprecated =
+    configuredModel &&
+    DEPRECATED_MODEL_PREFIXES.some((prefix) => configuredModel.startsWith(prefix));
+  const primaryModel = !configuredModel || isDeprecated ? 'gemini-3.8-flash' : configuredModel;
+  const rawCandidateModels = [
     primaryModel,
-    'gemini-2.5-flash',
-    'gemini-1.5-flash',
+    'gemini-3.8-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-4-argon',
   ].filter((v, i, a) => a.indexOf(v) === i);
+
+  const nowMs = Date.now();
+  const activeModels = rawCandidateModels.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= nowMs);
+  const candidateModels = activeModels.length > 0 ? activeModels : rawCandidateModels;
 
   const baseUserPrompt = buildUserTracePrompt({
     ...params,
@@ -843,10 +1366,13 @@ export async function generateExecutionTrace(params: {
 
   let lastValidationError = '';
   let abortAllModels = false;
+  const overallDeadline = Date.now() + 24000;
 
   for (const modelName of candidateModels) {
-    if (abortAllModels) break;
+    if (abortAllModels || Date.now() >= overallDeadline) break;
     for (let attempt = 1; attempt <= 2; attempt++) {
+      const remainingMs = overallDeadline - Date.now();
+      if (remainingMs < 1500) break;
       try {
         const promptText =
           attempt === 1
@@ -861,6 +1387,7 @@ export async function generateExecutionTrace(params: {
             responseMimeType: 'application/json',
             responseSchema: TRACE_RESPONSE_SCHEMA,
             temperature: 0.2,
+            abortSignal: AbortSignal.timeout(Math.min(20000, remainingMs)),
           },
         });
 
@@ -872,63 +1399,48 @@ export async function generateExecutionTrace(params: {
           params.code
         );
 
-        // Preserve exact ground-truth runtime stdout, variables, and step structures when deterministic execution succeeded
-        if (!normalized.hasError && deterministicTrace.steps.length > 0) {
-          const detSteps = deterministicTrace.steps;
-          const aiSteps: TraceStep[] = Array.isArray(normalized.steps) ? normalized.steps : [];
-
-          normalized.analogyType =
-            deterministicTrace.analogyType !== 'generic_memory'
-              ? deterministicTrace.analogyType
-              : normalized.analogyType;
-
-          normalized.finalOutput =
-            deterministicTrace.finalOutput || normalized.finalOutput || '';
-
-          // Map AI explanations onto deterministic runtime steps so memory states and 3D structures are 100% exact
-          normalized.steps = detSteps.map((dStep, idx) => {
-            const matchingAiStep =
-              aiSteps[idx]?.activeLine === dStep.activeLine
-                ? aiSteps[idx]
-                : aiSteps.find((a) => a.activeLine === dStep.activeLine);
-
-            return {
-              ...dStep,
-              explanation: matchingAiStep?.explanation || dStep.explanation,
-              why: matchingAiStep?.why || dStep.why,
-              whatHappenedBn: matchingAiStep?.explanation || dStep.whatHappenedBn,
-              logicBuildingBn: matchingAiStep?.why || dStep.logicBuildingBn,
-            };
-          });
-
+        // Align finalOutput with ground-truth runtime stdout while preserving Gemini's
+        // authentic step-by-step trace, variable transitions, analogyType, and 3D structures.
+        if (!normalized.hasError) {
+          if (cleanedStdout !== '') {
+            normalized.finalOutput = cleanedStdout;
+          }
           if (normalized.programSummary) {
-            normalized.programSummary.totalExecutionSteps = normalized.steps.length;
+            normalized.programSummary.totalExecutionSteps = Array.isArray(normalized.steps)
+              ? normalized.steps.length
+              : 0;
             normalized.programSummary.finalOutput = normalized.finalOutput;
           }
+        }
+
+        if (!normalized.hasError && (!Array.isArray(normalized.steps) || normalized.steps.length === 0)) {
+          lastValidationError = 'Generated trace had 0 steps for valid code.';
+          continue;
         }
 
         const validated = ExecutionTraceSchema.safeParse(normalized);
 
         if (validated.success) {
           const finalTrace: ExecutionTrace = validated.data as unknown as ExecutionTrace;
-          if (prep.injectedPrefixLines > 0) {
-            for (const st of finalTrace.steps) {
-              st.activeLine = Math.max(1, st.activeLine - prep.injectedPrefixLines);
-              if (st.lineNumber) st.lineNumber = Math.max(1, st.lineNumber - prep.injectedPrefixLines);
-            }
-            for (const ln of finalTrace.lineNotes) {
-              ln.line = Math.max(1, ln.line - prep.injectedPrefixLines);
-            }
-          }
           if (!finalTrace.hasError) {
             traceCache.set(hash, { trace: finalTrace, createdAt: Date.now() });
           }
-          return formatResult(finalTrace, false, initialDiagnostics);
+          return formatResult(finalTrace, false, combinedDiagnostics);
         }
 
         lastValidationError = validated.error.message;
       } catch (err: any) {
         lastValidationError = String(err?.message || err);
+        console.warn(`[geminiTraceService] Model ${modelName} attempt ${attempt} failed:`, lastValidationError);
+        if (
+          lastValidationError.includes('429') ||
+          lastValidationError.includes('RESOURCE_EXHAUSTED') ||
+          lastValidationError.includes('404') ||
+          lastValidationError.includes('NOT_FOUND')
+        ) {
+          // Put quota-exhausted or unavailable models on a 5-minute cooldown so subsequent runs skip straight to working fallback models
+          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1000);
+        }
         if (
           lastValidationError.includes('403') ||
           lastValidationError.includes('PERMISSION_DENIED') ||
@@ -941,9 +1453,14 @@ export async function generateExecutionTrace(params: {
     }
   }
 
-  if (!deterministicTrace.hasError) {
-    traceCache.set(hash, { trace: deterministicTrace, createdAt: Date.now() });
-  }
-  return formatResult(deterministicTrace, false, initialDiagnostics);
+  const fallbackResult = formatResult(deterministicTrace, false, combinedDiagnostics);
+  fallbackResult.apiNotice = {
+    code: 'GEMINI_TEMPORARY_FALLBACK',
+    message_bn:
+      'Gemini AI সাময়িকভাবে ব্যস্ত বা অনুপলব্ধ থাকায় ডিটারমিনিস্টিক রানটাইম ট্রেস দেখানো হচ্ছে। কিছুক্ষণ পর আবার রান করুন।',
+    message_en:
+      'Gemini AI was temporarily unavailable, so the deterministic runtime trace is shown. Please run again shortly.',
+  };
+  return fallbackResult;
 }
 

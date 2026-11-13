@@ -1,11 +1,14 @@
 import { create } from 'zustand';
 import {
+  CodeExecutionRecord,
   ExecutionDiagnostic,
+  ExecutionMode,
   ExecutionResultPayload,
   ExecutionStatus,
   ExecutionTrace,
   ExplainLanguage,
   ExplanationDepth,
+  FastExecutionResult,
   SupportedLanguage,
 } from '../../shared/types';
 import { SAMPLE_PROGRAMS, resolveTraceForCode } from '../data/sampleTraces';
@@ -14,22 +17,45 @@ import { clampStepIndex, findFirstStepForLine } from '../utils/playerLogic';
 import {
   AppUserProfile,
   signInWithGooglePopup,
+  completeGoogleRedirectSignIn,
   signOutFirebase,
   subscribeToAuthChanges,
+  getFirebaseIdToken,
   syncUserProfileToFirestore,
   saveSnippetToFirestore,
   deleteSnippetFromFirestore,
   saveHistoryToFirestore,
+  deleteHistoryFromFirestore,
+  clearHistoryFromFirestore,
   syncProgressToFirestore,
   createShareInFirestore,
   getShareFromFirestore,
   fetchUserCloudData,
+  saveCodeExecutionToFirestore,
+  fetchCodeExecutionsFromFirestore,
+  clearCodeExecutionsFromFirestore,
 } from '../lib/firebase';
 
-export type AppRoute = '/' | '/library' | '/history' | '/progress' | '/settings' | '/share';
+export type AppRoute = '/' | '/login' | '/library' | '/history' | '/progress' | '/settings' | '/share';
 export type DeckTab = 'explain' | 'output' | 'summary';
 export type MobileTab = 'code' | 'stage' | 'explain' | 'output';
 export type WorkspaceResultTab = 'explanation' | 'animation';
+
+export interface TerminalLine {
+  id: string;
+  type: 'output' | 'prompt-answered' | 'error';
+  text: string;
+  prompt?: string;
+  answer?: string;
+}
+
+export type TerminalExecState =
+  | 'IDLE'
+  | 'COMPILING'
+  | 'RUNNING'
+  | 'WAITING_FOR_INPUT'
+  | 'COMPLETED'
+  | 'ERROR';
 
 export interface UserCodeFile {
   id: string;
@@ -169,6 +195,17 @@ interface LabState {
   folderName: string;
   fileName: string;
   code: string;
+  stdin: string;
+  consoleOpen: boolean;
+  isFastRunning: boolean;
+  executionMode: ExecutionMode | null;
+  fastRunResult: FastExecutionResult | null;
+  terminalHistory: TerminalLine[];
+  currentPrompt: string;
+  currentInputValue: string;
+  terminalExecState: TerminalExecState;
+  activeSessionId: string | null;
+  recentExecutions: CodeExecutionRecord[];
   hasExecuted: boolean;
   activeResultTab: WorkspaceResultTab;
 
@@ -200,7 +237,9 @@ interface LabState {
 
   user: AppUserProfile | null;
   isAuthReady: boolean;
+  isAuthLoading: boolean;
   isCloudSyncing: boolean;
+  authError: BilingualMessage | null;
   guestWorkMigrated: boolean;
   snippets: SavedSnippetItem[];
   historyItems: SavedHistoryItem[];
@@ -214,6 +253,9 @@ interface LabState {
 
   // Actions
   initAuthAndCloudSync: () => () => void;
+  openLoginPage: () => void;
+  continueAsGuest: () => void;
+  clearAuthError: () => void;
   setHistoryDropdownOpen: (open: boolean) => void;
   toggleHistoryDropdown: () => void;
   restoreHistoryItem: (item: SavedHistoryItem) => void;
@@ -237,7 +279,18 @@ interface LabState {
   selectSample: (sampleId: string) => void;
   loadLibraryProblem: (problemId: string, useFaulty?: boolean) => Promise<void>;
   setCode: (code: string) => void;
+  setStdin: (stdin: string) => void;
+  setCurrentInputValue: (val: string) => void;
+  submitTerminalInput: () => Promise<void>;
+  stopTerminalSession: () => void;
+  setConsoleOpen: (open: boolean) => void;
+  toggleConsoleOpen: () => void;
+  clearConsoleOutput: () => void;
   resetSnippetToNew: () => void;
+  runFast: (overrideCode?: string, overrideStdin?: string) => Promise<void>;
+  appendTerminalStdinAndRun: (inputLine: string, overrideCode?: string) => Promise<void>;
+  restoreExecutionRecord: (record: CodeExecutionRecord) => void;
+  clearRecentExecutions: () => void;
   runVisualize: (overrideCode?: string) => Promise<void>;
   toggleBreakpoint: (line: number) => void;
   clearBreakpoints: () => void;
@@ -284,7 +337,7 @@ const INITIAL_USER_FILE: UserCodeFile = {
   folderName: 'my-project',
   fileName: 'main.js',
   language: 'javascript',
-  code: '// Start writing here...\n',
+  code: '',
 };
 
 const INITIAL_PROGRESS: UserProgressState = {
@@ -295,26 +348,38 @@ const INITIAL_PROGRESS: UserProgressState = {
   topicsCovered: [],
 };
 
-function loadInitialHistory(): SavedHistoryItem[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem('logic_lab_history_v2');
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed;
-    }
-  } catch {}
-  return [];
-}
-
-function persistHistory(items: SavedHistoryItem[]) {
+function clearLegacyLocalHistoryStorage() {
   if (typeof window === 'undefined') return;
   try {
-    localStorage.setItem('logic_lab_history_v2', JSON.stringify(items.slice(0, 50)));
+    localStorage.removeItem('logic_lab_history_v2');
+    localStorage.removeItem('logic_lab_code_executions_v1');
   } catch {}
+}
+
+function formatCloudTimestamp(createdMs?: number): string {
+  if (!createdMs) return 'Cloud Synced';
+  const d = new Date(createdMs);
+  return (
+    d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) +
+    ', ' +
+    d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+  );
 }
 
 let activeAbortController: AbortController | null = null;
+let fastAbortController: AbortController | null = null;
+let activeEventSource: EventSource | null = null;
+
+function closeActiveEventSource() {
+  if (activeEventSource) {
+    activeEventSource.close();
+    activeEventSource = null;
+  }
+}
+
+function makeTerminalLineId(): string {
+  return `tline-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
 
 async function fetchTraceFromApi(
   params: {
@@ -323,6 +388,7 @@ async function fetchTraceFromApi(
     explainLanguage: ExplainLanguage;
     depth: ExplanationDepth;
     fileName?: string;
+    stdin?: string;
     bypassCache?: boolean;
   },
   uid?: string,
@@ -381,6 +447,17 @@ export const useLabStore = create<LabState>((set, get) => ({
   folderName: INITIAL_USER_FILE.folderName,
   fileName: INITIAL_USER_FILE.fileName,
   code: INITIAL_USER_FILE.code,
+  stdin: '',
+  consoleOpen: true,
+  isFastRunning: false,
+  executionMode: null,
+  fastRunResult: null,
+  terminalHistory: [],
+  currentPrompt: '',
+  currentInputValue: '',
+  terminalExecState: 'IDLE',
+  activeSessionId: null,
+  recentExecutions: [],
   hasExecuted: false,
   activeResultTab: 'explanation',
 
@@ -423,10 +500,12 @@ export const useLabStore = create<LabState>((set, get) => ({
 
   user: null,
   isAuthReady: false,
+  isAuthLoading: false,
   isCloudSyncing: false,
+  authError: null,
   guestWorkMigrated: false,
   snippets: [],
-  historyItems: loadInitialHistory(),
+  historyItems: [],
   progress: INITIAL_PROGRESS,
   sharedRun: null,
   shareModalOpen: false,
@@ -435,9 +514,22 @@ export const useLabStore = create<LabState>((set, get) => ({
   toast: null,
 
   initAuthAndCloudSync: () => {
+    clearLegacyLocalHistoryStorage();
+    void completeGoogleRedirectSignIn().catch(() => {});
+
     const unsubscribe = subscribeToAuthChanges(async (fbUser) => {
       if (!fbUser) {
-        set({ isAuthReady: true, isCloudSyncing: false });
+        clearLegacyLocalHistoryStorage();
+        set({
+          user: null,
+          isAuthReady: true,
+          isAuthLoading: false,
+          isCloudSyncing: false,
+          historyItems: [],
+          recentExecutions: [],
+          snippets: [],
+          guestWorkMigrated: false,
+        });
         return;
       }
 
@@ -448,70 +540,134 @@ export const useLabStore = create<LabState>((set, get) => ({
         photoURL: fbUser.photoURL || '',
       };
 
-      set({ user: profile, isAuthReady: true, isCloudSyncing: true });
+      set({
+        user: profile,
+        isAuthReady: true,
+        isAuthLoading: false,
+        isCloudSyncing: true,
+        authError: null,
+      });
+
+      if (get().activeRoute === '/login') {
+        get().setActiveRoute('/');
+      }
 
       try {
+        const idToken = await getFirebaseIdToken();
+        const backendSessionPromise = fetch('/api/auth/session', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-uid': fbUser.uid,
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+          body: JSON.stringify({
+            email: profile.email,
+            displayName: profile.displayName,
+            photoURL: profile.photoURL,
+          }),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null);
+
         await syncUserProfileToFirestore(fbUser, {
           theme: get().theme,
           explainLanguage: get().explainLanguage,
           detailLevel: get().depth,
           defaultCodeLanguage: get().language,
-          defaultSpeed: get().speed,
-        });
+          defaultSpeed: 1,
+        }).catch(() => {});
 
-        const cloudData = await fetchUserCloudData(fbUser.uid);
-        if (cloudData) {
-          const loadedSnippets: SavedSnippetItem[] = (cloudData.snippets || []).map((s: any) => ({
-            id: String(s.id || `snip-${Date.now()}`),
-            title_bn: String(s.title || 'main.js'),
-            title_en: String(s.title || 'main.js'),
-            language: (s.language as SupportedLanguage) || 'javascript',
-            code: String(s.code || ''),
-            stdin: '',
-            analogyType: 'generic_memory',
-            isFavorite: Boolean(s.favorite ?? true),
-            problemId: s.problemId ? String(s.problemId) : undefined,
-            updatedAt: 'Cloud Synced',
-          }));
+        const [cloudData, backendSession] = await Promise.all([
+          fetchUserCloudData(fbUser.uid),
+          backendSessionPromise,
+        ]);
 
-          const loadedHistory: SavedHistoryItem[] = (cloudData.history || []).map((h: any) => ({
-            id: String(h.id || `run-${Date.now()}`),
-            title_bn: String(h.title_bn || h.title_en || 'কোড রান'),
-            title_en: String(h.title_en || h.title_bn || 'Code Run'),
-            language: (h.language as SupportedLanguage) || 'javascript',
-            code: String(h.code || ''),
-            analogyType: (h.analogyType as ExecutionTrace['analogyType']) || 'generic_memory',
-            verdictStatus:
-              (h.verdictStatus as ExecutionTrace['verdict']['status']) || 'ok',
-            favorite: Boolean(h.favorite),
-            timestamp: 'Cloud Synced',
-          }));
+        const cloudSnippets: SavedSnippetItem[] = (cloudData?.snippets || []).map((s: any) => ({
+          id: String(s.id || `snip-${Date.now()}`),
+          title_bn: String(s.title || 'main.js'),
+          title_en: String(s.title || 'main.js'),
+          language: (s.language as SupportedLanguage) || 'javascript',
+          code: String(s.code || ''),
+          stdin: '',
+          analogyType: 'generic_memory',
+          isFavorite: Boolean(s.favorite ?? true),
+          problemId: s.problemId ? String(s.problemId) : undefined,
+          updatedAt: 'Cloud Synced',
+        }));
 
-          set((state) => ({
-            snippets: loadedSnippets.length > 0 ? loadedSnippets : state.snippets,
-            historyItems: loadedHistory.length > 0 ? loadedHistory : state.historyItems,
-            progress: cloudData.progress
-              ? {
-                  streak: Number(cloudData.progress.streak ?? state.progress.streak),
-                  lastActiveDate: String(
-                    cloudData.progress.lastActiveDate || state.progress.lastActiveDate
-                  ),
-                  completedProblemIds: Array.isArray(cloudData.progress.completedProblemIds)
-                    ? cloudData.progress.completedProblemIds
-                    : state.progress.completedProblemIds,
-                  badges: Array.isArray(cloudData.progress.badges)
-                    ? cloudData.progress.badges
-                    : state.progress.badges,
-                  topicsCovered: Array.isArray(cloudData.progress.topicsCovered)
-                    ? cloudData.progress.topicsCovered
-                    : state.progress.topicsCovered,
-                }
-              : state.progress,
-            isCloudSyncing: false,
-          }));
-        } else {
-          set({ isCloudSyncing: false });
-        }
+        const cloudHistory: SavedHistoryItem[] = (cloudData?.history || []).map((h: any) => ({
+          id: String(h.id || `run-${Date.now()}`),
+          fileName: String(h.title_en || h.title_bn || 'main.js'),
+          title_bn: String(h.title_bn || h.title_en || 'কোড রান'),
+          title_en: String(h.title_en || h.title_bn || 'Code Run'),
+          language: (h.language as SupportedLanguage) || 'javascript',
+          code: String(h.code || ''),
+          analogyType: (h.analogyType as ExecutionTrace['analogyType']) || 'generic_memory',
+          verdictStatus: (h.verdictStatus as ExecutionTrace['verdict']['status']) || 'ok',
+          favorite: Boolean(h.favorite),
+          timestamp: formatCloudTimestamp(h.createdMs),
+          createdAt: h.createdMs || undefined,
+        }));
+
+        const backendHistory: SavedHistoryItem[] = Array.isArray(backendSession?.history)
+          ? backendSession.history.map((h: any) => ({
+              id: String(h.id || `run-${Date.now()}`),
+              fileName: h.fileName ? String(h.fileName) : String(h.title_en || 'main.js'),
+              title_bn: String(h.title_bn || h.title_en || 'কোড রান'),
+              title_en: String(h.title_en || h.title_bn || 'Code Run'),
+              language: (h.language as SupportedLanguage) || 'javascript',
+              code: String(h.code || ''),
+              analogyType: (h.analogyType as ExecutionTrace['analogyType']) || 'generic_memory',
+              verdictStatus: (h.verdictStatus as ExecutionTrace['verdict']['status']) || 'ok',
+              favorite: Boolean(h.favorite),
+              timestamp: String(h.timestamp || 'Synced'),
+            }))
+          : [];
+
+        const seenHistoryIds = new Set(cloudHistory.map((h) => h.id));
+        const mergedHistory = [
+          ...cloudHistory,
+          ...backendHistory.filter((h) => !seenHistoryIds.has(h.id)),
+        ].slice(0, 50);
+
+        set((state) => ({
+          snippets: cloudSnippets,
+          historyItems: mergedHistory,
+          progress: cloudData?.progress
+            ? {
+                streak: Number(cloudData.progress.streak ?? state.progress.streak),
+                lastActiveDate: String(
+                  cloudData.progress.lastActiveDate || state.progress.lastActiveDate
+                ),
+                completedProblemIds: Array.isArray(cloudData.progress.completedProblemIds)
+                  ? cloudData.progress.completedProblemIds
+                  : state.progress.completedProblemIds,
+                badges: Array.isArray(cloudData.progress.badges)
+                  ? cloudData.progress.badges
+                  : state.progress.badges,
+                topicsCovered: Array.isArray(cloudData.progress.topicsCovered)
+                  ? cloudData.progress.topicsCovered
+                  : state.progress.topicsCovered,
+              }
+            : state.progress,
+          isCloudSyncing: false,
+        }));
+
+        // Non-blocking fetch of recent code_executions from Firestore + backend
+        void fetchCodeExecutionsFromFirestore(fbUser.uid, 25)
+          .then((cloudExecs) => {
+            const backendExecs: CodeExecutionRecord[] = Array.isArray(backendSession?.executions)
+              ? backendSession.executions
+              : [];
+            const existingIds = new Set(cloudExecs.map((e) => e.id));
+            const merged = [
+              ...cloudExecs,
+              ...backendExecs.filter((e) => !existingIds.has(e.id)),
+            ].slice(0, 30);
+            set({ recentExecutions: merged });
+          })
+          .catch(() => {});
       } catch {
         set({ isCloudSyncing: false });
       }
@@ -520,13 +676,27 @@ export const useLabStore = create<LabState>((set, get) => ({
     return unsubscribe;
   },
 
+  openLoginPage: () => {
+    set({ authError: null, historyDropdownOpen: false });
+    get().setActiveRoute('/login');
+  },
+
+  continueAsGuest: () => {
+    set({ authError: null });
+    get().setActiveRoute('/');
+  },
+
+  clearAuthError: () => set({ authError: null }),
+
   setActiveRoute: (route) => {
-    if (
-      typeof window !== 'undefined' &&
-      route !== '/share' &&
-      window.location.pathname.startsWith('/s/')
-    ) {
-      window.history.pushState({}, '', '/');
+    if (typeof window !== 'undefined') {
+      if (route === '/login') {
+        if (window.location.pathname !== '/login') {
+          window.history.pushState({}, '', '/login');
+        }
+      } else if (route !== '/share' && window.location.pathname !== '/') {
+        window.history.pushState({}, '', '/');
+      }
     }
     set({ activeRoute: route });
   },
@@ -555,11 +725,11 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   setExplainLanguage: (nextLang) => {
-    const { code, language, depth, hasExecuted, fileName, user } = get();
+    const { code, language, depth, hasExecuted, fileName, stdin, user } = get();
     set({ explainLanguage: nextLang });
     if (!hasExecuted || !code.trim()) return;
     fetchTraceFromApi(
-      { code, language, explainLanguage: nextLang, depth, fileName },
+      { code, language, explainLanguage: nextLang, depth, fileName, stdin },
       user?.uid
     )
       .then((res) => {
@@ -571,10 +741,10 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   setDepth: (depth) => {
-    const { code, language, explainLanguage, hasExecuted, fileName, user } = get();
+    const { code, language, explainLanguage, hasExecuted, fileName, stdin, user } = get();
     set({ depth });
     if (!hasExecuted || !code.trim()) return;
-    fetchTraceFromApi({ code, language, explainLanguage, depth, fileName }, user?.uid)
+    fetchTraceFromApi({ code, language, explainLanguage, depth, fileName, stdin }, user?.uid)
       .then((res) => {
         if (res.trace) {
           set({ trace: res.trace, apiNotice: null });
@@ -629,7 +799,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       folderName: folderName || 'my-project',
       fileName: `${basePrefix}${ext}`,
       language,
-      code: language === 'python' ? '# Start writing here...\n' : '// Start writing here...\n',
+      code: '',
     };
     set({
       userFiles: [...userFiles, newFile],
@@ -750,11 +920,11 @@ export const useLabStore = create<LabState>((set, get) => ({
       activeAbortController.abort();
       activeAbortController = null;
     }
-    const { activeFileId, userFiles, language } = get();
-    const defaultComment = language === 'python' ? '# Start writing here...\n' : '// Start writing here...\n';
-    const updated = userFiles.map((f) => (f.id === activeFileId ? { ...f, code: defaultComment } : f));
+    const { activeFileId, userFiles } = get();
+    const emptyCode = '';
+    const updated = userFiles.map((f) => (f.id === activeFileId ? { ...f, code: emptyCode } : f));
     set({
-      code: defaultComment,
+      code: emptyCode,
       userFiles: updated,
       hasExecuted: false,
       trace: EMPTY_INITIAL_TRACE,
@@ -769,6 +939,519 @@ export const useLabStore = create<LabState>((set, get) => ({
     });
   },
 
+  setStdin: (stdin) => set({ stdin }),
+  setCurrentInputValue: (currentInputValue) => set({ currentInputValue }),
+  stopTerminalSession: () => {
+    closeActiveEventSource();
+    const { activeSessionId } = get();
+    if (activeSessionId) {
+      void fetch('/api/execute/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: activeSessionId }),
+      }).catch(() => {});
+    }
+    set({
+      activeSessionId: null,
+      isFastRunning: false,
+      terminalExecState: get().terminalHistory.length > 0 ? 'COMPLETED' : 'IDLE',
+    });
+  },
+  setConsoleOpen: (consoleOpen) => set({ consoleOpen }),
+  toggleConsoleOpen: () => set((s) => ({ consoleOpen: !s.consoleOpen })),
+  clearConsoleOutput: () => {
+    closeActiveEventSource();
+    const { activeSessionId } = get();
+    if (activeSessionId) {
+      void fetch('/api/execute/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: activeSessionId }),
+      }).catch(() => {});
+    }
+    set({
+      fastRunResult: null,
+      terminalHistory: [],
+      currentPrompt: '',
+      currentInputValue: '',
+      terminalExecState: 'IDLE',
+      activeSessionId: null,
+      isFastRunning: false,
+      diagnostics: [],
+      executionStatus: 'idle',
+    });
+  },
+
+  restoreExecutionRecord: (record) => {
+    const { userFiles, activeFileId } = get();
+    const targetFileName =
+      record.file_name ||
+      (record.language === 'java'
+        ? 'Main.java'
+        : record.language === 'python'
+        ? 'main.py'
+        : record.language === 'cpp'
+        ? 'main.cpp'
+        : 'main.js');
+    const updatedFiles = userFiles.map((f) =>
+      f.id === activeFileId
+        ? {
+            ...f,
+            code: record.source_code,
+            language: record.language,
+            fileName: targetFileName,
+          }
+        : f
+    );
+    set({
+      code: record.source_code,
+      stdin: record.stdin_input || '',
+      language: record.language,
+      fileName: targetFileName,
+      userFiles: updatedFiles,
+      consoleOpen: true,
+      executionMode: record.execution_mode,
+      fastRunResult: {
+        success: record.success,
+        stdout: record.stdout_output || '',
+        stderr: record.stderr_output || '',
+        exitCode: record.exit_code ?? (record.success ? 0 : 1),
+        executionTimeMs: record.execution_time_ms || 0,
+        language: record.language,
+        stdinUsed: record.stdin_input || '',
+        timestamp: new Date(record.created_at).toLocaleTimeString('en-US', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      },
+      apiError: null,
+    });
+  },
+
+  clearRecentExecutions: () => {
+    const { user } = get();
+    clearLegacyLocalHistoryStorage();
+    set({ recentExecutions: [] });
+    if (user && !user.isDemo) {
+      void fetch('/api/executions', {
+        method: 'DELETE',
+        headers: { 'x-user-uid': user.uid },
+      }).catch(() => {});
+      void clearCodeExecutionsFromFirestore(user.uid).catch(() => {});
+    }
+  },
+
+  runFast: async (overrideCode?: string, overrideStdin?: string) => {
+    if (fastAbortController) {
+      fastAbortController.abort();
+      fastAbortController = null;
+    }
+    closeActiveEventSource();
+    const prevSessionId = get().activeSessionId;
+    if (prevSessionId) {
+      void fetch('/api/execute/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: prevSessionId }),
+      }).catch(() => {});
+    }
+
+    const controller = new AbortController();
+    fastAbortController = controller;
+
+    let { code, stdin, language, fileName, user, userFiles, activeFileId, explainLanguage } = get();
+
+    if (typeof overrideCode === 'string') {
+      code = overrideCode;
+      const updatedFiles = userFiles.map((f) => (f.id === activeFileId ? { ...f, code } : f));
+      set({ code, userFiles: updatedFiles });
+    }
+    if (typeof overrideStdin === 'string') {
+      stdin = overrideStdin;
+      set({ stdin });
+    }
+
+    set({
+      consoleOpen: true,
+      isFastRunning: true,
+      executionMode: 'fast',
+      apiError: null,
+      fastRunResult: null,
+      terminalHistory: [],
+      currentPrompt: '',
+      currentInputValue: '',
+      terminalExecState: 'COMPILING',
+      activeSessionId: null,
+      diagnostics: [],
+      executionStatus: 'idle',
+    });
+
+    if (!code.trim()) {
+      const emptyMsg =
+        explainLanguage === 'bn'
+          ? 'এডিটর খালি আছে। রান করার জন্য আগে কোড লিখুন।'
+          : 'Editor is empty. Please write code before running.';
+      set({
+        isFastRunning: false,
+        terminalExecState: 'ERROR',
+        executionStatus: 'error',
+        terminalHistory: [{ id: makeTerminalLineId(), type: 'error', text: emptyMsg }],
+        fastRunResult: {
+          success: false,
+          stdout: '',
+          stderr: emptyMsg,
+          exitCode: 1,
+          executionTimeMs: 0,
+          language,
+          stdinUsed: '',
+          timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        },
+      });
+      return;
+    }
+
+    // Auto-switch from untouched default main.js to Java if the user pasted a Java class
+    if (
+      language === 'javascript' &&
+      fileName === 'main.js' &&
+      (/\bpublic\s+class\s+[A-Za-z_$]/.test(code) || /\bSystem\.out\.print/.test(code))
+    ) {
+      language = 'java';
+      fileName = 'Main.java';
+      const updatedFiles = userFiles.map((f) =>
+        f.id === activeFileId ? { ...f, language, fileName } : f
+      );
+      set({ language, fileName, userFiles: updatedFiles });
+    }
+
+    const startedAt = Date.now();
+    try {
+      const res = await fetch('/api/execute/start', {
+        method: 'POST',
+        signal: controller.signal,
+        cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-uid': user?.uid || 'guest-local',
+        },
+        body: JSON.stringify({ code, language, fileName }),
+      });
+
+      const data = await res.json();
+      if (controller.signal.aborted) return;
+
+      const diagnostics: ExecutionDiagnostic[] = Array.isArray(data.diagnostics)
+        ? data.diagnostics
+        : [];
+
+      if (!data.ok || !data.sessionId) {
+        const stderr = String(data.stderr || data.runtimeError || 'Compilation or syntax error.');
+        const errorLines: TerminalLine[] = stderr
+          .replace(/\r\n/g, '\n')
+          .split('\n')
+          .filter((l, idx, arr) => idx < arr.length - 1 || l.length > 0)
+          .map((text) => ({ id: makeTerminalLineId(), type: 'error', text }));
+
+        set({
+          isFastRunning: false,
+          terminalExecState: 'ERROR',
+          diagnostics,
+          executionStatus: 'error',
+          terminalHistory: errorLines,
+          fastRunResult: {
+            success: false,
+            stdout: '',
+            stderr,
+            exitCode: 1,
+            executionTimeMs: Math.max(1, Date.now() - startedAt),
+            language,
+            stdinUsed: '',
+            timestamp: new Date().toLocaleTimeString('en-US', {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            diagnostics,
+          },
+        });
+        return;
+      }
+
+      const sessionId: string = data.sessionId;
+      set({
+        activeSessionId: sessionId,
+        terminalExecState: 'RUNNING',
+        diagnostics,
+      });
+
+      const es = new EventSource(`/api/execute/stream/${encodeURIComponent(sessionId)}`);
+      activeEventSource = es;
+
+      es.addEventListener('stdout', (ev: MessageEvent) => {
+        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        try {
+          const payload = JSON.parse(ev.data) as { text?: string };
+          const chunk = String(payload.text ?? '').replace(/\r\n/g, '\n');
+          if (!chunk) return;
+
+          set((s) => {
+            const combined = s.currentPrompt + chunk;
+            const parts = combined.split('\n');
+            const newLines: TerminalLine[] = parts.slice(0, -1).map((text) => ({
+              id: makeTerminalLineId(),
+              type: 'output',
+              text,
+            }));
+            const nextPrompt = parts[parts.length - 1] ?? '';
+            return {
+              terminalHistory: newLines.length > 0 ? [...s.terminalHistory, ...newLines] : s.terminalHistory,
+              currentPrompt: nextPrompt,
+            };
+          });
+        } catch {
+          // Ignore malformed event
+        }
+      });
+
+      es.addEventListener('stderr', (ev: MessageEvent) => {
+        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        try {
+          const payload = JSON.parse(ev.data) as { text?: string };
+          const chunk = String(payload.text ?? '').replace(/\r\n/g, '\n');
+          if (!chunk) return;
+
+          const lines = chunk.split('\n');
+          if (lines[lines.length - 1] === '') lines.pop();
+          if (lines.length === 0) return;
+
+          set((s) => ({
+            terminalHistory: [
+              ...s.terminalHistory,
+              ...lines.map((text) => ({
+                id: makeTerminalLineId(),
+                type: 'error' as const,
+                text,
+              })),
+            ],
+          }));
+        } catch {
+          // Ignore malformed event
+        }
+      });
+
+      es.addEventListener('prompt', () => {
+        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        set({
+          terminalExecState: 'WAITING_FOR_INPUT',
+          isFastRunning: false,
+        });
+      });
+
+      es.addEventListener('exit', (ev: MessageEvent) => {
+        closeActiveEventSource();
+        if (controller.signal.aborted || get().activeSessionId !== sessionId) return;
+        try {
+          const payload = JSON.parse(ev.data) as {
+            exitCode: number | null;
+            timedOut?: boolean;
+            executionTimeMs?: number;
+            success?: boolean;
+            stdout?: string;
+            stderr?: string;
+            stdinUsed?: string;
+            diagnostics?: ExecutionDiagnostic[];
+          };
+
+          const executionTimeMs =
+            typeof payload.executionTimeMs === 'number'
+              ? payload.executionTimeMs
+              : Math.max(1, Date.now() - startedAt);
+          const timedOut = Boolean(payload.timedOut);
+          const success = Boolean(payload.success);
+          const exitCode = typeof payload.exitCode === 'number' ? payload.exitCode : success ? 0 : 1;
+          const stdout = typeof payload.stdout === 'string' ? payload.stdout : '';
+          const stderr =
+            timedOut && !payload.stderr
+              ? `Execution timed out (${executionTimeMs}ms). Possible infinite loop.`
+              : typeof payload.stderr === 'string'
+              ? payload.stderr
+              : '';
+          const exitDiags: ExecutionDiagnostic[] = Array.isArray(payload.diagnostics)
+            ? payload.diagnostics
+            : diagnostics;
+
+          const fastRes: FastExecutionResult = {
+            success,
+            stdout,
+            stderr,
+            exitCode,
+            executionTimeMs,
+            timedOut,
+            language,
+            stdinUsed: payload.stdinUsed || '',
+            timestamp: new Date().toLocaleTimeString('en-US', {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            diagnostics: exitDiags,
+          };
+
+          const fastHasError = !success || exitDiags.some((d) => d.severity === 'error');
+          const fastHasWarning = !fastHasError && exitDiags.some((d) => d.severity === 'warning');
+          const fastExecStatus: ExecutionStatus = fastHasError
+            ? 'error'
+            : fastHasWarning
+            ? 'warning'
+            : 'success';
+
+          set((s) => {
+            const flushedHistory = [...s.terminalHistory];
+            if (s.currentPrompt.length > 0) {
+              flushedHistory.push({
+                id: makeTerminalLineId(),
+                type: 'output',
+                text: s.currentPrompt,
+              });
+            }
+            if (timedOut) {
+              flushedHistory.push({
+                id: makeTerminalLineId(),
+                type: 'error',
+                text:
+                  s.explainLanguage === 'bn'
+                    ? 'সময়সীমা অতিক্রম করেছে (সম্ভাব্য অসীম লুপ)।'
+                    : `Execution timed out (${executionTimeMs}ms). Possible infinite loop.`,
+              });
+            }
+            return {
+              isFastRunning: false,
+              activeSessionId: null,
+              currentPrompt: '',
+              currentInputValue: '',
+              terminalExecState: success ? 'COMPLETED' : 'ERROR',
+              terminalHistory: flushedHistory,
+              fastRunResult: fastRes,
+              diagnostics: exitDiags,
+              executionStatus: fastExecStatus,
+            };
+          });
+
+          const currentUser = get().user;
+          const isAuthenticated = Boolean(currentUser && !currentUser.isDemo);
+          if (isAuthenticated && currentUser) {
+            const record: CodeExecutionRecord = {
+              id: `exec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              userId: currentUser.uid,
+              language,
+              source_code: code,
+              stdin_input: payload.stdinUsed || '',
+              stdout_output: stdout,
+              stderr_output: stderr,
+              exit_code: exitCode,
+              execution_mode: 'fast',
+              execution_time_ms: executionTimeMs,
+              success,
+              file_name: fileName,
+              created_at: new Date().toISOString(),
+            };
+
+            set({ recentExecutions: [record, ...get().recentExecutions].slice(0, 30) });
+
+            void fetch('/api/executions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-user-uid': currentUser.uid,
+              },
+              body: JSON.stringify(record),
+            }).catch(() => {});
+
+            void saveCodeExecutionToFirestore(currentUser.uid, record).catch(() => {});
+          }
+        } catch {
+          set({
+            isFastRunning: false,
+            activeSessionId: null,
+            terminalExecState: 'ERROR',
+          });
+        }
+      });
+
+      es.onerror = () => {
+        if (get().activeSessionId !== sessionId) return;
+        closeActiveEventSource();
+        set((s) => ({
+          isFastRunning: false,
+          activeSessionId: null,
+          terminalExecState: s.terminalHistory.length > 0 ? 'COMPLETED' : 'ERROR',
+        }));
+      };
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || controller.signal.aborted) return;
+      const errMsg = err?.message || 'Failed to execute code.';
+      set({
+        isFastRunning: false,
+        activeSessionId: null,
+        terminalExecState: 'ERROR',
+        executionStatus: 'error',
+        terminalHistory: [{ id: makeTerminalLineId(), type: 'error', text: errMsg }],
+        fastRunResult: {
+          success: false,
+          stdout: '',
+          stderr: errMsg,
+          exitCode: 1,
+          executionTimeMs: Math.max(1, Date.now() - startedAt),
+          language,
+          stdinUsed: '',
+          timestamp: new Date().toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+        },
+      });
+    }
+  },
+
+  submitTerminalInput: async () => {
+    const { activeSessionId, terminalExecState, currentPrompt, currentInputValue } = get();
+    if (!activeSessionId || terminalExecState !== 'WAITING_FOR_INPUT') return;
+
+    const answer = currentInputValue;
+    set((s) => ({
+      terminalHistory: [
+        ...s.terminalHistory,
+        {
+          id: makeTerminalLineId(),
+          type: 'prompt-answered',
+          text: `${currentPrompt}${answer}`,
+          prompt: currentPrompt,
+          answer,
+        },
+      ],
+      currentPrompt: '',
+      currentInputValue: '',
+      terminalExecState: 'RUNNING',
+      isFastRunning: true,
+    }));
+
+    try {
+      await fetch('/api/execute/input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: activeSessionId, input: answer }),
+      });
+    } catch {
+      // Errors will surface through the SSE stream or exit handler
+    }
+  },
+
+  appendTerminalStdinAndRun: async (inputLine: string, overrideCode?: string) => {
+    const currentStdin = get().stdin;
+    const nextStdin = currentStdin
+      ? `${currentStdin.replace(/\n$/, '')}\n${inputLine}`
+      : inputLine;
+    await get().runFast(overrideCode, nextStdin);
+  },
+
   runVisualize: async (overrideCode?: string) => {
     // 1. Abort any previous hanging execution/Gemini requests
     if (activeAbortController) {
@@ -780,6 +1463,7 @@ export const useLabStore = create<LabState>((set, get) => ({
 
     let {
       code,
+      stdin,
       language,
       explainLanguage,
       depth,
@@ -791,6 +1475,8 @@ export const useLabStore = create<LabState>((set, get) => ({
       userFiles,
     } = get();
 
+    const explainStartedAt = Date.now();
+
     if (typeof overrideCode === 'string') {
       code = overrideCode;
       const updatedFiles = userFiles.map((f) => (f.id === activeFileId ? { ...f, code } : f));
@@ -801,6 +1487,7 @@ export const useLabStore = create<LabState>((set, get) => ({
     set({
       isPlaying: false,
       isTracing: true,
+      executionMode: 'explain',
       traceProgressStage: 1,
       apiError: null,
       apiNotice: null,
@@ -875,7 +1562,7 @@ export const useLabStore = create<LabState>((set, get) => ({
 
     try {
       const apiRes = await fetchTraceFromApi(
-        { code, language, explainLanguage, depth, fileName, bypassCache: true },
+        { code, language, explainLanguage, depth, fileName, stdin, bypassCache: true },
         user?.uid,
         currentAbortController.signal
       );
@@ -902,20 +1589,36 @@ export const useLabStore = create<LabState>((set, get) => ({
       const canRun = apiRes.canRun ?? !hasErrors;
 
       if (hasErrors) {
+        const errMsg =
+          apiRes.trace?.errorDetails?.message ||
+          apiRes.error?.message_en ||
+          apiRes.trace?.verdict.message ||
+          'Execution error encountered.';
         set({
           hasExecuted: true,
           isTracing: false,
           traceProgressStage: 0,
+          fastRunResult: {
+            success: false,
+            stdout: '',
+            stderr: errMsg,
+            exitCode: 1,
+            executionTimeMs: Math.max(1, Date.now() - explainStartedAt),
+            language,
+            stdinUsed: stdin,
+            timestamp: new Date().toLocaleTimeString('en-US', {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            diagnostics,
+          },
           apiError: apiRes.error || {
             code: 'COMPILE_ERROR',
             message_bn:
               apiRes.trace?.errorDetails?.messageBn ||
               apiRes.trace?.verdict.message ||
               'কোড কম্পাইল বা রান করতে ত্রুটি হয়েছে।',
-            message_en:
-              apiRes.trace?.errorDetails?.message ||
-              apiRes.trace?.verdict.message ||
-              'Execution error encountered.',
+            message_en: errMsg,
           },
           executionStatus: 'error',
           canRun: false,
@@ -954,54 +1657,101 @@ export const useLabStore = create<LabState>((set, get) => ({
             minute: '2-digit',
           });
 
-        const newEntry: SavedHistoryItem = {
-          id: `run-${Date.now()}`,
-          fileName: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
-          folderName: '',
-          title_bn: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
-          title_en: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
-          language,
-          code,
-          analogyType: nextTrace.analogyType,
-          verdictStatus: nextTrace.verdict.status,
-          favorite: false,
-          timestamp: formattedDate,
-          trace: nextTrace,
-          createdAt: Date.now(),
-        };
+        const explainDurationMs = Math.max(1, Date.now() - explainStartedAt);
+        const explainStdout = nextTrace.finalOutput || '';
+        const isAuthenticated = Boolean(user && !user.isDemo);
 
-        const updatedHistory = [newEntry, ...historyItems.slice(0, 49)];
-        persistHistory(updatedHistory);
+        if (isAuthenticated && user) {
+          const newEntry: SavedHistoryItem = {
+            id: `run-${Date.now()}`,
+            fileName: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
+            folderName: '',
+            title_bn: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
+            title_en: fileName || (language === 'java' ? 'Main.java' : 'main.js'),
+            language,
+            code,
+            analogyType: nextTrace.analogyType,
+            verdictStatus: nextTrace.verdict.status,
+            favorite: false,
+            timestamp: formattedDate,
+            trace: nextTrace,
+            createdAt: Date.now(),
+          };
 
-        set({
-          hasExecuted: true,
-          trace: nextTrace,
-          diagnostics,
-          executionStatus,
-          canRun: true,
-          apiNotice: null,
-          apiError: null,
-          isTracing: false,
-          traceProgressStage: 0,
-          isDirty: false,
-          currentStepIndex: 0,
-          prevStepIndex: 0,
-          isPlaying: false,
-          historyItems: updatedHistory,
-        });
+          const updatedHistory = [newEntry, ...historyItems.slice(0, 49)];
 
-        // Persist run history to backend API in the background
-        void fetch('/api/history', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-user-uid': user?.uid || 'guest-local',
-          },
-          body: JSON.stringify(newEntry),
-        }).catch(() => {});
+          const explainExecRecord: CodeExecutionRecord = {
+            id: `exec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            userId: user.uid,
+            language,
+            source_code: code,
+            stdin_input: stdin,
+            stdout_output: explainStdout,
+            stderr_output: '',
+            exit_code: 0,
+            execution_mode: 'explain',
+            execution_time_ms: explainDurationMs,
+            success: true,
+            file_name: fileName,
+            created_at: new Date().toISOString(),
+          };
+          const updatedExecs = [explainExecRecord, ...get().recentExecutions].slice(0, 30);
 
-        // Sync run history and active file to Cloud Firestore in the background if signed in
-        if (user && !user.isDemo) {
+          set({
+            hasExecuted: true,
+            trace: nextTrace,
+            diagnostics,
+            executionStatus,
+            canRun: true,
+            apiNotice: apiRes.apiNotice || null,
+            apiError: null,
+            isTracing: false,
+            traceProgressStage: 0,
+            isDirty: false,
+            currentStepIndex: 0,
+            prevStepIndex: 0,
+            isPlaying: false,
+            historyItems: updatedHistory,
+            recentExecutions: updatedExecs,
+            fastRunResult: {
+              success: true,
+              stdout: explainStdout,
+              stderr: '',
+              exitCode: 0,
+              executionTimeMs: explainDurationMs,
+              language,
+              stdinUsed: stdin,
+              timestamp: now.toLocaleTimeString('en-US', {
+                hour: '2-digit',
+                minute: '2-digit',
+              }),
+              diagnostics,
+            },
+          });
+
+          // Persist code_executions log asynchronously
+          void fetch('/api/executions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-user-uid': user.uid,
+            },
+            body: JSON.stringify(explainExecRecord),
+          }).catch(() => {});
+
+          void saveCodeExecutionToFirestore(user.uid, explainExecRecord).catch(() => {});
+
+          // Persist run history to backend API in the background
+          void fetch('/api/history', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-user-uid': user.uid,
+            },
+            body: JSON.stringify(newEntry),
+          }).catch(() => {});
+
+          // Sync run history and active file to Cloud Firestore in the background
           void saveHistoryToFirestore(user.uid, {
             id: newEntry.id,
             title: newEntry.title_en,
@@ -1023,6 +1773,37 @@ export const useLabStore = create<LabState>((set, get) => ({
               isFavorite: true,
             }).catch(() => {});
           }
+        } else {
+          // Guest Mode: full execution & animation, ZERO history saved
+          set({
+            hasExecuted: true,
+            trace: nextTrace,
+            diagnostics,
+            executionStatus,
+            canRun: true,
+            apiNotice: apiRes.apiNotice || null,
+            apiError: null,
+            isTracing: false,
+            traceProgressStage: 0,
+            isDirty: false,
+            currentStepIndex: 0,
+            prevStepIndex: 0,
+            isPlaying: false,
+            fastRunResult: {
+              success: true,
+              stdout: explainStdout,
+              stderr: '',
+              exitCode: 0,
+              executionTimeMs: explainDurationMs,
+              language,
+              stdinUsed: stdin,
+              timestamp: now.toLocaleTimeString('en-US', {
+                hour: '2-digit',
+                minute: '2-digit',
+              }),
+              diagnostics,
+            },
+          });
         }
         return;
       }
@@ -1120,7 +1901,7 @@ export const useLabStore = create<LabState>((set, get) => ({
     }
   },
 
-  setSpeed: (speed) => set({ speed }),
+  setSpeed: () => set({ speed: 1 }),
 
   setReduceMotion: (reduceMotion) => {
     if (typeof document !== 'undefined') {
@@ -1147,34 +1928,60 @@ export const useLabStore = create<LabState>((set, get) => ({
 
   signInWithGoogle: async () => {
     try {
-      set({ isCloudSyncing: true });
+      set({ isAuthLoading: true, isCloudSyncing: true, authError: null });
       const profile = await signInWithGooglePopup();
+      if (!profile) {
+        // Redirect flow initiated (auth/popup-blocked fallback)
+        return;
+      }
       set({
         user: profile,
+        isAuthLoading: false,
         isCloudSyncing: false,
+        authError: null,
         toast: {
           id: `auth-${Date.now()}`,
-          message_bn: `স্বাগতম, ${profile.displayName}! ক্লাউড সিঙ্ক সক্রিয় হয়েছে।`,
-          message_en: `Welcome, ${profile.displayName}! Cloud sync is active.`,
+          message_bn: `স্বাগতম, ${profile.displayName}! গুগল লগইন সম্পন্ন হয়েছে।`,
+          message_en: `Welcome, ${profile.displayName}! Signed in with Google.`,
         },
       });
-      get().migrateGuestToAccount();
-    } catch {
-      set({ isCloudSyncing: false });
-      get().signInDemoStudent();
+      if (get().activeRoute === '/login') {
+        get().setActiveRoute('/');
+      }
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      let message_bn = 'গুগল দিয়ে লগইন করা যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।';
+      let message_en = 'Could not sign in with Google. Please try again.';
+
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        message_bn = 'লগইন পপআপ বন্ধ করা হয়েছে। লগইন করতে আবার চেষ্টা করুন।';
+        message_en = 'Sign-in popup was closed. Please try again.';
+      } else if (code === 'auth/unauthorized-domain') {
+        message_bn = 'এই ডোমেইনটি Firebase Authentication-এ অনুমোদিত নয়।';
+        message_en = 'This domain is not authorized in Firebase Authentication settings.';
+      } else if (code === 'auth/network-request-failed') {
+        message_bn = 'নেটওয়ার্ক সংযোগে সমস্যা হয়েছে। ইন্টারনেট সংযোগ পরীক্ষা করুন।';
+        message_en = 'Network error during Google sign-in. Please check your connection.';
+      } else if (err?.message === 'Firebase configuration missing') {
+        message_bn = 'Firebase কনফিগারেশন পাওয়া যায়নি।';
+        message_en = 'Firebase configuration is missing.';
+      }
+
+      set({
+        isAuthLoading: false,
+        isCloudSyncing: false,
+        authError: {
+          code: code || 'AUTH_ERROR',
+          message_bn,
+          message_en,
+        },
+      });
     }
   },
 
   signInDemoStudent: () => {
-    set({
-      user: {
-        uid: 'student-demo-bd',
-        displayName: 'তানভীর আহমেদ (Tanvir Ahmed)',
-        email: 'tanvir.student@logiclab.bd',
-        photoURL: '',
-        isDemo: true,
-      },
-    });
+    // Deprecated demo login removed in favor of Guest Mode + Google Auth
+    get().continueAsGuest();
   },
 
   signOutUser: async () => {
@@ -1183,13 +1990,26 @@ export const useLabStore = create<LabState>((set, get) => ({
     } catch {
       // ignore
     }
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+    clearLegacyLocalHistoryStorage();
     set({
       user: null,
+      isAuthLoading: false,
+      isCloudSyncing: false,
+      authError: null,
       guestWorkMigrated: false,
+      historyItems: [],
+      recentExecutions: [],
+      snippets: [],
+      historyDropdownOpen: false,
       toast: {
         id: `signout-${Date.now()}`,
-        message_bn: 'সাইন আউট সম্পন্ন হয়েছে।',
-        message_en: 'Signed out successfully.',
+        message_bn: 'লগআউট সম্পন্ন হয়েছে। আপনি এখন গেস্ট মোডে আছেন।',
+        message_en: 'Logged out successfully. You are now in Guest mode.',
       },
     });
   },
@@ -1306,12 +2126,14 @@ export const useLabStore = create<LabState>((set, get) => ({
   deleteHistoryItem: (id) => {
     const { historyItems, user } = get();
     const next = historyItems.filter((item) => item.id !== id);
-    persistHistory(next);
     set({ historyItems: next });
-    void fetch(`/api/history/${id}`, {
-      method: 'DELETE',
-      headers: { 'x-user-uid': user?.uid || 'guest-local' },
-    }).catch(() => {});
+    if (user && !user.isDemo) {
+      void fetch(`/api/history/${id}`, {
+        method: 'DELETE',
+        headers: { 'x-user-uid': user.uid },
+      }).catch(() => {});
+      void deleteHistoryFromFirestore(user.uid, id).catch(() => {});
+    }
   },
 
   setHistoryDropdownOpen: (open: boolean) => set({ historyDropdownOpen: open }),
@@ -1320,45 +2142,61 @@ export const useLabStore = create<LabState>((set, get) => ({
 
   restoreHistoryItem: (item: SavedHistoryItem) => {
     const { userFiles, activeFileId } = get();
+    const restoredFileName = item.fileName || item.title_en;
     const updatedFiles = userFiles.map((f) =>
       f.id === activeFileId
         ? {
             ...f,
             code: item.code,
-            fileName: item.fileName || item.title_en,
+            fileName: restoredFileName,
             language: item.language,
           }
         : f
     );
-    set({
-      code: item.code,
-      fileName: item.fileName || item.title_en,
-      language: item.language,
-      trace: item.trace || EMPTY_INITIAL_TRACE,
-      hasExecuted: true,
-      currentStepIndex: 0,
-      prevStepIndex: 0,
-      isPlaying: false,
-      historyDropdownOpen: false,
-      apiError:
-        item.verdictStatus === 'compile_error'
-          ? {
-              code: 'RESTORED_ERROR',
-              message_bn: item.trace?.verdict?.message || 'কোডে ত্রুটি আছে',
-              message_en: item.trace?.verdict?.message || 'Error in code',
-            }
-          : null,
-      userFiles: updatedFiles,
-    });
+    if (item.trace && item.trace.steps && item.trace.steps.length > 0) {
+      set({
+        code: item.code,
+        fileName: restoredFileName,
+        language: item.language,
+        trace: item.trace,
+        hasExecuted: true,
+        currentStepIndex: 0,
+        prevStepIndex: 0,
+        isPlaying: false,
+        historyDropdownOpen: false,
+        apiError:
+          item.verdictStatus === 'compile_error'
+            ? {
+                code: 'RESTORED_ERROR',
+                message_bn: item.trace?.verdict?.message || 'কোডে ত্রুটি আছে',
+                message_en: item.trace?.verdict?.message || 'Error in code',
+              }
+            : null,
+        userFiles: updatedFiles,
+      });
+    } else {
+      set({
+        code: item.code,
+        fileName: restoredFileName,
+        language: item.language,
+        historyDropdownOpen: false,
+        userFiles: updatedFiles,
+      });
+      void get().runVisualize(item.code);
+    }
   },
 
   clearAllHistory: () => {
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.removeItem('logic_lab_history_v2');
-      } catch {}
-    }
+    const { user } = get();
+    clearLegacyLocalHistoryStorage();
     set({ historyItems: [], historyDropdownOpen: false });
+    if (user && !user.isDemo) {
+      void fetch('/api/history', {
+        method: 'DELETE',
+        headers: { 'x-user-uid': user.uid },
+      }).catch(() => {});
+      void clearHistoryFromFirestore(user.uid).catch(() => {});
+    }
   },
 
   createShareLink: async () => {

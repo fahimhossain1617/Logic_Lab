@@ -11,8 +11,17 @@
     min-height: 100vh;
     margin: 0;
     padding: 0;
-    overflow-x: hidden;
+    overflow-x: clip;
     -webkit-font-smoothing: antialiased;
+  }
+
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
   }
 
   [lang="bn"] {
@@ -47,11 +56,10 @@
   word-break: break-word;
 }
 
-/* Panel Surface - Crisp borders, very soft light shadow, NO glowing box shadow */
+/* Panel Surface - Crisp 1px hairline border, flat Hallmark surface */
 .ll-panel {
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
-  box-shadow: var(--shadow-panel);
 }
 
 /* Primary Visualize Button - Crisp Flat Button, No Neon Glow */
@@ -88,6 +96,12 @@
 }
 
 /* Monaco Active Execution Line & Fault Line Decorations */
+.monaco-editor .margin-view-overlays .line-numbers {
+  text-align: center !important;
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+
 .monaco-active-line-bg {
   background: rgba(163, 193, 255, 0.16) !important;
   border-left: 3px solid #A3C1FF !important;

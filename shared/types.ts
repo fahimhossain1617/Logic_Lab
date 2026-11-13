@@ -21,13 +21,17 @@ export type AnalogyType =
 export type TraceSource = 'real_execution' | 'ai_predicted' | 'builtin_verified';
 
 export type LineRole =
+  | 'declaration'
   | 'declare'
+  | 'allocation'
   | 'assign'
   | 'condition'
+  | 'comparison'
   | 'loop'
   | 'call'
   | 'return'
   | 'output'
+  | 'scope_end'
   | 'block_end'
   | 'comment';
 
@@ -93,13 +97,57 @@ export interface StepStructure {
 }
 
 export type RuntimeActionType =
+  | 'DECLARATION'
+  | 'ALLOCATION'
   | 'DECLARE'
   | 'ASSIGN'
+  | 'CONDITION'
+  | 'LOOP'
   | 'LOOP_CHECK'
   | 'CONDITION_CHECK'
+  | 'COMPARISON'
+  | 'CALL'
   | 'OUTPUT'
+  | 'RETURN'
+  | 'SCOPE_END'
   | 'METHOD_ENTRY'
   | 'BLOCK_END';
+
+export interface VariableSnapshot {
+  name: string;
+  type: string;
+  value: any;
+  memoryAddress?: string | null;
+  referenceId?: string | null;
+  pointsTo?: string | null;
+  changed?: boolean;
+}
+
+export interface ComparisonVisual {
+  leftVar?: string | null;
+  rightVar?: string | null;
+  leftLabel: string;
+  rightLabel: string;
+  operator: string;
+  result: boolean;
+  reason?: string | null;
+}
+
+export interface VisualCue {
+  mode?:
+    | 'memory'
+    | 'compare'
+    | 'reference'
+    | 'mutate'
+    | 'loop'
+    | 'output'
+    | 'call'
+    | 'return';
+  highlightVars?: string[];
+  compareVars?: [string, string] | null;
+  linkVars?: string[] | null;
+  comparison?: ComparisonVisual | null;
+}
 
 export interface MemoryDelta {
   variable: string | null;
@@ -138,6 +186,10 @@ export interface TraceStep {
   consoleOutput?: string | null;
   whatHappenedBn?: string;
   logicBuildingBn?: string;
+  whatHappened?: string;
+  whyAndLogic?: string;
+  variableSnapshots?: VariableSnapshot[] | null;
+  visualCue?: VisualCue | null;
 }
 
 export interface LineNote {
@@ -243,3 +295,35 @@ export interface SampleProgram {
     };
   };
 }
+
+export type ExecutionMode = 'fast' | 'explain';
+
+export interface FastExecutionResult {
+  success: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  executionTimeMs: number;
+  timedOut?: boolean;
+  language: SupportedLanguage;
+  stdinUsed: string;
+  timestamp: string;
+  diagnostics?: ExecutionDiagnostic[];
+}
+
+export interface CodeExecutionRecord {
+  id: string;
+  userId?: string | null;
+  language: SupportedLanguage;
+  source_code: string;
+  stdin_input: string;
+  stdout_output: string;
+  stderr_output?: string;
+  exit_code?: number | null;
+  execution_mode: ExecutionMode;
+  execution_time_ms: number;
+  success: boolean;
+  file_name?: string;
+  created_at: string;
+}
+

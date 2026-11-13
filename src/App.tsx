@@ -3,8 +3,9 @@ import { useLabStore } from './store/useLabStore';
 import { CodeEditorPanel } from './components/editor/CodeEditorPanel';
 import { LineByLineWorkspace } from './components/workspace/LineByLineWorkspace';
 import { SharedRunView } from './components/views/SecondaryViews';
+import { LoginView } from './components/views/LoginView';
 import { Overlays } from './components/modals/Overlays';
-import { LogIn, LogOut, History, Languages, Trash2, Calendar } from 'lucide-react';
+import { LogIn, LogOut, History, Languages, Trash2, Calendar, AlertTriangle, X } from 'lucide-react';
 
 export default function App() {
   const {
@@ -14,7 +15,9 @@ export default function App() {
     user,
     historyItems,
     historyDropdownOpen,
+    apiNotice,
     initAuthAndCloudSync,
+    dismissApiNotice,
     setActiveRoute,
     runVisualize,
     togglePlay,
@@ -23,7 +26,7 @@ export default function App() {
     resetPlayback,
     goToStep,
     toggleExplainLanguage,
-    signInWithGoogle,
+    openLoginPage,
     signOutUser,
     openShareViewById,
     toggleHistoryDropdown,
@@ -54,15 +57,27 @@ export default function App() {
     return () => unsubscribe();
   }, [initAuthAndCloudSync]);
 
-  // Detect /s/:shareId route on initial load
+  // Detect /s/:shareId or /login route on initial load and browser navigation
   useEffect(() => {
-    if (typeof window !== 'undefined' && window.location.pathname.startsWith('/s/')) {
-      const shareId = window.location.pathname.slice(3).trim();
-      if (shareId) {
-        void openShareViewById(shareId);
+    const syncRouteFromUrl = () => {
+      if (typeof window === 'undefined') return;
+      const pathname = window.location.pathname;
+      if (pathname.startsWith('/s/')) {
+        const shareId = pathname.slice(3).trim();
+        if (shareId) {
+          void openShareViewById(shareId);
+        }
+      } else if (pathname === '/login') {
+        setActiveRoute('/login');
+      } else if (pathname === '/') {
+        setActiveRoute('/');
       }
-    }
-  }, [openShareViewById]);
+    };
+
+    syncRouteFromUrl();
+    window.addEventListener('popstate', syncRouteFromUrl);
+    return () => window.removeEventListener('popstate', syncRouteFromUrl);
+  }, [openShareViewById, setActiveRoute]);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -123,7 +138,7 @@ export default function App() {
   return (
     <div className="min-h-screen flex flex-col text-[var(--text-primary)] selection:bg-[#A3C1FF]/30">
       {/* Clean Single-Workspace Top Bar */}
-      <header className="flex items-center justify-between gap-4 px-4 sm:px-6 lg:px-8 py-3 border-b border-[#1E293B] bg-[#0B0F19]">
+      <header className="flex items-center justify-between gap-4 px-4 sm:px-6 lg:px-8 py-3 border-b border-[var(--border-subtle)] bg-[var(--bg-gutter)]">
         <div className="flex items-center gap-3 min-w-0">
           <a
             href="#workspace"
@@ -193,7 +208,23 @@ export default function App() {
                 </div>
 
                 <div className="max-h-72 overflow-y-auto pt-2 space-y-1.5">
-                  {historyItems.length === 0 ? (
+                  {!user ? (
+                    <div className="py-5 px-2 text-center space-y-3">
+                      <p className="text-xs text-slate-400 leading-relaxed m-0" lang={explainLanguage}>
+                        {explainLanguage === 'bn'
+                          ? 'গেস্ট মোডে কোনো রান ইতিহাস সেভ হয় না। ইতিহাস সংরক্ষণ করতে লগইন করুন।'
+                          : 'History is not saved in Guest mode. Login with Google to save your runs.'}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={openLoginPage}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-xs font-semibold text-white transition-colors cursor-pointer"
+                      >
+                        <LogIn className="w-3.5 h-3.5" />
+                        <span>{explainLanguage === 'bn' ? 'লগইন করুন' : 'Login'}</span>
+                      </button>
+                    </div>
+                  ) : historyItems.length === 0 ? (
                     <div className="py-6 text-center text-xs text-slate-500 font-mono">
                       {explainLanguage === 'bn' ? 'কোনো রান ইতিহাস নেই' : 'No execution history yet'}
                     </div>
@@ -267,7 +298,15 @@ export default function App() {
           {/* Login / Logout Button with Icon */}
           {user ? (
             <div className="flex items-center gap-2">
-              <span className="hidden sm:inline text-xs text-slate-300 font-medium truncate max-w-[120px]">
+              {user.photoURL ? (
+                <img
+                  src={user.photoURL}
+                  alt={user.displayName}
+                  className="w-6 h-6 rounded-full border border-slate-700 object-cover shrink-0"
+                  referrerPolicy="no-referrer"
+                />
+              ) : null}
+              <span className="hidden sm:inline text-xs text-slate-300 font-medium truncate max-w-[140px]">
                 {user.displayName}
               </span>
               <button
@@ -275,16 +314,16 @@ export default function App() {
                 onClick={() => void signOutUser()}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-700/80 bg-[#111827] text-xs font-medium text-slate-300 hover:text-red-400 hover:border-red-500/50 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 data-testid="header-signout-btn"
-                title="Sign Out"
+                title={explainLanguage === 'bn' ? 'লগআউট' : 'Logout'}
               >
                 <LogOut className="w-3.5 h-3.5" />
-                <span>{explainLanguage === 'bn' ? 'লগআউট' : 'Sign Out'}</span>
+                <span>{explainLanguage === 'bn' ? 'লগআউট' : 'Logout'}</span>
               </button>
             </div>
           ) : (
             <button
               type="button"
-              onClick={() => void signInWithGoogle()}
+              onClick={openLoginPage}
               className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl border border-slate-700/80 bg-[#111827] text-xs font-medium text-slate-200 hover:text-white hover:border-blue-500 transition-colors cursor-pointer whitespace-nowrap shrink-0"
               data-testid="header-signin-btn"
             >
@@ -299,16 +338,40 @@ export default function App() {
       {/* Main Single Clean Workspace */}
       <main
         id="workspace"
-        className="flex-1 min-w-0 p-4 sm:p-6 lg:p-8 overflow-x-hidden"
+        className="flex-1 min-w-0 p-4 sm:p-6 lg:p-8 overflow-x-clip"
       >
-        {activeRoute === '/share' ? (
+        {activeRoute === '/login' ? (
+          <LoginView />
+        ) : activeRoute === '/share' ? (
           <SharedRunView />
         ) : (
-          <div className="max-w-[1280px] mx-auto space-y-6 sm:space-y-8">
+          <div className="max-w-[1440px] mx-auto space-y-6 sm:space-y-8">
+            {apiNotice && (
+              <div
+                role="status"
+                className="flex items-center justify-between gap-3 py-2 border-b border-[var(--border-subtle)] text-xs text-amber-300"
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-400" />
+                  <span className="truncate">
+                    {explainLanguage === 'bn' ? apiNotice.message_bn : apiNotice.message_en}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={dismissApiNotice}
+                  className="p-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors cursor-pointer"
+                  aria-label="Dismiss notice"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
             {/* 1. User File / Folder Editor + Real Output Section */}
             <CodeEditorPanel />
 
-            {/* 2. Line-by-Line Explanation & Scrollable 3D Animation Workspace (only shown after valid code execution) */}
+            {/* 2. Line-by-Line Explanation & Horizontal Logic Breakdown Workspace */}
             <LineByLineWorkspace />
           </div>
         )}

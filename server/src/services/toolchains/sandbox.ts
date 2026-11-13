@@ -50,7 +50,7 @@ export async function cleanupSandboxWorkspace(dirPath: string): Promise<void> {
 /**
  * Sanitizes PATH to include compilers while stripping sensitive credentials
  */
-function getSanitizedEnv(): NodeJS.ProcessEnv {
+export function getSanitizedEnv(): NodeJS.ProcessEnv {
   // Pass PATH, SYSTEMROOT, TEMP, and standard system variables
   const cleanEnv: NodeJS.ProcessEnv = {
     PATH: process.env.PATH || '',
@@ -65,6 +65,32 @@ function getSanitizedEnv(): NodeJS.ProcessEnv {
     HOMEPATH: process.env.HOMEPATH || '\\Users\\fahim',
   };
   return cleanEnv;
+}
+
+/**
+ * Terminates a child process and its descendants cleanly across Windows and Unix
+ */
+export function killProcessTree(childProcess: any): void {
+  if (!childProcess || !childProcess.pid) return;
+  if (process.platform === 'win32') {
+    try {
+      spawn('taskkill', ['/pid', String(childProcess.pid), '/T', '/F'], {
+        windowsHide: true,
+      });
+    } catch {
+      try {
+        childProcess.kill('SIGKILL');
+      } catch {
+        // Ignore already-exited errors
+      }
+    }
+  } else {
+    try {
+      childProcess.kill('SIGKILL');
+    } catch {
+      // Ignore already-exited errors
+    }
+  }
 }
 
 /**
@@ -156,9 +182,12 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
         finish(code);
       });
 
-      // Write stdin if provided
+      // Write stdin if provided (normalize CRLF and ensure trailing newline for Scanner/cin/input/readline)
       if (stdin) {
-        childProcess.stdin.write(stdin);
+        const normalizedStdin = stdin.replace(/\r\n/g, '\n');
+        childProcess.stdin.write(
+          normalizedStdin.endsWith('\n') ? normalizedStdin : `${normalizedStdin}\n`
+        );
       }
       childProcess.stdin.end();
     } catch (err: any) {

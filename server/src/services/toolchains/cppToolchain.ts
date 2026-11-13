@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
+import { executeViaRemoteSandbox, isLocalExecutionBlockedError } from './remoteSandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
 
@@ -12,9 +13,8 @@ export function parseGppDiagnostics(stderr: string, stdout: string): ExecutionDi
   const lines = combined.split('\n');
   const diagnostics: ExecutionDiagnostic[] = [];
 
-  // Match: program.cpp:5:10: error: expected ';'
-  // Match: program.cpp:5:10: warning: unused variable
-  const diagRegex = /^.*?[\\/]?([A-Za-z0-9_.-]+\.cpp):(\d+):(\d+):\s*(error|warning|fatal error):\s*(.+)$/;
+  // Match: program.cpp:5:10: error: expected ';' or program.c:5:10: error: ...
+  const diagRegex = /^.*?[\\/]?([A-Za-z0-9_.-]+\.(?:cpp|c|cc|cxx)):(\d+):(\d+):\s*(error|warning|fatal error):\s*(.+)$/;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -77,6 +77,35 @@ export async function compileCpp(
   };
 }
 
+function buildRemoteCppResult(
+  remote: NonNullable<Awaited<ReturnType<typeof executeViaRemoteSandbox>>>,
+  diagnostics: ExecutionDiagnostic[],
+  runtimeErrorLine?: number
+): ToolchainExecutionResult {
+  const status: 'success' | 'warning' | 'error' =
+    remote.timedOut || (remote.exitCode !== 0 && remote.exitCode !== null)
+      ? 'error'
+      : diagnostics.some((d) => d.severity === 'warning')
+      ? 'warning'
+      : 'success';
+  const output = remote.runtimeError
+    ? remote.stdout ? `${remote.stdout}\n${remote.runtimeError}` : remote.runtimeError
+    : remote.stdout;
+  return {
+    status,
+    canRun: status !== 'error',
+    stdout: remote.stdout,
+    stderr: remote.stderr,
+    output,
+    exitCode: remote.exitCode,
+    timedOut: remote.timedOut,
+    runtimeError: remote.runtimeError,
+    ...(runtimeErrorLine !== undefined ? { runtimeErrorLine } : {}),
+    executionTimeMs: remote.executionTimeMs,
+    diagnostics,
+  };
+}
+
 /**
  * Executes a compiled C++ binary in the sandbox
  */
@@ -90,6 +119,22 @@ export async function executeCpp(
 
   try {
     if (!compileRes.success) {
+      // Fallback to remote sandbox if g++ is unavailable on host (e.g. serverless)
+      if (isLocalExecutionBlockedError(compileRes.stderr)) {
+        const remote = await executeViaRemoteSandbox('cpp', code, stdin, timeoutMs);
+        if (remote) {
+          const remoteDiagnostics = remote.compileOutput
+            ? parseGppDiagnostics(remote.compileOutput, '')
+            : [];
+          const hasRemoteCompileErr = remote.exitCode !== 0 && Boolean(remote.compileOutput);
+          return buildRemoteCppResult(
+            remote,
+            remoteDiagnostics,
+            hasRemoteCompileErr ? remoteDiagnostics[0]?.line || 1 : undefined
+          );
+        }
+      }
+
       const firstError = compileRes.diagnostics.find((d) => d.severity === 'error');
       const errorMsg =
         firstError?.message || compileRes.stderr.trim() || 'C++ compilation failed.';
@@ -116,6 +161,30 @@ export async function executeCpp(
       timeoutMs,
     });
 
+    const hasWarnings = compileRes.diagnostics.some((d) => d.severity === 'warning');
+
+    if (runRes.exitCode !== 0 && isLocalExecutionBlockedError(runRes.stderr)) {
+      const remote = await executeViaRemoteSandbox('cpp', code, stdin, timeoutMs);
+      if (remote) {
+        return buildRemoteCppResult(remote, compileRes.diagnostics);
+      }
+
+      const blockedMsg =
+        'Local compiled C++ executable was blocked by OS security policy (Device Guard), and remote sandbox execution was unavailable.';
+      return {
+        status: 'error',
+        canRun: false,
+        stdout: '',
+        stderr: blockedMsg,
+        output: blockedMsg,
+        exitCode: 1,
+        timedOut: false,
+        runtimeError: blockedMsg,
+        executionTimeMs: runRes.executionTimeMs,
+        diagnostics: compileRes.diagnostics,
+      };
+    }
+
     let runtimeError: string | null = null;
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
@@ -123,7 +192,6 @@ export async function executeCpp(
       runtimeError = runRes.stderr.trim() || `Process exited with error code ${runRes.exitCode}.`;
     }
 
-    const hasWarnings = compileRes.diagnostics.some((d) => d.severity === 'warning');
     const status: 'success' | 'warning' | 'error' =
       runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
         ? 'error'

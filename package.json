@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch server.ts",
     "start": "tsx server.ts",
-    "build": "vite build",
+    "build": "vite build && npm run build:api",
+    "build:api": "esbuild server/src/vercel.ts --bundle --platform=node --format=esm --packages=external --outfile=api/index.mjs",
     "preview": "vite preview",
     "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true }); try { fs.rmSync('server.js', { force: true }); } catch {}\"",
     "lint": "tsc --noEmit",

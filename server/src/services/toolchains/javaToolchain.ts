@@ -1,6 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
+import {
+  buildRemoteToolchainResult,
+  executeViaRemoteSandbox,
+  isLocalExecutionBlockedError,
+} from './remoteSandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
 
@@ -120,6 +125,22 @@ export async function executeJava(
 
   try {
     if (!compileRes.success) {
+      // Fallback to remote sandbox if javac is unavailable on host (e.g. serverless)
+      if (isLocalExecutionBlockedError(compileRes.stderr)) {
+        const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs);
+        if (remote) {
+          const remoteDiagnostics = remote.compileOutput
+            ? parseJavacDiagnostics(remote.compileOutput, '')
+            : [];
+          const hasRemoteCompileErr = remote.exitCode !== 0 && Boolean(remote.compileOutput);
+          return buildRemoteToolchainResult(
+            remote,
+            remoteDiagnostics,
+            hasRemoteCompileErr ? remoteDiagnostics[0]?.line || 1 : undefined
+          );
+        }
+      }
+
       const firstError = compileRes.diagnostics.find((d) => d.severity === 'error');
       const errorMsg =
         firstError?.message || compileRes.stderr.trim() || 'Java compilation failed.';
@@ -159,6 +180,13 @@ export async function executeJava(
       stdin,
       timeoutMs,
     });
+
+    if (runRes.exitCode !== 0 && isLocalExecutionBlockedError(runRes.stderr)) {
+      const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs);
+      if (remote) {
+        return buildRemoteToolchainResult(remote, compileRes.diagnostics);
+      }
+    }
 
     // Check runtime errors and exceptions
     let runtimeError: string | null = null;

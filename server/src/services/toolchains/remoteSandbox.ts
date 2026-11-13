@@ -1,4 +1,5 @@
-import { SupportedLanguage } from '../../../../shared/types';
+import { ExecutionDiagnostic, SupportedLanguage } from '../../../../shared/types';
+import { ToolchainExecutionResult } from './types';
 
 export interface RemoteSandboxResult {
   ok: boolean;
@@ -214,6 +215,40 @@ async function runJudge0(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Converts a RemoteSandboxResult into a standard ToolchainExecutionResult.
+ */
+export function buildRemoteToolchainResult(
+  remote: RemoteSandboxResult,
+  diagnostics: ExecutionDiagnostic[],
+  runtimeErrorLine?: number
+): ToolchainExecutionResult {
+  const status: 'success' | 'warning' | 'error' =
+    remote.timedOut || (remote.exitCode !== 0 && remote.exitCode !== null)
+      ? 'error'
+      : diagnostics.some((d) => d.severity === 'warning')
+      ? 'warning'
+      : 'success';
+  const output = remote.runtimeError
+    ? remote.stdout
+      ? `${remote.stdout}\n${remote.runtimeError}`
+      : remote.runtimeError
+    : remote.stdout;
+  return {
+    status,
+    canRun: status !== 'error',
+    stdout: remote.stdout,
+    stderr: remote.stderr,
+    output,
+    exitCode: remote.exitCode,
+    timedOut: remote.timedOut,
+    runtimeError: remote.runtimeError,
+    ...(runtimeErrorLine !== undefined ? { runtimeErrorLine } : {}),
+    executionTimeMs: remote.executionTimeMs,
+    diagnostics,
+  };
 }
 
 /**

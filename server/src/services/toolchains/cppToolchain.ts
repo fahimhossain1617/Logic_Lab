@@ -1,7 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
-import { executeViaRemoteSandbox, isLocalExecutionBlockedError } from './remoteSandbox';
+import {
+  buildRemoteToolchainResult,
+  executeViaRemoteSandbox,
+  isLocalExecutionBlockedError,
+} from './remoteSandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
 
@@ -77,35 +81,6 @@ export async function compileCpp(
   };
 }
 
-function buildRemoteCppResult(
-  remote: NonNullable<Awaited<ReturnType<typeof executeViaRemoteSandbox>>>,
-  diagnostics: ExecutionDiagnostic[],
-  runtimeErrorLine?: number
-): ToolchainExecutionResult {
-  const status: 'success' | 'warning' | 'error' =
-    remote.timedOut || (remote.exitCode !== 0 && remote.exitCode !== null)
-      ? 'error'
-      : diagnostics.some((d) => d.severity === 'warning')
-      ? 'warning'
-      : 'success';
-  const output = remote.runtimeError
-    ? remote.stdout ? `${remote.stdout}\n${remote.runtimeError}` : remote.runtimeError
-    : remote.stdout;
-  return {
-    status,
-    canRun: status !== 'error',
-    stdout: remote.stdout,
-    stderr: remote.stderr,
-    output,
-    exitCode: remote.exitCode,
-    timedOut: remote.timedOut,
-    runtimeError: remote.runtimeError,
-    ...(runtimeErrorLine !== undefined ? { runtimeErrorLine } : {}),
-    executionTimeMs: remote.executionTimeMs,
-    diagnostics,
-  };
-}
-
 /**
  * Executes a compiled C++ binary in the sandbox
  */
@@ -127,7 +102,7 @@ export async function executeCpp(
             ? parseGppDiagnostics(remote.compileOutput, '')
             : [];
           const hasRemoteCompileErr = remote.exitCode !== 0 && Boolean(remote.compileOutput);
-          return buildRemoteCppResult(
+          return buildRemoteToolchainResult(
             remote,
             remoteDiagnostics,
             hasRemoteCompileErr ? remoteDiagnostics[0]?.line || 1 : undefined
@@ -166,7 +141,7 @@ export async function executeCpp(
     if (runRes.exitCode !== 0 && isLocalExecutionBlockedError(runRes.stderr)) {
       const remote = await executeViaRemoteSandbox('cpp', code, stdin, timeoutMs);
       if (remote) {
-        return buildRemoteCppResult(remote, compileRes.diagnostics);
+        return buildRemoteToolchainResult(remote, compileRes.diagnostics);
       }
 
       const blockedMsg =

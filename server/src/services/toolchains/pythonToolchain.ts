@@ -1,6 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
+import {
+  buildRemoteToolchainResult,
+  executeViaRemoteSandbox,
+  isLocalExecutionBlockedError,
+} from './remoteSandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
 
@@ -95,6 +100,14 @@ export async function executePython(
 
   try {
     if (!syntaxRes.success) {
+      // Fallback to remote sandbox if python is unavailable on host (e.g. serverless)
+      if (isLocalExecutionBlockedError(syntaxRes.stderr)) {
+        const remote = await executeViaRemoteSandbox('python', code, stdin, timeoutMs);
+        if (remote) {
+          return buildRemoteToolchainResult(remote, []);
+        }
+      }
+
       const firstError = syntaxRes.diagnostics.find((d) => d.severity === 'error');
       const errorMsg =
         firstError?.message || syntaxRes.stderr.trim() || 'Python syntax error.';
@@ -124,6 +137,13 @@ export async function executePython(
       timeoutMs,
       env: { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
     });
+
+    if (runRes.exitCode !== 0 && isLocalExecutionBlockedError(runRes.stderr)) {
+      const remote = await executeViaRemoteSandbox('python', code, stdin, timeoutMs);
+      if (remote) {
+        return buildRemoteToolchainResult(remote, syntaxRes.diagnostics);
+      }
+    }
 
     let runtimeError: string | null = null;
     let runtimeErrorLine: number | undefined;

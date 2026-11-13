@@ -1317,6 +1317,11 @@ export const useLabStore = create<LabState>((set, get) => ({
       }
 
       const sessionId: string = data.sessionId;
+      if (typeof EventSource === 'undefined') {
+        await runStaticFallback();
+        return;
+      }
+
       set({
         activeSessionId: sessionId,
         terminalExecState: 'RUNNING',

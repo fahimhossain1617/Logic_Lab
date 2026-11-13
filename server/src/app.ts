@@ -13,8 +13,20 @@ import {
 export function createCoreExpressApp(): Express {
   const app = express();
 
+  // Full CORS support for local dev (Vite on port 5173, custom origins, etc.)
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-user-uid, Cache-Control');
+    res.setHeader('Access-Control-Expose-Headers', '*');
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
+
   app.use(securityHeadersMiddleware);
-  app.use(express.json({ limit: '64kb' }));
+  app.use(express.json({ limit: '512kb' }));
 
   // Mount API routes at /api and root fallback (for Vercel serverless function rewrites)
   app.use('/api', apiRouter);

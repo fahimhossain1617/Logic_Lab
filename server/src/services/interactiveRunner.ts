@@ -61,7 +61,7 @@ export interface StartInteractiveResult {
 
 const sessions = new Map<string, InteractiveSession>();
 const MAX_OUTPUT_BYTES = 128 * 1024;
-const STEP_TIMEOUT_MS = 5000;
+const STEP_TIMEOUT_MS = 12000;
 const IDLE_TIMEOUT_MS = 120_000;
 const PROMPT_SETTLE_MS = 85;
 
@@ -317,9 +317,11 @@ function createRemoteReplaySession(
   language: SupportedLanguage,
   fileName: string | undefined,
   isInteractive: boolean,
-  diagnostics: ExecutionDiagnostic[]
+  diagnostics: ExecutionDiagnostic[],
+  initialStdin = ''
 ): StartInteractiveResult {
   const sessionId = `exec-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const initialInputs = initialStdin ? initialStdin.replace(/\r\n/g, '\n').split('\n') : [];
   const session: InteractiveSession = {
     id: sessionId,
     language,
@@ -328,12 +330,12 @@ function createRemoteReplaySession(
     workspaceDir: '',
     child: null,
     isRemoteReplay: true,
-    collectedInputs: [],
+    collectedInputs: initialInputs,
     isInteractive,
     startedAt: Date.now(),
     stdoutAll: '',
     stderrAll: '',
-    stdinAll: '',
+    stdinAll: initialStdin,
     exited: false,
     exitCode: null,
     timedOut: false,
@@ -361,7 +363,8 @@ function createRemoteReplaySession(
 export async function startInteractiveSession(
   rawCode: string,
   language: SupportedLanguage,
-  fileName?: string
+  fileName?: string,
+  initialStdin = ''
 ): Promise<StartInteractiveResult> {
   const prep = preprocessCode(rawCode, language);
   const code = prep.code;
@@ -410,7 +413,7 @@ export async function startInteractiveSession(
         const errMsg =
           compileRes.stderr.trim() || firstErr?.message || 'C/C++ compilation failed.';
         if (isLocalExecutionBlockedError(errMsg)) {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics);
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
         }
         return {
           ok: false,
@@ -452,8 +455,8 @@ export async function startInteractiveSession(
       cmd = 'java';
       args =
         runnerCompile.exitCode === 0
-          ? ['-cp', workspaceDir, '_LogicLabRunner', className]
-          : ['-cp', workspaceDir, className];
+          ? ['-Dfile.encoding=UTF-8', '-cp', workspaceDir, '_LogicLabRunner', className]
+          : ['-Dfile.encoding=UTF-8', '-cp', workspaceDir, className];
     } else if (language === 'python') {
       const syntaxRes = await checkPythonSyntax(code, fileName || 'script.py');
       workspaceDir = syntaxRes.workspaceDir;
@@ -520,7 +523,7 @@ export async function startInteractiveSession(
       startedAt: Date.now(),
       stdoutAll: '',
       stderrAll: '',
-      stdinAll: '',
+      stdinAll: initialStdin,
       exited: false,
       exitCode: null,
       timedOut: false,
@@ -532,6 +535,15 @@ export async function startInteractiveSession(
       stepTimeoutTimer: null,
       idleTimeoutTimer: null,
     };
+
+    if (initialStdin && child.stdin) {
+      const normalized = initialStdin.replace(/\r\n/g, '\n');
+      try {
+        child.stdin.write(normalized.endsWith('\n') ? normalized : `${normalized}\n`);
+      } catch {
+        // Ignore write error on dead child
+      }
+    }
 
     sessions.set(sessionId, session);
     startStepTimer(session);

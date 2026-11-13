@@ -1242,7 +1242,15 @@ export const useLabStore = create<LabState>((set, get) => ({
           void saveCodeExecutionToFirestore(currentUser.uid, record).catch(() => {});
         }
       } catch (fbErr: any) {
-        const errMsg = fbErr?.message || fallbackErr || 'Failed to execute code.';
+        const isNetworkErr =
+          fbErr?.name === 'TypeError' ||
+          String(fbErr?.message || '').toLowerCase().includes('fetch') ||
+          String(fallbackErr || '').toLowerCase().includes('fetch');
+        const errMsg = isNetworkErr
+          ? explainLanguage === 'bn'
+            ? 'সার্ভারের সাথে সংযোগ করা সম্ভব হয়নি (Failed to connect to backend server at http://localhost:3000)। অনুগ্রহ করে টার্মিনালে \'npm run dev\' চালু আছে কিনা তা নিশ্চিত করুন।'
+            : 'Could not connect to the backend execution server at http://localhost:3000. Please ensure the server is running (\'npm run dev\').'
+          : fbErr?.message || fallbackErr || 'Failed to execute code.';
         set({
           isFastRunning: false,
           activeSessionId: null,
@@ -1262,7 +1270,7 @@ export const useLabStore = create<LabState>((set, get) => ({
           'Content-Type': 'application/json',
           'x-user-uid': user?.uid || 'guest-local',
         },
-        body: JSON.stringify({ code, language, fileName }),
+        body: JSON.stringify({ code, language, fileName, stdin }),
       });
 
       let data: any = null;
@@ -1532,27 +1540,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       };
     } catch (err: any) {
       if (err?.name === 'AbortError' || controller.signal.aborted) return;
-      const errMsg = err?.message || 'Failed to execute code.';
-      set({
-        isFastRunning: false,
-        activeSessionId: null,
-        terminalExecState: 'ERROR',
-        executionStatus: 'error',
-        terminalHistory: [{ id: makeTerminalLineId(), type: 'error', text: errMsg }],
-        fastRunResult: {
-          success: false,
-          stdout: '',
-          stderr: errMsg,
-          exitCode: 1,
-          executionTimeMs: Math.max(1, Date.now() - startedAt),
-          language,
-          stdinUsed: '',
-          timestamp: new Date().toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-          }),
-        },
-      });
+      await runStaticFallback(err?.message);
     }
   },
 

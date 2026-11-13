@@ -16,6 +16,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
   const {
     fileName,
     explainLanguage,
+    stdin,
     consoleOpen,
     isFastRunning,
     isTracing,
@@ -31,13 +32,14 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
     apiError,
     diagnostics,
     executionStatus,
+    setStdin,
     setCurrentInputValue,
     submitTerminalInput,
     toggleConsoleOpen,
     clearConsoleOutput,
   } = useLabStore();
 
-  const [activeTab, setActiveTab] = useState<'output' | 'problems'>('output');
+  const [activeTab, setActiveTab] = useState<'output' | 'problems' | 'stdin'>('output');
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const inlineInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -159,6 +161,25 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
             )}
           </button>
 
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('stdin');
+              if (!consoleOpen) toggleConsoleOpen();
+            }}
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+              activeTab === 'stdin'
+                ? 'bg-[var(--code-pill-bg)] text-[var(--text-accent)] border border-[var(--border-active)]/35'
+                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            }`}
+            data-testid="tab-stdin"
+          >
+            <span>{explainLanguage === 'bn' ? 'ইনপুট (STDIN)' : 'Input (stdin)'}</span>
+            {stdin.trim().length > 0 && (
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+            )}
+          </button>
+
           {isWaitingInput && (
             <span className="inline-flex items-center gap-1.5 text-[11px] font-mono font-semibold px-2 py-0.5 rounded-md bg-cyan-500/15 text-cyan-300">
               <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
@@ -244,7 +265,39 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
             }`}
             data-testid="terminal-output-view"
           >
-            {activeTab === 'problems' ? (
+            {activeTab === 'stdin' ? (
+              <div className="p-1 space-y-2 select-text" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center justify-between text-xs font-mono text-slate-400">
+                  <span>
+                    {explainLanguage === 'bn'
+                      ? 'কোড রান করার আগে ইনপুট দিতে চাইলে নিচে লিখুন (প্রতি লাইনে একটি ইনপুট):'
+                      : 'Provide inputs line by line before running (or leave blank to type interactively):'}
+                  </span>
+                  {stdin.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setStdin('')}
+                      className="text-xs text-rose-400 hover:text-rose-300 font-mono cursor-pointer"
+                    >
+                      {explainLanguage === 'bn' ? 'মুছুন' : 'Clear'}
+                    </button>
+                  )}
+                </div>
+                <textarea
+                  value={stdin}
+                  onChange={(e) => setStdin(e.target.value)}
+                  placeholder={
+                    explainLanguage === 'bn'
+                      ? 'এখানে ইনপুট লিখুন (যেমন:\n15.5\n24.5\n...খালি রাখলে কোড চলাকালীন টার্মিনালেই সরাসরি টাইপ করতে পারবেন)'
+                      : 'Enter inputs line by line (e.g.:\n15.5\n24.5\n...or leave empty to type interactively in the terminal)'
+                  }
+                  rows={4}
+                  spellCheck={false}
+                  data-testid="console-stdin-input"
+                  className="w-full rounded-lg bg-[#070C1D] border border-slate-800 focus:border-cyan-500/60 focus:outline-none p-3 font-mono text-xs sm:text-sm text-slate-100 placeholder:text-slate-600 resize-y"
+                />
+              </div>
+            ) : activeTab === 'problems' ? (
               displayDiagnostics.length === 0 ? (
                 <div className="py-2 text-slate-500 select-none text-xs">
                   //{' '}

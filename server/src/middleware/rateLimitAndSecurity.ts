@@ -21,7 +21,7 @@ export function traceRateLimiter(req: Request, res: Response, next: NextFunction
   const userId = req.headers['x-user-uid'] as string | undefined;
 
   if (userId) {
-    const limit = 60;
+    const limit = 120;
     const bucket = userBuckets.get(userId);
     if (!bucket || now > bucket.resetAt) {
       userBuckets.set(userId, { count: 1, resetAt: now + windowMs });
@@ -31,8 +31,8 @@ export function traceRateLimiter(req: Request, res: Response, next: NextFunction
       return res.status(429).json({
         error: {
           code: 'RATE_LIMIT_EXCEEDED',
-          message_bn: 'আপনি প্রতি মিনিটে ৬০টির বেশি অনুরোধ পাঠিয়েছেন। অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন।',
-          message_en: 'Rate limit exceeded (60 requests/min per user). Please wait a moment.',
+          message_bn: 'আপনি প্রতি মিনিটে অনুরোধের সীমা অতিক্রম করেছেন। অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন।',
+          message_en: 'Rate limit exceeded (120 requests/min per user). Please wait a moment.',
         },
       });
     }
@@ -41,7 +41,7 @@ export function traceRateLimiter(req: Request, res: Response, next: NextFunction
   }
 
   const ip = (req.ip || req.socket.remoteAddress || 'anon').toString();
-  const limit = 20;
+  const limit = 120;
   const bucket = ipBuckets.get(ip);
   if (!bucket || now > bucket.resetAt) {
     ipBuckets.set(ip, { count: 1, resetAt: now + windowMs });
@@ -51,8 +51,8 @@ export function traceRateLimiter(req: Request, res: Response, next: NextFunction
     return res.status(429).json({
       error: {
         code: 'RATE_LIMIT_EXCEEDED',
-        message_bn: 'প্রতি মিনিটে সর্বোচ্চ ২০টি ভিজ্যুয়ালাইজ অনুরোধ করা যায়। অনুগ্রহ করে একটু পর আবার চেষ্টা করুন।',
-        message_en: 'Rate limit exceeded (20 requests/min per IP). Please try again shortly.',
+        message_bn: 'প্রতি মিনিটে অনুরোধের সীমা অতিক্রম করেছে। অনুগ্রহ করে একটু পর আবার চেষ্টা করুন।',
+        message_en: 'Rate limit exceeded (120 requests/min per IP). Please try again shortly.',
       },
     });
   }

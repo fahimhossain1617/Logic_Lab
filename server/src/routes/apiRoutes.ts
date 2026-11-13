@@ -514,6 +514,7 @@ apiRouter.post('/execute/start', traceRateLimiter, async (req: Request, res: Res
       ? rawLang
       : 'javascript';
   const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName : undefined;
+  const stdin = typeof req.body?.stdin === 'string' ? req.body.stdin : '';
 
   if (!code.trim()) {
     return res.status(400).json({
@@ -524,7 +525,7 @@ apiRouter.post('/execute/start', traceRateLimiter, async (req: Request, res: Res
     });
   }
 
-  const result = await startInteractiveSession(code, language, fileName);
+  const result = await startInteractiveSession(code, language, fileName, stdin);
   if (!result.ok) {
     return res.status(200).json(result);
   }

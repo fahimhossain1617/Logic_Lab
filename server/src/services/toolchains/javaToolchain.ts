@@ -140,10 +140,21 @@ export async function executeJava(
 
     const mainClass = compileRes.mainClass || 'Main';
 
-    // Execute with java runtime in sandbox
+    // Execute with java runtime in sandbox (force UTF-8 across stdio and default charset on Windows/Java 18+)
     const runRes = await runSandboxedProcess({
       cmd: 'java',
-      args: ['-Dfile.encoding=UTF-8', '-Xmx256m', '-cp', compileRes.workspaceDir, mainClass],
+      args: [
+        '-Dfile.encoding=UTF-8',
+        '-Dstdout.encoding=UTF-8',
+        '-Dstderr.encoding=UTF-8',
+        '-Dstdin.encoding=UTF-8',
+        '-Dsun.stdout.encoding=UTF-8',
+        '-Dsun.stderr.encoding=UTF-8',
+        '-Xmx256m',
+        '-cp',
+        compileRes.workspaceDir,
+        mainClass,
+      ],
       cwd: compileRes.workspaceDir,
       stdin,
       timeoutMs,

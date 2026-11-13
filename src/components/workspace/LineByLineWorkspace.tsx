@@ -1,6 +1,11 @@
 import React, { useState } from 'react';
 import { useLabStore } from '../../store/useLabStore';
 import { FormattedText } from '../common/FormattedText';
+import { sanitizeDisplayText } from '../stage/GenericMemoryRenderer';
+import {
+  analyzeBlockExecution,
+  buildExecutionAwareLineNote,
+} from '../../../shared/codeAnalysis';
 import {
   BookOpen,
   ListOrdered,
@@ -22,6 +27,15 @@ function getActionBadgeClasses(tag: string): string {
     return 'bg-[var(--bg-gutter)] text-[var(--text-muted)]';
   }
   return 'bg-[var(--bg-gutter)] text-[var(--text-secondary)]';
+}
+
+function isBoilerplateLineNote(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  if (/^লাইন\s+\d+\s*\([^)]*\)\s*(?:এক্সিকিউট\s+হয়েছে|সম্পন্ন\s+হয়েছে)/.test(t)) return true;
+  if (/^প্রোগ্রামের চূড়ান্ত ফলাফলে পৌঁছানোর জন্য এই লাইনটি স্টেট/.test(t)) return true;
+  if (/^Line\s+\d+\s*\([^)]*\)\s*executed\.?$/i.test(t)) return true;
+  return false;
 }
 
 export const LineByLineWorkspace: React.FC = () => {
@@ -50,6 +64,8 @@ export const LineByLineWorkspace: React.FC = () => {
 
   const codeLines = code.split('\n');
   const activeStep = trace.steps[currentStepIndex] || trace.steps[0];
+  const executedLines = new Set<number>(trace.steps.map((s) => s.activeLine));
+  const blockExec = analyzeBlockExecution(code, trace.language, executedLines);
 
   // Build line-by-line reference entries for every non-empty line in the user's code
   const lineBreakdownItems = codeLines
@@ -64,25 +80,95 @@ export const LineByLineWorkspace: React.FC = () => {
       const firstStepIdx = firstStep
         ? trace.steps.findIndex((s) => s.stepIndex === firstStep.stepIndex)
         : -1;
+      const role = (note?.role || firstStep?.actionType || firstStep?.action || 'statement').toUpperCase();
+      const braceInfo = blockExec.braceByCloseLine.get(lineNumber);
+      const pythonEndInfo = blockExec.pythonEndsByLine.get(lineNumber);
+      const isClosingBrace = trimmed === '}' || trimmed === '};';
+      const awareFallback = buildExecutionAwareLineNote({
+        lineNumber,
+        trimmed,
+        language: trace.language,
+        explainLanguage,
+        executedLines,
+        braceInfo,
+        pythonEndInfo,
+      });
+
+      const isSkippedConditionalOrBlock =
+        matchingSteps.length === 0 &&
+        (blockExec.skippedBlockLines.has(lineNumber) ||
+          /^(?:\}?\s*)?(?:else\s+if|elif|else|catch|except|case\b|default\s*:)/.test(trimmed));
+
+      const noteMentionsSkipped =
+        Boolean(note?.text) &&
+        /স্কিপ|চলেনি|প্রবেশ\s*করেনি|বাদ\s*পড়ে|হয়নি|skip|not\s+executed|bypassed|unentered|did\s+not\s+enter/i.test(
+          note!.text
+        );
+      const noteClaimsActiveReturn =
+        Boolean(note?.text) &&
+        /নিয়ন্ত্রণ\s+বাইরের|ব্লক\s+শেষ\s+হয়ে\s+নিয়ন্ত্রণ|returning\s+control|returns\s+control/i.test(
+          note!.text
+        );
+
+      let candidateWhat: string;
+      if (isClosingBrace) {
+        candidateWhat =
+          braceInfo?.wasBlockExecuted && note?.text && !isBoilerplateLineNote(note.text)
+            ? note.text
+            : awareFallback.text;
+      } else if ((firstStep?.whatHappened || firstStep?.explanation) && matchingSteps.length > 0) {
+        const baseWhat =
+          matchingSteps.length > 1
+            ? `${firstStep.whatHappened || firstStep.explanation} (${
+                explainLanguage === 'bn'
+                  ? `মোট ${matchingSteps.length} বার চলেছে`
+                  : `ran ${matchingSteps.length}×`
+              })`
+            : firstStep.whatHappened || firstStep.explanation;
+        if (
+          trace.language === 'python' &&
+          pythonEndInfo?.wasBlockExecuted &&
+          !/ইন্ডেন্টেশন|ব্লক.*শেষ|block\s*end|ends\s+the\s+python/i.test(baseWhat)
+        ) {
+          candidateWhat =
+            explainLanguage === 'bn'
+              ? `${baseWhat} (এই লাইনের পর \`${pythonEndInfo.kind}\` ব্লকের ইন্ডেন্টেশন শেষ হয়ে নিয়ন্ত্রণ বাইরের স্তরে ফিরে আসে)`
+              : `${baseWhat} (Ends the Python \`${pythonEndInfo.kind}\` block afterward, returning control outward)`;
+        } else {
+          candidateWhat = baseWhat;
+        }
+      } else if (isSkippedConditionalOrBlock) {
+        candidateWhat =
+          note?.text && !isBoilerplateLineNote(note.text) && noteMentionsSkipped
+            ? note.text
+            : awareFallback.text;
+      } else if (
+        note?.text &&
+        !isBoilerplateLineNote(note.text) &&
+        !(matchingSteps.length === 0 && noteClaimsActiveReturn)
+      ) {
+        candidateWhat = note.text;
+      } else {
+        candidateWhat = awareFallback.text;
+      }
+
+      const candidateWhy =
+        isClosingBrace && !braceInfo?.wasBlockExecuted
+          ? awareFallback.why
+          : (firstStep?.whyAndLogic || firstStep?.why) && matchingSteps.length > 0
+          ? firstStep.whyAndLogic || firstStep.why
+          : isSkippedConditionalOrBlock && !noteMentionsSkipped
+          ? awareFallback.why
+          : note?.why && !isBoilerplateLineNote(note.why)
+          ? note.why
+          : awareFallback.why;
 
       return {
         lineNumber,
         codeText: trimmed,
-        role: (note?.role || firstStep?.actionType || firstStep?.action || 'statement').toUpperCase(),
-        whatText:
-          note?.text ||
-          firstStep?.whatHappened ||
-          firstStep?.explanation ||
-          (explainLanguage === 'bn'
-            ? `লাইন ${lineNumber} (\`${trimmed}\`) এক্সিকিউট হয়েছে।`
-            : `Line ${lineNumber} (\`${trimmed}\`) executed.`),
-        whyText:
-          note?.why ||
-          firstStep?.whyAndLogic ||
-          firstStep?.why ||
-          (explainLanguage === 'bn'
-            ? 'প্রোগ্রামের চূড়ান্ত ফলাফলে পৌঁছানোর জন্য এই লাইনটি স্টেট এগিয়ে নেয়।'
-            : 'Advances program state toward the final output.'),
+        role,
+        whatText: candidateWhat,
+        whyText: candidateWhy,
         executionCount: matchingSteps.length,
         firstStepIdx,
       };
@@ -175,8 +261,8 @@ export const LineByLineWorkspace: React.FC = () => {
             {trace.steps.map((stepItem, idx) => {
               const isSelected = idx === currentStepIndex;
               const stepLineCode =
-                stepItem.codeSnippet ||
                 codeLines[stepItem.activeLine - 1]?.trim() ||
+                stepItem.codeSnippet ||
                 `Line ${stepItem.activeLine}`;
               const badgeAction = (stepItem.actionType || stepItem.action).toUpperCase();
 
@@ -191,20 +277,13 @@ export const LineByLineWorkspace: React.FC = () => {
                   }`}
                   data-testid={`explanation-step-row-${idx + 1}`}
                 >
-                  {/* Top Horizontal Row: Step # + Line # + AST Tag + Code + Sync Button */}
+                  {/* Top Horizontal Row: Line Number + Exact Code Line + Inspect Indicator */}
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="flex flex-wrap items-center gap-2.5 min-w-0">
-                      <span className="font-mono text-xs font-bold text-[var(--text-accent)] shrink-0">
+                      <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-accent)] shrink-0">
                         {explainLanguage === 'bn'
-                          ? `ধাপ ${idx + 1} · লাইন ${stepItem.activeLine}`
-                          : `Step ${idx + 1} · Line ${stepItem.activeLine}`}
-                      </span>
-                      <span
-                        className={`font-mono text-[11px] font-semibold uppercase px-2 py-0.5 rounded shrink-0 ${getActionBadgeClasses(
-                          badgeAction
-                        )}`}
-                      >
-                        {badgeAction}
+                          ? `লাইন ${stepItem.activeLine}`
+                          : `Line ${stepItem.activeLine}`}
                       </span>
                       <code className="font-mono text-xs sm:text-sm font-semibold text-[var(--text-primary)] break-all">
                         {stepLineCode}
@@ -217,86 +296,76 @@ export const LineByLineWorkspace: React.FC = () => {
                     </span>
                   </div>
 
-                  {/* What Happened & Deep Why/Logic */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs sm:text-sm leading-relaxed">
-                    <p className="text-[var(--text-primary)] m-0" lang={explainLanguage}>
-                      <strong className="text-[var(--text-secondary)] mr-1.5">
-                        {explainLanguage === 'bn' ? 'কী ঘটল:' : 'What happened:'}
+                  {/* Vertically Stacked (Top-to-Bottom): "কী ঘটলো" then "লজিক ও কারণ" */}
+                  <div className="flex flex-col gap-2 text-xs sm:text-sm leading-relaxed">
+                    <div className="text-[var(--text-primary)]" lang={explainLanguage}>
+                      <strong className="text-[var(--text-accent)] mr-1.5">
+                        {explainLanguage === 'bn' ? 'কী ঘটলো:' : 'What happened:'}
                       </strong>
                       <FormattedText
                         text={stepItem.whatHappened || stepItem.explanation}
                         lang={explainLanguage}
                         onHoverToken={setHoveredVariable}
                       />
-                    </p>
+                    </div>
 
                     {(stepItem.whyAndLogic || stepItem.why) && (
-                      <p className="text-[var(--text-secondary)] m-0" lang={explainLanguage}>
+                      <div className="text-[var(--text-secondary)]" lang={explainLanguage}>
                         <strong className="text-[var(--text-success)] mr-1.5">
-                          {explainLanguage === 'bn' ? 'লজিক ও কারণ:' : 'Why & Logic:'}
+                          {explainLanguage === 'bn' ? 'লজিক ও কারণ:' : 'Logic & Reason:'}
                         </strong>
                         <FormattedText
                           text={stepItem.whyAndLogic || stepItem.why}
                           lang={explainLanguage}
                           onHoverToken={setHoveredVariable}
                         />
-                      </p>
+                      </div>
                     )}
                   </div>
 
-                  {/* Inline Memory Snapshot / Delta & Stdout */}
-                  {((stepItem.changes && stepItem.changes.length > 0) ||
-                    (stepItem.variableSnapshots && stepItem.variableSnapshots.length > 0) ||
-                    stepItem.consoleOutput) && (
-                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-1 font-mono text-xs text-[var(--text-secondary)]">
-                      {stepItem.changes && stepItem.changes.length > 0 && (
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-[var(--text-muted)]">
-                            {explainLanguage === 'bn' ? 'পরিবর্তন:' : 'Delta:'}
+                  {/* Clean Variable Changes (no raw @ memory addresses) */}
+                  {stepItem.changes && stepItem.changes.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 pt-1 font-mono text-xs">
+                      {stepItem.changes.map((chg, cIdx) => {
+                        const snapType = (
+                          stepItem.variableSnapshots?.find((v) => v.name === chg.name)?.type || ''
+                        ).toLowerCase();
+                        const rawTo =
+                          chg.to === null || chg.to === undefined
+                            ? 'null'
+                            : typeof chg.to === 'object'
+                            ? sanitizeDisplayText(JSON.stringify(chg.to))
+                            : sanitizeDisplayText(String(chg.to));
+                        const resolvedTo =
+                          rawTo || (snapType === 'scanner' ? 'Scanner' : snapType || 'Object');
+                        const isStringVar =
+                          snapType === 'string' ||
+                          snapType === 'str' ||
+                          snapType === 'char*' ||
+                          snapType === 'std::string' ||
+                          (snapType === '' &&
+                            typeof chg.to === 'string' &&
+                            !/^-?\d+(\.\d+)?$/.test(resolvedTo) &&
+                            resolvedTo !== 'true' &&
+                            resolvedTo !== 'false');
+                        const formattedTo =
+                          isStringVar &&
+                          resolvedTo.length > 0 &&
+                          !(resolvedTo.startsWith('"') && resolvedTo.endsWith('"')) &&
+                          !/^Scanner$/i.test(resolvedTo)
+                            ? `"${resolvedTo}"`
+                            : resolvedTo;
+                        return (
+                          <span
+                            key={`${chg.name}-${cIdx}`}
+                            onMouseEnter={() => setHoveredVariable(chg.name)}
+                            onMouseLeave={() => setHoveredVariable(null)}
+                            className="px-2 py-0.5 rounded bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-success)] font-semibold"
+                          >
+                            {chg.name} = {formattedTo}
                           </span>
-                          {stepItem.changes.map((chg, cIdx) => (
-                            <span
-                              key={`${chg.name}-${cIdx}`}
-                              onMouseEnter={() => setHoveredVariable(chg.name)}
-                              onMouseLeave={() => setHoveredVariable(null)}
-                              className="text-[var(--text-success)] font-semibold"
-                            >
-                              {chg.name}:{' '}
-                              {chg.from === null || chg.from === undefined ? '∅' : String(chg.from)} →{' '}
-                              {String(chg.to)}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-
-                      {stepItem.variableSnapshots && stepItem.variableSnapshots.length > 0 && (
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-[var(--text-muted)]">
-                            {explainLanguage === 'bn' ? 'মেমোরি:' : 'Memory:'}
-                          </span>
-                          {stepItem.variableSnapshots.map((vs) => (
-                            <span
-                              key={vs.name}
-                              onMouseEnter={() => setHoveredVariable(vs.name)}
-                              onMouseLeave={() => setHoveredVariable(null)}
-                              className="px-1.5 py-0.5 rounded bg-[var(--bg-gutter)] text-[var(--text-primary)]"
-                            >
-                              {vs.name}
-                              <span className="text-[var(--text-muted)]">:{vs.type}</span>=
-                              {typeof vs.value === 'object' ? JSON.stringify(vs.value) : String(vs.value)}
-                              {vs.referenceId ? (
-                                <span className="text-[var(--text-accent)] ml-1">{vs.referenceId}</span>
-                              ) : null}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-
-                      {stepItem.consoleOutput && (
-                        <span className="text-[var(--text-accent)] font-semibold">
-                          stdout: {JSON.stringify(stepItem.consoleOutput)}
-                        </span>
-                      )}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -350,13 +419,16 @@ export const LineByLineWorkspace: React.FC = () => {
                   )}
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs sm:text-sm leading-relaxed">
+                <div className="flex flex-col gap-2 text-xs sm:text-sm leading-relaxed">
                   <p className="text-[var(--text-primary)] m-0" lang={explainLanguage}>
+                    <strong className="text-[var(--text-accent)] mr-1.5">
+                      {explainLanguage === 'bn' ? 'কী ঘটলো:' : 'What happened:'}
+                    </strong>
                     <FormattedText text={item.whatText} lang={explainLanguage} />
                   </p>
                   <p className="text-[var(--text-secondary)] m-0" lang={explainLanguage}>
                     <strong className="text-[var(--text-success)] mr-1.5">
-                      {explainLanguage === 'bn' ? 'লজিক:' : 'Logic:'}
+                      {explainLanguage === 'bn' ? 'লজিক ও কারণ:' : 'Logic & Reason:'}
                     </strong>
                     <FormattedText text={item.whyText} lang={explainLanguage} />
                   </p>

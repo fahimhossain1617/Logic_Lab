@@ -1,14 +1,18 @@
 import vm from 'node:vm';
 import {
   AnalogyType,
+  ComparisonVisual,
   CompilationErrorType,
+  ConditionEvaluation,
   ExecutionTrace,
   ExplainLanguage,
   ExplanationDepth,
   LineNote,
   LineRole,
+  LoopStepInfo,
   MemoryDelta,
   RuntimeActionType,
+  StdinConsumption,
   StepAction,
   StepStructure,
   SupportedLanguage,
@@ -16,8 +20,15 @@ import {
   TraceSource,
   TraceStep,
   VariableChange,
+  VisualCue,
 } from '../../../shared/types';
 import { SAMPLE_PROGRAMS } from '../../../src/data/sampleTraces';
+import {
+  analyzeBlockExecution,
+  analyzeCodeComplexity,
+  buildExecutionAwareLineNote,
+  generateLanguagePitfalls,
+} from '../../../shared/codeAnalysis';
 import {
   RecordedJsStep,
   matchCuratedLibraryProblemTrace,
@@ -1351,25 +1362,80 @@ function buildStepPedagogy(
       };
     }
 
+    if (meta?.subKind === 'ELSE_BRANCH') {
+      return {
+        whatHappenedBn:
+          'আগের সবগুলো `if` / `else if` শর্ত মিথ্যা (`false`) হওয়ায় প্রোগ্রামটি বিকল্প `else` ব্লকে প্রবেশ করেছে।',
+        logicBuildingBn:
+          'পূর্বের কোনো শর্তই না মিললে নিরাপদ ডিফল্ট সিদ্ধান্ত নেওয়ার জন্য `else` শাখাটি চালানো হয়।',
+        whatHappenedEn:
+          'Entered the `else` branch because all preceding `if` / `else if` conditions evaluated to `false`.',
+        logicBuildingEn:
+          'The `else` block handles all remaining cases when none of the earlier conditions match.',
+        uiAction: 'compare',
+      };
+    }
+
+    if (meta?.subKind === 'SWITCH_ENTER') {
+      const condExpr = meta?.conditionExpr || codeSnippet;
+      const resolved = substituteExpressionValues(condExpr, variables);
+      return {
+        whatHappenedBn: `\`${condExpr}\` (${resolved}) যাচাই করে ম্যাচিং \`case\` শাখা খোঁজা হচ্ছে।`,
+        logicBuildingBn:
+          'একটি মানের উপর ভিত্তি করে একাধিক সম্ভাব্য বিকল্প থেকে দ্রুত সঠিক শাখা বেছে নিতে `switch` ব্যবহৃত হয়।',
+        whatHappenedEn: `Evaluating \`${condExpr}\` (${resolved}) to jump to the matching \`case\` branch.`,
+        logicBuildingEn:
+          '`switch` dispatches directly to the `case` matching the evaluated expression.',
+        uiAction: 'compare',
+      };
+    }
+
+    if (meta?.subKind === 'CASE_MATCH' || meta?.subKind === 'DEFAULT_CASE') {
+      const label = meta?.conditionExpr || codeSnippet;
+      const isDefault = meta?.subKind === 'DEFAULT_CASE';
+      return {
+        whatHappenedBn: isDefault
+          ? 'কোনো `case` মান না মেলায় `default` শাখাটি চালু হয়েছে।'
+          : `\`switch\`-এর মান \`${label}\`-এর সাথে মিলে যাওয়ায় এই শাখার কোড এক্সিকিউট হচ্ছে।`,
+        logicBuildingBn: isDefault
+          ? 'অপ্রত্যাশিত বা বাকি সব ইনপুট নিরাপদভাবে হ্যান্ডেল করতে `default` শাখা কাজ করে।'
+          : `ম্যাচিং \`${label}\` পাওয়ায় সরাসরি এই শাখার স্টেটমেন্টগুলো রান হচ্ছে।`,
+        whatHappenedEn: isDefault
+          ? 'No `case` matched, so execution entered the `default` branch.'
+          : `Matched \`${label}\` and entered this branch.`,
+        logicBuildingEn: isDefault
+          ? '`default` catches any value not handled by explicit `case` labels.'
+          : 'Control jumps directly to the matching `case` block.',
+        uiAction: 'compare',
+      };
+    }
+
     const condExpr = meta?.conditionExpr || codeSnippet;
     const resolved = substituteExpressionValues(condExpr, variables);
     const isTrue = Boolean(meta?.conditionResult);
+    const isElseIf = /^(?:\}?\s*)?(?:else\s+if|elif)\b/.test(codeSnippet);
     const showResolved = resolved !== condExpr ? ` (\`${resolved}\`)` : '';
 
     if (isTrue) {
       return {
-        whatHappenedBn: `শর্ত \`${condExpr}\`${showResolved} যাচাই করা হলো—শর্তটি সত্য (\`true\`), তাই এই \`if\` ব্লকের ভেতরের অংশটি এখন এক্সিকিউট হবে।`,
-        logicBuildingBn: `\`${condExpr}\` সত্য হওয়ায় প্রোগ্রামটি শুধুমাত্র এই শাখাটি (true branch) চালাবে এবং বিকল্প \`else\` শাখা সম্পূর্ণ স্কিপ করবে।`,
-        whatHappenedEn: `Evaluated condition \`${condExpr}\`${showResolved} — result is \`true\`, entering the true branch.`,
-        logicBuildingEn: `Because \`${condExpr}\` is \`true\`, only this branch executes while any \`else\` branch is skipped.`,
+        whatHappenedBn: isElseIf
+          ? `আগের শর্ত মিথ্যা হওয়ায় পরবর্তী \`else if\` শর্ত \`${condExpr}\`${showResolved} যাচাই করা হলো—শর্তটি সত্য (\`TRUE ✅\`), তাই প্রোগ্রামটি এই ব্লকের ভেতরে প্রবেশ করেছে।`
+          : `শর্ত \`${condExpr}\`${showResolved} যাচাই করা হলো—শর্তটি সত্য (\`TRUE ✅\`), তাই এই \`if\` ব্লকের ভেতরের অংশটি এখন এক্সিকিউট হবে।`,
+        logicBuildingBn: isElseIf
+          ? `আগের শর্তগুলো ব্যর্থ হওয়ার পর \`${condExpr}\` সত্য হওয়ায় কম্পাইলার এই নির্দিষ্ট শাখাটি কার্যকর করছে এবং পরের বিকল্পগুলো স্কিপ করবে।`
+          : `\`${condExpr}\` সত্য হওয়ায় প্রোগ্রামটি শুধুমাত্র এই শাখাটি (true branch) চালাবে এবং বিকল্প \`else if / else\` শাখা সম্পূর্ণ স্কিপ করবে।`,
+        whatHappenedEn: `Evaluated \`${isElseIf ? 'else if' : 'if'}\` condition \`${condExpr}\`${showResolved} — result is \`TRUE\`, entering this branch.`,
+        logicBuildingEn: `Because \`${condExpr}\` is \`true\`, this branch executes and remaining \`else if / else\` branches are skipped.`,
         uiAction: 'compare',
       };
     } else {
       return {
-        whatHappenedBn: `শর্ত \`${condExpr}\`${showResolved} যাচাই করা হলো—শর্তটি মিথ্যা (\`false\`), তাই এই \`if\` ব্লকটি স্কিপ করে বিকল্প (\`else\` বা পরবর্তী) অংশে যাচ্ছে।`,
-        logicBuildingBn: `\`${condExpr}\` মিথ্যা হওয়ায় এই ব্লকের কোড কখনোই চলবে না, বরং নিয়ন্ত্রণ সরাসরি পরবর্তী শর্ত বা \`else\` ব্লকে স্থানান্তরিত হবে।`,
-        whatHappenedEn: `Evaluated condition \`${condExpr}\`${showResolved} — result is \`false\`, skipping this branch.`,
-        logicBuildingEn: `When an \`if\` condition evaluates to \`false\`, execution bypasses its body and proceeds to the \`else\` branch.`,
+        whatHappenedBn: isElseIf
+          ? `আগের শর্ত মিথ্যা হওয়ায় পরবর্তী \`else if\` শর্ত \`${condExpr}\`${showResolved} চেক করা হলো—শর্তটি মিথ্যা (\`FALSE ❌\`), তাই এই ব্লকটি বাদ দিয়ে পরের শর্তে যাচ্ছে।`
+          : `শর্ত \`${condExpr}\`${showResolved} চেক করা হলো—শর্তটি মিথ্যা (\`FALSE ❌\`), তাই এই \`if\` ব্লকটি স্কিপ করে পরবর্তী বিকল্প (\`else if\` বা \`else\`) চেক করতে যাচ্ছে।`,
+        logicBuildingBn: `\`${condExpr}\` মিথ্যা হওয়ায় এই ব্লকের ভেতরের কোড চলবে না; সঠিক শাখা খুঁজে পেতে নিয়ন্ত্রণ ধাপে ধাপে পরবর্তী শর্তটি যাচাই করছে।`,
+        whatHappenedEn: `Checked \`${isElseIf ? 'else if' : 'if'}\` condition \`${condExpr}\`${showResolved} — result is \`FALSE\`, moving to the next branch.`,
+        logicBuildingEn: `When a condition evaluates to \`false\`, execution skips its body and tests the next \`else if\` or \`else\` branch.`,
         uiAction: 'compare',
       };
     }
@@ -1401,21 +1467,80 @@ function buildStepPedagogy(
         uiAction: 'return',
       };
     }
+    if (meta?.subKind === 'LOOP_JUMP') {
+      const isBreak = meta?.conditionExpr === 'break';
+      return {
+        whatHappenedBn: isBreak
+          ? '`break` স্টেটমেন্ট চলায় চলমান লুপ বা `switch` ব্লক থেকে তাৎক্ষণিক বের হয়ে যাচ্ছে।'
+          : '`continue` স্টেটমেন্ট চলায় বর্তমান ইটারেশনের বাকি অংশ বাদ দিয়ে লুপের পরবর্তী ধাপে যাচ্ছে।',
+        logicBuildingBn: isBreak
+          ? 'কাজ বা লক্ষ্য অর্জিত হয়ে গেলে অপ্রয়োজনীয় পুনরাবৃত্তি থামাতে `break` ব্যবহার করা হয়।'
+          : 'নির্দিষ্ট কোনো ধাপ এড়িয়ে পরের পুনরাবৃত্তিতে যেতে `continue` ব্যবহার করা হয়।',
+        whatHappenedEn: isBreak
+          ? 'Executed `break`, immediately exiting the enclosing loop or `switch`.'
+          : 'Executed `continue`, skipping to the next iteration of the loop.',
+        logicBuildingEn: isBreak
+          ? '`break` halts unnecessary iterations once the desired branch or target is reached.'
+          : '`continue` bypasses remaining loop statements for the current cycle.',
+        uiAction: 'return',
+      };
+    }
     return {
-      whatHappenedBn: `লাইন ${line} (\`${codeSnippet}\`) সম্পন্ন হয়েছে।`,
-      logicBuildingBn: 'ব্লকের কাজ শেষ করে প্রোগ্রামের নিয়ন্ত্রণ পরবর্তী ধাপে নিয়ে যাওয়া হলো।',
-      whatHappenedEn: `Completed block at line ${line}.`,
-      logicBuildingEn: 'Closes the current execution block.',
+      whatHappenedBn:
+        'এই কোড ব্লকের (`}`) সবগুলো কার্যকর স্টেটমেন্ট সম্পন্ন হওয়ায় নিয়ন্ত্রণ বাইরের স্তরে ফিরে আসছে।',
+      logicBuildingBn:
+        'ক্লোজিং ব্রেস (`}`) ব্লকের স্কোপ ও মেমোরি লাইফটাইম সীমা নির্ধারণ করে নিয়ন্ত্রণ পরবর্তী অংশে পৌঁছে দেয়।',
+      whatHappenedEn: `Reached the closing brace of the current execution block at line ${line}.`,
+      logicBuildingEn: 'Closes the active block scope and returns control flow to the outer scope.',
       uiAction: 'return',
     };
   }
 
-  // 6. Variable Declaration (`DECLARE`) & Assignment (`ASSIGN`)
+  // 6. Resource cleanup (`scanner.close()`)
+  if (meta?.subKind === 'CLOSE_RESOURCE') {
+    const varName = meta.targetVar || 'scanner';
+    return {
+      whatHappenedBn: `ইনপুট রিসোর্স \`${varName}\` বন্ধ (\`close()\`) করা হলো যাতে আর কোনো সিস্টেম মেমোরি বা স্ট্রিম খোলা না থাকে।`,
+      logicBuildingBn:
+        'ইনপুট নেওয়ার কাজ শেষ হলে `close()` কল করে স্ট্রিম মুক্ত করা ভালো প্রোগ্রামিং চর্চা (Resource Cleanup)।',
+      whatHappenedEn: `Closed resource \`${varName}\` to release the underlying input stream.`,
+      logicBuildingEn: 'Explicitly closing I/O streams prevents resource leaks after input is complete.',
+      uiAction: 'call',
+    };
+  }
+
+  // 7. Variable Declaration (`DECLARE`) & Assignment (`ASSIGN`)
   const varName = memoryDelta?.variable || meta?.targetVar || 'variable';
   const oldVal = memoryDelta?.oldValue ?? null;
   const newVal =
     memoryDelta?.newValue !== undefined ? memoryDelta.newValue : variables[varName];
   const rhsExpr = meta?.rhsExpr || '';
+
+  // Uninitialized declaration (`String grade;`, `double gpa;`)
+  if (actionType === 'DECLARE' && (newVal === null || newVal === undefined) && !rhsExpr) {
+    return {
+      whatHappenedBn: `মেমোরিতে নতুন ভ্যারিয়েবল \`${varName}\` ডিক্লেয়ার (তৈরি) করা হলো—এখনও কোনো মান না দেওয়ায় এর প্রাথমিক অবস্থা \`uninitialized / null\`।`,
+      logicBuildingBn: `শর্ত যাচাই বা ইনপুটের পর মান সংরক্ষণের জন্য আগেভাগে \`${varName}\`-এর মেমোরি বক্স প্রস্তুত রাখা হয়েছে।`,
+      whatHappenedEn: `Declared \`${varName}\` in memory without an initial assignment (\`uninitialized / null\`).`,
+      logicBuildingEn: `Reserves memory space for \`${varName}\` before conditional branches or assignments populate it.`,
+      uiAction: 'declare',
+    };
+  }
+
+  // STDIN input read (`scanner.nextDouble()`, `input()`, `cin >>`)
+  if (meta?.stdinRead !== undefined) {
+    return {
+      whatHappenedBn: `ইনপুট স্ট্রিম (STDIN) থেকে \`${meta.stdinRead}\` মানটি পড়ে \`${varName}\` ভ্যারিয়েবলের মেমোরি বক্সে সংরক্ষণ করা হলো (বর্তমান মান: \`${formatVal(
+        newVal
+      )}\`)।`,
+      logicBuildingBn: `প্রোগ্রাম রান করার সময় ব্যবহারকারীর দেওয়া ইনপুট গ্রহণ করে \`${varName}\`-এ রাখা হয়েছে, যার ওপর ভিত্তি করে পরবর্তী শর্ত বা গণনা চলবে।`,
+      whatHappenedEn: `Read \`${meta.stdinRead}\` from standard input (STDIN) and stored \`${formatVal(
+        newVal
+      )}\` in \`${varName}\`.`,
+      logicBuildingEn: `Captures dynamic user input into \`${varName}\` so downstream logic branches and calculations use the live runtime value.`,
+      uiAction: 'declare',
+    };
+  }
   const varsForSubst = { ...prevVars };
   for (const [k, v] of Object.entries(variables)) {
     if (!(k in varsForSubst)) varsForSubst[k] = v;
@@ -1509,6 +1634,43 @@ function buildStepPedagogy(
     )}\` to \`${formatVal(newVal)}\`${mathDetail}.`,
     logicBuildingEn: logicEn,
     uiAction: /^[A-Za-z_]\w*$/.test(rhsExpr) ? 'transfer' : 'assign',
+  };
+}
+
+function parseComparisonVisual(
+  condExpr: string,
+  variables: Record<string, any>,
+  result: boolean
+): ComparisonVisual | null {
+  if (!condExpr || condExpr === 'else' || condExpr === 'default') return null;
+  const firstClause = condExpr.split(/&&|\|\||\band\b|\bor\b/)[0].trim();
+  const cmpMatch = firstClause.match(/^(.+?)\s*(===|!==|==|!=|>=|<=|>|<)\s*(.+)$/);
+  if (!cmpMatch) return null;
+  const leftLabel = cmpMatch[1].trim();
+  const operator = cmpMatch[2].trim();
+  const rightLabel = cmpMatch[3].trim();
+
+  const formatOperandLabel = (expr: string): { varName: string | null; label: string } => {
+    const trimmed = expr.trim();
+    if (/^-?\d+(\.\d+)?$/.test(trimmed)) return { varName: null, label: trimmed };
+    if (trimmed in variables && variables[trimmed] !== undefined && variables[trimmed] !== null) {
+      const v = variables[trimmed];
+      const valStr = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      return { varName: trimmed, label: `${trimmed} (${valStr})` };
+    }
+    return { varName: null, label: substituteExpressionValues(trimmed, variables) };
+  };
+
+  const leftInfo = formatOperandLabel(leftLabel);
+  const rightInfo = formatOperandLabel(rightLabel);
+
+  return {
+    leftVar: leftInfo.varName,
+    rightVar: rightInfo.varName,
+    leftLabel: leftInfo.label,
+    rightLabel: rightInfo.label,
+    operator,
+    result,
   };
 }
 
@@ -1696,15 +1858,26 @@ export function buildFallbackTrace(params: {
     const hasArray = Object.values(lastVars).some((v) => Array.isArray(v));
     const hasLoopInCode = recorded.some((r) => r.actionType === 'LOOP_CHECK');
     const varKeys = Object.keys(lastVars);
+    const hasSwapPattern =
+      /\btemp\b/i.test(code) ||
+      /\bswap\s*\(/i.test(code) ||
+      /^\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*=\s*\2\s*,\s*\1\b/m.test(code) ||
+      /\^\s*=/.test(code);
+    const hasSortPattern =
+      hasArray &&
+      hasLoopInCode &&
+      (/bubble|sort|swap/i.test(code) || /\[j\s*\+\s*1\]|\[j\s*-\s*1\]|minIdx|pivot/i.test(code));
     const isSimpleSwap =
       !hasArray &&
       !hasLoopInCode &&
       varKeys.length >= 2 &&
-      varKeys.length <= 3 &&
-      /\btemp\b/i.test(code);
+      varKeys.length <= 4 &&
+      hasSwapPattern;
 
     const detectedAnalogy: AnalogyType = isSimpleSwap
       ? 'swap_buckets'
+      : hasSortPattern
+      ? 'sort_blocks'
       : hasArray
       ? 'pointer_arrows'
       : hasLoopInCode
@@ -1713,6 +1886,7 @@ export function buildFallbackTrace(params: {
 
     const steps: TraceStep[] = [];
     let prevVars: Record<string, any> = {};
+    let stdinBufferCounter = 0;
 
     recorded.slice(0, 100).forEach((rec, idx) => {
       const snippet = rec.codeSnippet || cleanLines[rec.line - 1] || '';
@@ -1742,18 +1916,110 @@ export function buildFallbackTrace(params: {
       const whyText =
         explainLanguage === 'bn' ? pedagogy.logicBuildingBn : pedagogy.logicBuildingEn;
 
+      const isCond = rec.actionType === 'CONDITION_CHECK' && rec.meta?.conditionExpr;
+      const isLoop = rec.actionType === 'LOOP_CHECK' && rec.meta?.conditionExpr;
+      const condExpr = rec.meta?.conditionExpr || '';
+      const condResult = Boolean(rec.meta?.conditionResult);
+      const comparison =
+        isCond || isLoop
+          ? parseComparisonVisual(condExpr, rec.variables, condResult)
+          : null;
+
+      const condKind: ConditionEvaluation['kind'] =
+        rec.meta?.subKind === 'ELSE_BRANCH'
+          ? 'else'
+          : rec.meta?.subKind === 'SWITCH_ENTER' ||
+            rec.meta?.subKind === 'CASE_MATCH' ||
+            rec.meta?.subKind === 'DEFAULT_CASE'
+          ? 'switch'
+          : isLoop
+          ? 'loop'
+          : /^(?:\}?\s*)?(?:else\s+if|elif)\b/.test(snippet)
+          ? 'else_if'
+          : 'if';
+
+      const conditionEval: ConditionEvaluation | null =
+        isCond || isLoop
+          ? {
+              expression: substituteExpressionValues(condExpr, rec.variables),
+              result: condResult,
+              branchTaken:
+                rec.meta?.subKind === 'ELSE_BRANCH'
+                  ? 'else'
+                  : condResult
+                  ? 'true'
+                  : 'false',
+              kind: condKind,
+            }
+          : null;
+
+      const loopInfo: LoopStepInfo | null = isLoop
+        ? {
+            iteration: rec.meta?.iteration || 1,
+            conditionText: condExpr,
+            continuing: condResult,
+          }
+        : null;
+
+      const stdinConsumed: StdinConsumption | null =
+        rec.meta?.stdinRead !== undefined
+          ? {
+              token: String(rec.meta.stdinRead),
+              targetVar: rec.memoryDelta?.variable || rec.meta?.targetVar || null,
+              bufferIndex: stdinBufferCounter++,
+            }
+          : null;
+
+      const targetVarName = rec.memoryDelta?.variable || rec.meta?.targetVar || null;
+      const rhsExprText = rec.meta?.rhsExpr || '';
+      const rhsVarMatch = rhsExprText.match(/^([A-Za-z_$][\w$]*)$/);
+      const fromTransferVar =
+        rhsVarMatch && rhsVarMatch[1] in rec.variables
+          ? rhsVarMatch[1]
+          : pedagogy.uiAction === 'transfer' && rhsExprText
+          ? rhsExprText
+          : null;
+
+      const visualCue: VisualCue = {
+        mode:
+          isCond || comparison
+            ? 'compare'
+            : isLoop
+            ? 'loop'
+            : rec.actionType === 'OUTPUT'
+            ? 'output'
+            : pedagogy.uiAction === 'return'
+            ? 'return'
+            : pedagogy.uiAction === 'call'
+            ? 'call'
+            : rec.memoryDelta?.variable
+            ? 'mutate'
+            : 'memory',
+        highlightVars: targetVarName
+          ? [targetVarName]
+          : comparison && comparison.leftLabel in rec.variables
+          ? [comparison.leftLabel]
+          : [],
+        compareVars:
+          comparison &&
+          comparison.leftLabel in rec.variables &&
+          comparison.rightLabel in rec.variables
+            ? [comparison.leftLabel, comparison.rightLabel]
+            : null,
+        comparison,
+      };
+
       steps.push({
         stepIndex: idx + 1,
         activeLine: rec.line,
         analogyType: detectedAnalogy,
         action: pedagogy.uiAction,
-        from:
-          pedagogy.uiAction === 'transfer' && rec.meta?.rhsExpr
-            ? rec.meta.rhsExpr
-            : null,
-        to: rec.memoryDelta?.variable || null,
+        from: fromTransferVar,
+        to: targetVarName,
         explanation: explanationText,
         why: whyText,
+        whatHappened: explanationText,
+        whyAndLogic: whyText,
         stdout: rec.consoleOutput ?? (rec.stdoutSoFar || null),
         changes,
         variables: { ...rec.variables },
@@ -1783,12 +2049,20 @@ export function buildFallbackTrace(params: {
           newValue: null,
         },
         consoleOutput: rec.consoleOutput,
+        cumulativeOutput: rec.stdoutSoFar || null,
         whatHappenedBn: pedagogy.whatHappenedBn,
         logicBuildingBn: pedagogy.logicBuildingBn,
+        visualCue,
+        conditionEval,
+        loopInfo,
+        stdinConsumed,
       });
 
       prevVars = { ...rec.variables };
     });
+
+    const executedLines = new Set<number>(steps.map((s) => s.activeLine));
+    const blockExec = analyzeBlockExecution(code, language, executedLines);
 
     const lineNotes: LineNote[] = [];
     cleanLines.forEach((trimmed, idx) => {
@@ -1798,41 +2072,48 @@ export function buildFallbackTrace(params: {
       const matchingSteps = steps.filter((s) => s.activeLine === lineNum);
       const firstMatch = matchingSteps[0];
       const lastMatch = matchingSteps[matchingSteps.length - 1];
+      const braceInfo = blockExec.braceByCloseLine.get(lineNum);
+      const pythonEndInfo = blockExec.pythonEndsByLine.get(lineNum);
+      const isClosingBrace = trimmed === '}' || trimmed === '};';
 
-      let noteText = firstMatch?.explanation || '';
-      if (matchingSteps.length > 1 && lastMatch) {
+      const awareFallback =
+        !firstMatch || isClosingBrace
+          ? buildExecutionAwareLineNote({
+              lineNumber: lineNum,
+              trimmed,
+              language,
+              explainLanguage,
+              executedLines,
+              braceInfo,
+              pythonEndInfo,
+            })
+          : null;
+
+      let noteText = awareFallback?.text || firstMatch?.explanation || '';
+      if (!isClosingBrace && matchingSteps.length > 1 && lastMatch) {
         noteText =
           explainLanguage === 'bn'
             ? `${firstMatch.explanation} (এই লাইনটি মোট ${matchingSteps.length} বার এক্সিকিউট হয়েছে; সর্বশেষ ধাপে: ${lastMatch.explanation})`
             : `${firstMatch.explanation} (Executed ${matchingSteps.length} times; final pass: ${lastMatch.explanation})`;
-      } else if (!noteText) {
-        if (role === 'block_end') {
-          noteText =
-            explainLanguage === 'bn'
-              ? `লাইন ${lineNum} (\`${trimmed}\`): বর্তমান কোড ব্লকের সমাপ্তি নির্দেশ করে।`
-              : `Line ${lineNum} (\`${trimmed}\`): Marks the end of the current code block.`;
-        } else if (/^(?:\}?\s*)?else\b/.test(trimmed)) {
-          noteText =
-            explainLanguage === 'bn'
-              ? `লাইন ${lineNum} (\`${trimmed}\`): \`if\` শর্তটি মিথ্যা (\`false\`) হলে এই \`else\` শাখাটি কাজ করে।`
-              : `Line ${lineNum} (\`${trimmed}\`): Fallback \`else\` branch executed only when the \`if\` condition is \`false\`.`;
-        } else {
-          noteText =
-            explainLanguage === 'bn'
-              ? `লাইন ${lineNum} (\`${trimmed}\`): এই অংশটি বর্তমান রানটাইম প্রবাহে স্কিপ হয়েছে (শর্ত মিথ্যা হওয়ায় বা এক্সেপশন জাম্পের কারণে)।`
-              : `Line ${lineNum} (\`${trimmed}\`): Skipped during this runtime execution path.`;
-        }
+      }
+
+      if (
+        language === 'python' &&
+        firstMatch &&
+        pythonEndInfo &&
+        pythonEndInfo.wasBlockExecuted
+      ) {
+        noteText =
+          explainLanguage === 'bn'
+            ? `${noteText} (এই লাইনের পর \`${pythonEndInfo.kind}\` ব্লকের ইন্ডেন্টেশন শেষ হয়ে নিয়ন্ত্রণ বাইরের স্তরে ফিরে আসে)`
+            : `${noteText} (Ends the Python \`${pythonEndInfo.kind}\` block afterward, returning control outward)`;
       }
 
       lineNotes.push({
         line: lineNum,
         role,
         text: noteText,
-        why:
-          firstMatch?.why ||
-          (explainLanguage === 'bn'
-            ? 'প্রোগ্রামের শর্ত ও ব্লক কাঠামো সঠিকভাবে বজায় রাখার জন্য এই লাইনটি ব্যবহৃত হয়েছে।'
-            : 'Maintains the structural control flow of the program.'),
+        why: awareFallback?.why || firstMatch?.why,
       });
     });
 
@@ -1842,8 +2123,10 @@ export function buildFallbackTrace(params: {
         .map(([k, v]) => `${k} = ${typeof v === 'object' ? JSON.stringify(v) : v}`)
         .join(', ');
 
-    const timeComp = hasLoopInCode ? 'O(n)' : 'O(1)';
-    const spaceComp = hasArray ? 'O(n)' : 'O(1)';
+    const complexityResult = analyzeCodeComplexity(code, language, steps);
+    const timeComp = complexityResult.time;
+    const spaceComp = complexityResult.space;
+    const dynamicPitfalls = generateLanguagePitfalls(code, language, explainLanguage);
 
     return {
       hasError: false,
@@ -1889,16 +2172,10 @@ export function buildFallbackTrace(params: {
           space: spaceComp,
           note:
             explainLanguage === 'bn'
-              ? hasLoopInCode
-                ? `লুপের প্রতিটি আবর্তন ধাপে ধাপে সম্পন্ন হওয়ায় সময় জটিলতা ${timeComp} এবং অতিরিক্ত মেমোরি ${spaceComp}।`
-                : `নির্দিষ্ট সংখ্যক ধাপে কাজ সম্পন্ন হওয়ায় সময় ও মেমোরি জটিলতা ${timeComp}।`
-              : `Time complexity is ${timeComp} and auxiliary space complexity is ${spaceComp}.`,
+              ? complexityResult.noteBn
+              : complexityResult.noteEn,
         },
-        commonMistakes: [
-          explainLanguage === 'bn'
-            ? 'পূর্ণসংখ্যার ভাগে (Integer Division) দশমিক অংশ স্বয়ংক্রিয়ভাবে বাদ পড়ে যায়—এটি খেয়াল রাখা জরুরি।'
-            : 'Remember that integer division truncates any fractional remainder.',
-        ],
+        commonMistakes: dynamicPitfalls,
       },
       lineNotes,
       steps,
@@ -1927,6 +2204,8 @@ export function buildFallbackTrace(params: {
   }
 
   // Fallback if no steps were recorded
+  const emptyComplexity = analyzeCodeComplexity(code, language, []);
+  const emptyPitfalls = generateLanguagePitfalls(code, language, explainLanguage);
   return {
     hasError: false,
     isValidLogic: true,
@@ -1940,8 +2219,12 @@ export function buildFallbackTrace(params: {
       idea: '',
       keyPoints: [],
       analogyStory: '',
-      complexity: { time: 'O(1)', space: 'O(1)', note: '' },
-      commonMistakes: [],
+      complexity: {
+        time: emptyComplexity.time,
+        space: emptyComplexity.space,
+        note: explainLanguage === 'bn' ? emptyComplexity.noteBn : emptyComplexity.noteEn,
+      },
+      commonMistakes: emptyPitfalls,
     },
     lineNotes: [],
     steps: [],
@@ -1953,8 +2236,8 @@ export function buildFallbackTrace(params: {
     },
     programSummary: {
       totalExecutionSteps: 0,
-      timeComplexity: 'O(1)',
-      spaceComplexity: 'O(1)',
+      timeComplexity: emptyComplexity.time,
+      spaceComplexity: emptyComplexity.space,
       finalOutput: sandboxRun.stdout.trim(),
     },
   };

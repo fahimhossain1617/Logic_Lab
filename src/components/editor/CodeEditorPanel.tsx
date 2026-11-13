@@ -4,10 +4,6 @@ import { useLabStore } from '../../store/useLabStore';
 import { SupportedLanguage, ExecutionDiagnostic } from '../../../shared/types';
 import {
   Play,
-  Pause,
-  SkipBack,
-  SkipForward,
-  RotateCcw,
   Plus,
   Minus,
   Trash2,
@@ -15,13 +11,15 @@ import {
   AlignLeft,
   Clock,
   Cpu,
+  Keyboard,
+  Sparkles,
 } from 'lucide-react';
 import { registerMonacoLanguageProviders } from './monacoProviders';
 import { registerIntelliSense } from '../../lib/monaco/intellisense/registerIntelliSense';
 import { DisposableHandle } from '../../lib/monaco/intellisense/types';
 import { StageCanvas } from '../stage/StageCanvas';
 import { OutputConsole } from './OutputConsole';
-import { getStepDurationMs } from '../../utils/playerLogic';
+import { detectInputCalls } from '../../../shared/stdinHelper';
 
 export const CodeEditorPanel: React.FC = () => {
   const {
@@ -35,8 +33,6 @@ export const CodeEditorPanel: React.FC = () => {
     hasExecuted,
     isTracing,
     isFastRunning,
-    isPlaying,
-    speed,
     trace,
     apiError,
     diagnostics,
@@ -44,7 +40,6 @@ export const CodeEditorPanel: React.FC = () => {
     activeBreakpoints,
     currentStepIndex,
     editorFontSize,
-    cursorPosition,
     setCode,
     setLanguage,
     setFileName,
@@ -55,10 +50,14 @@ export const CodeEditorPanel: React.FC = () => {
     resetSnippetToNew,
     runFast,
     runVisualize,
-    togglePlay,
-    nextStep,
-    prevStep,
-    resetPlayback,
+    requestVisualize,
+    stdinPromptOpen,
+    stdinDraft,
+    pendingVisualizeCode,
+    setStdinDraft,
+    confirmStdinPromptAndVisualize,
+    autoFillSampleAndVisualize,
+    cancelStdinPrompt,
     toggleBreakpoint,
     jumpToLine,
     setHoveredLine,
@@ -91,9 +90,8 @@ export const CodeEditorPanel: React.FC = () => {
   const hasFaultOnLine = Boolean(currentStep?.fault);
   const isCompileError =
     hasExecuted &&
-    (executionStatus === 'error' ||
-      Boolean(apiError) ||
-      trace.verdict.status === 'compile_error');
+    (trace.verdict.status === 'compile_error' ||
+      ((executionStatus === 'error' || Boolean(apiError)) && trace.steps.length === 0));
 
   const handleBeforeMount: BeforeMount = (monaco) => {
     // Register custom dark & light themes
@@ -319,6 +317,9 @@ export const CodeEditorPanel: React.FC = () => {
           glyphMarginClassName: showFaultStyle ? 'monaco-fault-glyph' : 'monaco-active-glyph',
         },
       });
+      if (typeof editor.revealLineInCenterIfOutsideViewport === 'function') {
+        editor.revealLineInCenterIfOutsideViewport(targetLine);
+      }
     }
 
     // 3. Minor warning line highlights
@@ -451,15 +452,7 @@ export const CodeEditorPanel: React.FC = () => {
     }
   };
 
-  // Auto-play timer synced with playback speed
-  useEffect(() => {
-    if (!isPlaying || trace.steps.length === 0) return;
-    const intervalMs = getStepDurationMs(speed);
-    const timer = setInterval(() => {
-      nextStep();
-    }, intervalMs);
-    return () => clearInterval(timer);
-  }, [isPlaying, speed, nextStep, trace.steps.length]);
+  // Keyboard shortcuts handled in App.tsx
 
   const codeLines = code.split('\n');
 
@@ -552,60 +545,6 @@ export const CodeEditorPanel: React.FC = () => {
             </div>
           )}
 
-          {/* Playback Quick Controls */}
-          {hasExecuted && !isCompileError && trace.steps.length > 0 && (
-            <div
-              className="flex items-center gap-1 pr-2 border-r border-[var(--border-subtle)]"
-              data-testid="player-controls"
-            >
-              <button
-                type="button"
-                onClick={prevStep}
-                disabled={currentStepIndex <= 0}
-                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-40 cursor-pointer transition-colors"
-                aria-label="Previous step"
-                title={explainLanguage === 'bn' ? 'পূর্ববর্তী ধাপ' : 'Previous step'}
-              >
-                <SkipBack className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={togglePlay}
-                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-accent)] hover:border-[var(--border-active)] cursor-pointer transition-colors"
-                aria-label={isPlaying ? 'Pause' : 'Play'}
-                title={isPlaying ? 'Pause' : 'Play'}
-              >
-                {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 fill-current" />}
-              </button>
-              <button
-                type="button"
-                onClick={nextStep}
-                disabled={currentStepIndex >= trace.steps.length - 1}
-                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-40 cursor-pointer transition-colors"
-                aria-label="Next step"
-                title={explainLanguage === 'bn' ? 'পরবর্তী ধাপ' : 'Next step'}
-              >
-                <SkipForward className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={resetPlayback}
-                className="p-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer transition-colors"
-                aria-label="Reset playback"
-                title={explainLanguage === 'bn' ? 'প্রথম থেকে' : 'Reset'}
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-              </button>
-
-              {/* Step Counter */}
-              <span className="text-[11px] font-mono text-[var(--text-secondary)] px-1 select-none whitespace-nowrap">
-                {explainLanguage === 'bn'
-                  ? `ধাপ ${currentStepIndex + 1}/${trace.steps.length}`
-                  : `Step ${currentStepIndex + 1}/${trace.steps.length}`}
-              </span>
-            </div>
-          )}
-
           {/* Language Select */}
           <div className="relative">
             <label className="sr-only" htmlFor="editor-language-select">
@@ -692,7 +631,7 @@ export const CodeEditorPanel: React.FC = () => {
             type="button"
             onClick={() => {
               const bufferCode = editorRef.current ? editorRef.current.getValue() : code;
-              void runVisualize(bufferCode);
+              void requestVisualize(bufferCode);
             }}
             className="px-3.5 sm:px-4 py-1.5 rounded-lg font-semibold text-xs inline-flex items-center justify-center cursor-pointer whitespace-nowrap border border-[#60A5FA]/35 bg-[#2563EB] hover:bg-[#3B82F6] text-white shadow-sm transition-colors"
             data-testid="visualize-primary-btn"
@@ -843,14 +782,11 @@ export const CodeEditorPanel: React.FC = () => {
             <div className="w-10 h-1 bg-slate-600 group-hover:bg-[var(--text-accent)] rounded-full transition-colors" />
           </div>
 
-          {/* Editor Status Bar */}
-          <div className="flex items-center justify-between px-4 py-1.5 bg-[var(--bg-gutter)] text-xs font-mono text-[var(--text-secondary)] select-none">
-            <div className="flex items-center gap-4">
-              <span className="font-semibold text-[var(--text-primary)]">{fileName}</span>
-              <span>
-                Ln {cursorPosition.lineNumber}, Col {cursorPosition.column}
-              </span>
-            </div>
+          {/* Editor Status Bar (static bottom-right line count & language) */}
+          <div
+            className="h-8 shrink-0 flex items-center justify-end px-4 bg-[var(--bg-gutter)] border-t border-[var(--border-subtle)] text-xs font-mono text-[var(--text-secondary)] select-none tabular-nums whitespace-nowrap"
+            data-testid="editor-status-bar"
+          >
             <div className="flex items-center gap-4">
               <span>{code ? `${codeLines.length} lines` : '0 lines'}</span>
               <span className="uppercase text-[var(--text-accent)] font-semibold">{language}</span>
@@ -895,12 +831,12 @@ export const CodeEditorPanel: React.FC = () => {
         </div>
 
         {/* RIGHT PANE: Live Logic & Memory Visualizer */}
-        <div className="w-full lg:flex-1 lg:min-w-[280px] flex flex-col justify-center min-w-0 bg-[var(--bg-panel)]">
-          <div className="flex-1 p-4 sm:p-5 flex flex-col justify-center min-h-[260px]">
+        <div className="w-full lg:flex-1 lg:min-w-[280px] flex flex-col justify-start min-w-0 bg-[var(--bg-panel)]">
+          <div className="flex-1 p-4 sm:p-5 flex flex-col justify-start min-h-[260px]">
             {hasExecuted || isTracing ? (
               <StageCanvas />
             ) : (
-              <div className="flex flex-col items-center justify-center text-center py-10 px-4 space-y-1.5 select-none">
+              <div className="my-auto flex flex-col items-center justify-center text-center py-10 px-4 space-y-1.5 select-none">
                 <p className="text-sm font-semibold text-[var(--text-primary)] m-0" lang={explainLanguage}>
                   {explainLanguage === 'bn'
                     ? 'লাইভ লজিক ভিজ্যুয়ালাইজার'
@@ -923,6 +859,108 @@ export const CodeEditorPanel: React.FC = () => {
         liveDiagnostics={liveDiagnostics}
         onJumpToDiagnostic={handleJumpToDiagnostic}
       />
+
+      {/* 4. Interactive STDIN Prompt Modal when input statements exist & STDIN tab is empty */}
+      {stdinPromptOpen && (() => {
+        const detectedCalls = detectInputCalls(pendingVisualizeCode || code, language);
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4"
+            role="dialog"
+            aria-modal="true"
+            data-testid="stdin-prompt-modal"
+          >
+            <div className="ll-panel w-full max-w-lg rounded-2xl border border-[#60A5FA]/40 bg-[var(--bg-panel)] p-5 shadow-2xl space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-9 h-9 rounded-xl bg-[#2563EB]/20 border border-[#60A5FA]/40 flex items-center justify-center text-[#60A5FA]">
+                    <Keyboard className="w-5 h-5" />
+                  </span>
+                  <div>
+                    <h3 className="text-sm font-bold text-[var(--text-primary)] m-0" lang={explainLanguage}>
+                      {explainLanguage === 'bn'
+                        ? 'প্রোগ্রামের জন্য ইনপুট (STDIN) প্রয়োজন'
+                        : 'Program Requires STDIN Input'}
+                    </h3>
+                    <p className="text-xs text-[var(--text-secondary)] m-0 mt-0.5" lang={explainLanguage}>
+                      {explainLanguage === 'bn'
+                        ? 'আপনার কোডে ইউজার ইনপুট (`Scanner` / `input()` / `cin`) আছে। স্যাম্পল মান দিন অথবা অটো-স্যাম্পল দিয়ে অ্যানিমেট করুন।'
+                        : 'Your code reads user input. Enter values line by line or use auto-generated sample values.'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {detectedCalls.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 text-[11px] font-mono">
+                  {detectedCalls.map((c, idx) => (
+                    <span
+                      key={`${c.line}-${idx}`}
+                      className="px-2 py-0.5 rounded-md bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-accent)]"
+                    >
+                      Ln {c.line}: {c.targetVar || `input #${idx + 1}`} ({c.hintType})
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="stdin-prompt-textarea"
+                  className="block text-xs font-semibold text-[var(--text-secondary)]"
+                >
+                  {explainLanguage === 'bn'
+                    ? 'ইনপুট (প্রতি লাইনে একটি মান লিখুন):'
+                    : 'Input values (one per line):'}
+                </label>
+                <textarea
+                  id="stdin-prompt-textarea"
+                  rows={4}
+                  value={stdinDraft}
+                  onChange={(e) => setStdinDraft(e.target.value)}
+                  data-testid="stdin-prompt-textarea"
+                  className="w-full rounded-xl bg-[#070C1D] border border-slate-700 focus:border-[#60A5FA] focus:outline-none p-3 font-mono text-xs sm:text-sm text-slate-100"
+                  placeholder={'25\n*\n5'}
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={cancelStdinPrompt}
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+                  data-testid="stdin-prompt-cancel"
+                >
+                  {explainLanguage === 'bn' ? 'বাতিল' : 'Cancel'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void autoFillSampleAndVisualize()}
+                  className="px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 border border-[#10B981]/40 bg-[#10B981]/15 text-[#34D399] hover:bg-[#10B981]/25 cursor-pointer"
+                  data-testid="stdin-prompt-auto-btn"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>
+                    {explainLanguage === 'bn'
+                      ? 'অটো স্যাম্পল দিয়ে অ্যানিমেট করুন'
+                      : 'Auto-Sample & Animate'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void confirmStdinPromptAndVisualize()}
+                  className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-[#2563EB] hover:bg-[#3B82F6] text-white cursor-pointer"
+                  data-testid="stdin-prompt-confirm-btn"
+                >
+                  {explainLanguage === 'bn'
+                    ? 'এই ইনপুট দিয়ে অ্যানিমেট করুন'
+                    : 'Run & Animate'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </section>
   );
 };

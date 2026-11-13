@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { useLabStore } from '../../store/useLabStore';
 import { SAMPLE_PROGRAMS } from '../../data/sampleTraces';
 import { StageCanvas } from '../stage/StageCanvas';
-import { PlayerBar } from '../player/PlayerBar';
 import { FormattedText } from '../common/FormattedText';
 import { X, Command, Keyboard, Sparkles, Minimize2, RotateCcw, Share2, ExternalLink } from 'lucide-react';
 
@@ -357,7 +356,6 @@ export const Overlays: React.FC = () => {
                 <FormattedText text={step.why} lang={explainLanguage} />
               </div>
             </div>
-            <PlayerBar />
           </div>
         </div>
       )}

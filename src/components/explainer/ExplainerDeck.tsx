@@ -162,7 +162,11 @@ export const ExplainerDeck: React.FC = () => {
                   </span>
                   <p className="text-[var(--text-primary)] m-0">
                     <FormattedText
-                      text={step.explanation}
+                      text={
+                        explainLanguage === 'bn'
+                          ? step.banglaExplanation || step.explanation
+                          : step.explanation
+                      }
                       lang={explainLanguage}
                       onHoverToken={setHoveredVariable}
                     />

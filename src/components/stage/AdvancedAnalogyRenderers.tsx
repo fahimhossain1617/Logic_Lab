@@ -60,9 +60,6 @@ export const PointerArrowsRenderer: React.FC<RendererProps> = ({
             ? 'বাস্তব উদাহরণ: অ্যারে বক্স ও চলমান পয়েন্টার (Array & Pointers)'
             : 'Real-World Analogy: Array Boxes & Sliding Pointers'}
         </span>
-        <span className="font-mono text-xs px-2.5 py-0.5 rounded-md bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-accent)] font-semibold uppercase">
-          {step.action} · Ln {step.activeLine}
-        </span>
       </div>
 
       {/* Array Cells + Pointer Badges */}
@@ -419,9 +416,6 @@ export const LinkedListTrainRenderer: React.FC<RendererProps> = ({
           {explainLanguage === 'bn'
             ? 'বাস্তব উদাহরণ: ট্রেনের বগি ও কাপলার (Linked List)'
             : 'Real-World Analogy: Train Coaches & Next Couplers'}
-        </span>
-        <span className="font-mono text-[var(--text-accent)] uppercase">
-          {step.action} · Ln {step.activeLine}
         </span>
       </div>
 

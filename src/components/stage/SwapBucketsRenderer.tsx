@@ -73,16 +73,18 @@ export const SwapBucketsRenderer: React.FC<SwapBucketsRendererProps> = ({
       className="relative flex flex-col items-center justify-center w-full h-full min-h-[290px] px-3 sm:px-5 py-3 select-none overflow-hidden"
       data-testid="renderer-swap-buckets"
     >
-      {/* Top Action Tag */}
+      {/* Top Analogy Label */}
       <div className="flex items-center justify-between w-full max-w-[580px] mb-3 text-xs gap-3">
         <span className="text-[var(--text-muted)] font-medium truncate">
           {explainLanguage === 'bn'
             ? 'বাস্তব উদাহরণ: তরলের কাপ (Liquid Cups)'
             : 'Real-World Analogy: Liquid Cups'}
         </span>
-        <span className="font-mono text-xs px-2.5 py-1 rounded-md bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-secondary)] font-semibold shrink-0">
-          {step.action.toUpperCase()} · Ln {step.activeLine}
-        </span>
+        {activeFrom && activeTo && activeFrom !== activeTo && (
+          <span className="px-2.5 py-0.5 rounded-md bg-[#8B5CF6]/15 border border-[#8B5CF6]/40 text-[#C4B5FD] font-mono text-[11px] font-semibold shrink-0">
+            {activeFrom} ➔ {activeTo}
+          </span>
+        )}
       </div>
 
       {/* Main SVG Stage */}

@@ -9,6 +9,7 @@ export const FaultInfoSchema = z.object({
     'stack_overflow',
     'off_by_one',
     'type_error',
+    'runtime_exception',
   ]),
   message: z.string(),
   fixHint: z.string(),
@@ -76,6 +77,36 @@ export const VisualCueSchema = z.object({
   compareVars: z.tuple([z.string(), z.string()]).nullable().optional(),
   linkVars: z.array(z.string()).nullable().optional(),
   comparison: ComparisonVisualSchema.nullable().optional(),
+});
+
+export const StdinConsumptionSchema = z.object({
+  token: z.string(),
+  targetVar: z.string().nullable().optional(),
+  targetType: z.string().nullable().optional(),
+  bufferIndex: z.number().nullable().optional(),
+  remainingTokens: z.array(z.string()).nullable().optional(),
+});
+
+export const ConditionEvaluationSchema = z.object({
+  expression: z.string(),
+  result: z.union([z.boolean(), z.string()]),
+  branchTaken: z.string().nullable().optional(),
+  kind: z.enum(['if', 'else_if', 'else', 'switch', 'loop', 'ternary']).nullable().optional(),
+  casesChecked: z
+    .array(
+      z.object({
+        label: z.string(),
+        matched: z.boolean(),
+      })
+    )
+    .nullable()
+    .optional(),
+});
+
+export const LoopStepInfoSchema = z.object({
+  iteration: z.number(),
+  conditionText: z.string().nullable().optional(),
+  continuing: z.boolean(),
 });
 
 export const TraceStepSchema = z.object({
@@ -153,6 +184,13 @@ export const TraceStepSchema = z.object({
   whyAndLogic: z.string().optional(),
   variableSnapshots: z.array(VariableSnapshotSchema).nullable().optional(),
   visualCue: VisualCueSchema.nullable().optional(),
+  stdinConsumed: StdinConsumptionSchema.nullable().optional(),
+  conditionEval: ConditionEvaluationSchema.nullable().optional(),
+  loopInfo: LoopStepInfoSchema.nullable().optional(),
+  animationAction: z.string().nullable().optional(),
+  banglaExplanation: z.string().nullable().optional(),
+  cumulativeOutput: z.string().nullable().optional(),
+  variablesState: z.record(z.string(), z.any()).nullable().optional(),
 });
 
 export const LineNoteSchema = z.object({
@@ -192,7 +230,7 @@ export const LogicSummarySchema = z.object({
 
 export const TraceErrorDetailsSchema = z.object({
   errorType: z
-    .enum(['COMPILATION_ERROR', 'SYNTAX_ERROR', 'FILE_NAME_MISMATCH'])
+    .enum(['COMPILATION_ERROR', 'SYNTAX_ERROR', 'FILE_NAME_MISMATCH', 'RUNTIME_ERROR', 'INPUT_ERROR'])
     .optional()
     .default('SYNTAX_ERROR'),
   lineNumber: z.number().optional().default(1),
@@ -205,6 +243,9 @@ export const TraceErrorDetailsSchema = z.object({
 
 export const ExecutionTraceSchema = z.object({
   hasError: z.boolean().optional(),
+  errorCategory: z.enum(['compile_error', 'runtime_error', 'input_error']).nullable().optional(),
+  stdinUsed: z.string().nullable().optional(),
+  stdinTokens: z.array(z.string()).nullable().optional(),
   isValidLogic: z.boolean(),
   errorDetails: TraceErrorDetailsSchema.nullable(),
   language: z.enum(['javascript', 'python', 'cpp', 'java']),

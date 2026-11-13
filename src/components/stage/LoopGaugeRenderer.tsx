@@ -37,9 +37,29 @@ export const LoopGaugeRenderer: React.FC<LoopGaugeRendererProps> = ({
             ? 'বাস্তব উদাহরণ: লুপ ল্যাপ কাউন্টার (Loop Lap Gauge)'
             : 'Real-World Analogy: Loop Lap Gauge'}
         </span>
-        <span className="font-mono text-xs px-2.5 py-0.5 rounded-md bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-secondary)] font-semibold">
-          Step {step.stepIndex} · Ln {step.activeLine}
-        </span>
+        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
+          <span className="px-2 py-0.5 rounded bg-[#8B5CF6]/15 border border-[#8B5CF6]/40 text-[#C4B5FD] font-semibold">
+            {explainLanguage === 'bn'
+              ? `ইটারেশন #${step.loopInfo?.iteration ?? inferredLap}`
+              : `Iteration #${step.loopInfo?.iteration ?? inferredLap}`}
+          </span>
+          {(step.conditionEval || step.structure?.conditionText) && (
+            <span
+              className={`px-2 py-0.5 rounded border font-bold ${
+                step.conditionEval?.result === false || step.conditionEval?.result === 'false'
+                  ? 'bg-[#EF4444]/15 border-[#EF4444]/40 text-[#F87171]'
+                  : 'bg-[#10B981]/15 border-[#10B981]/40 text-[#34D399]'
+              }`}
+            >
+              {step.conditionEval?.expression || step.structure?.conditionText}{' '}
+              {step.conditionEval
+                ? step.conditionEval.result === false || step.conditionEval.result === 'false'
+                  ? '→ FALSE'
+                  : '→ TRUE'
+                : ''}
+            </span>
+          )}
+        </div>
       </div>
 
       <div className="flex flex-col sm:flex-row items-center justify-center gap-6 sm:gap-8 my-5 w-full max-w-[600px]">

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, ChildProcess } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import { ExecutionDiagnostic, SupportedLanguage } from '../../../shared/types';
 import { preprocessCode } from './codePreprocessor';
 import {
@@ -94,6 +95,7 @@ public class _LogicLabRunner {
             }
         };
         System.setOut(unbufOut);
+        System.setErr(new PrintStream(new FileOutputStream(FileDescriptor.err), true, "UTF-8"));
         if (args.length == 0) return;
         String targetClass = args[0];
         Class<?> cls = Class.forName(targetClass);
@@ -452,11 +454,19 @@ export async function startInteractiveSession(
         timeoutMs: 8000,
       });
 
+      const javaUtf8Flags = [
+        '-Dfile.encoding=UTF-8',
+        '-Dstdout.encoding=UTF-8',
+        '-Dstderr.encoding=UTF-8',
+        '-Dstdin.encoding=UTF-8',
+        '-Dsun.stdout.encoding=UTF-8',
+        '-Dsun.stderr.encoding=UTF-8',
+      ];
       cmd = 'java';
       args =
         runnerCompile.exitCode === 0
-          ? ['-Dfile.encoding=UTF-8', '-cp', workspaceDir, '_LogicLabRunner', className]
-          : ['-Dfile.encoding=UTF-8', '-cp', workspaceDir, className];
+          ? [...javaUtf8Flags, '-cp', workspaceDir, '_LogicLabRunner', className]
+          : [...javaUtf8Flags, '-cp', workspaceDir, className];
     } else if (language === 'python') {
       const syntaxRes = await checkPythonSyntax(code, fileName || 'script.py');
       workspaceDir = syntaxRes.workspaceDir;
@@ -478,7 +488,7 @@ export async function startInteractiveSession(
         fileName && fileName.endsWith('.py') ? path.basename(fileName) : 'script.py';
       cmd = 'python';
       args = ['-u', sourceFileName];
-      extraEnv = { PYTHONIOENCODING: 'utf-8' };
+      extraEnv = { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
     } else {
       const syntaxRes = await checkJsSyntax(code, fileName || 'script.js');
       workspaceDir = syntaxRes.workspaceDir;
@@ -539,11 +549,14 @@ export async function startInteractiveSession(
     if (initialStdin && child.stdin) {
       const normalized = initialStdin.replace(/\r\n/g, '\n');
       try {
-        child.stdin.write(normalized.endsWith('\n') ? normalized : `${normalized}\n`);
+        child.stdin.write(normalized.endsWith('\n') ? normalized : `${normalized}\n`, 'utf8');
       } catch {
         // Ignore write error on dead child
       }
     }
+
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
 
     sessions.set(sessionId, session);
     startStepTimer(session);
@@ -552,7 +565,8 @@ export async function startInteractiveSession(
     }
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
+      const text = stdoutDecoder.write(chunk);
+      if (!text) return;
       if (session.stdoutAll.length < MAX_OUTPUT_BYTES) {
         session.stdoutAll += text;
       }
@@ -564,7 +578,8 @@ export async function startInteractiveSession(
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
+      const text = stderrDecoder.write(chunk);
+      if (!text) return;
       if (session.stderrAll.length < MAX_OUTPUT_BYTES) {
         session.stderrAll += text;
       }
@@ -579,6 +594,16 @@ export async function startInteractiveSession(
 
     child.on('close', (exitCode: number | null) => {
       if (session.exited) return;
+      const tailOut = stdoutDecoder.end();
+      if (tailOut) {
+        if (session.stdoutAll.length < MAX_OUTPUT_BYTES) session.stdoutAll += tailOut;
+        emitSessionEvent(session, { type: 'stdout', data: { text: tailOut } });
+      }
+      const tailErr = stderrDecoder.end();
+      if (tailErr) {
+        if (session.stderrAll.length < MAX_OUTPUT_BYTES) session.stderrAll += tailErr;
+        emitSessionEvent(session, { type: 'stderr', data: { text: tailErr } });
+      }
       session.exited = true;
       session.exitCode = exitCode;
       session.waitingForInput = false;
@@ -685,7 +710,7 @@ export function sendSessionInput(sessionId: string, inputLine: string): boolean 
 
   startStepTimer(session);
   try {
-    session.child.stdin.write(line);
+    session.child.stdin.write(line, 'utf8');
   } catch {
     return false;
   }

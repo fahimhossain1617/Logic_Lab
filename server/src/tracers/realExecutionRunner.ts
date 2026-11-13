@@ -19,6 +19,13 @@ export interface RecordedStepMeta {
     | 'MAIN_ENTRY'
     | 'FUNC_ENTRY'
     | 'ELSE_BRANCH'
+    | 'SWITCH_ENTER'
+    | 'CASE_MATCH'
+    | 'DEFAULT_CASE'
+    | 'SCOPE_END'
+    | 'LOOP_JUMP'
+    | 'CLOSE_RESOURCE'
+    | 'DO_LOOP'
     | 'RETURN'
     | 'TRY_BLOCK'
     | 'CATCH_BLOCK'
@@ -32,6 +39,7 @@ export interface RecordedStepMeta {
   iteration?: number;
   printedText?: string;
   returnVal?: any;
+  stdinRead?: string;
   exceptionType?: string;
   exceptionMessage?: string;
 }
@@ -92,6 +100,7 @@ const IGNORED_SANDBOX_KEYS = new Set([
   '__matchException',
   '__fmtException',
   '__fmtOut',
+  '__cinRead',
   '__cap',
 ]);
 
@@ -385,6 +394,21 @@ function extractVariablesAndTypes(
       }
     }
 
+    // Generic typed declarations (supports single and comma-separated: e.g. `double gpa, marks;`, `String a = "x", b;`)
+    const multiTypedMatch = trimmed.match(
+      /^(?:final\s+|static\s+)*(?:let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char|auto)\s+(?!\[\s*\])([^;()]+)/
+    );
+    if (multiTypedMatch) {
+      const declPart = multiTypedMatch[1];
+      for (const seg of declPart.split(',')) {
+        const lhs = seg.split('=')[0].trim().replace(/\[\s*\]/g, '').trim();
+        const idMatch = lhs.match(/^([a-zA-Z_$][\w$]*)$/);
+        if (idMatch && !LANGUAGE_KEYWORDS.has(idMatch[1]) && !IGNORED_SANDBOX_KEYS.has(idMatch[1])) {
+          names.add(idMatch[1]);
+        }
+      }
+    }
+
     // Generic typed declarations (including Java/C++ collection types like List, ArrayList, HashMap, vector, Scanner, File, Random)
     const typedDeclRegex =
       /\b(?:let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char|auto|FileReader|FileInputStream|BufferedReader|Scanner|Random|File|Object|Integer|Double|List|ArrayList|LinkedList|Map|HashMap|TreeMap|Set|HashSet|TreeSet|Queue|Deque|Stack|PriorityQueue|vector\s*<[^>]+>|(?:[A-Za-z_$][\w$]*\s*<[^>]+>)|(?:[A-Z][A-Za-z0-9_$]*))\s*(?:\[\s*\])?\s+([a-zA-Z_$][\w$]*)/g;
@@ -597,6 +621,9 @@ function buildInstrumentedMultiLangScript(
 
   const pyIndentStack: number[] = [0];
   const seenVars = new Set<string>();
+  const braceStack: Array<
+    'CLASS' | 'MAIN' | 'FUNC' | 'COND' | 'LOOP' | 'TRY' | 'CATCH' | 'FINALLY' | 'SWITCH' | 'DO' | 'OTHER'
+  > = [];
 
   // Track multi-catch chains in brace languages (`try { ... } catch (E1 e) { ... } catch (E2 e) { ... }`)
   let inCatchChain = false;
@@ -647,11 +674,30 @@ function buildInstrumentedMultiLangScript(
 
     // 2. Standalone braces `{` or `}` or `};`
     if (trimmed === '{' || trimmed === '}' || trimmed === '};') {
-      if (trimmed !== '{' && inCatchChain && !isNextNonEmptyLineAnotherCatch(idx)) {
+      if (trimmed === '{') {
+        braceStack.push('OTHER');
+        processedLines.push(`${pyClosingPrefix}{`);
+      } else if (inCatchChain && !isNextNonEmptyLineAnotherCatch(idx)) {
         inCatchChain = false;
+        braceStack.pop();
         processedLines.push(`${pyClosingPrefix}} else { throw __rawErr; } }`);
       } else {
-        processedLines.push(`${pyClosingPrefix}${trimmed === '};' ? '}' : trimmed}`);
+        const closedScope = braceStack.pop();
+        const prevNonEmpty = idx > 0 ? rawLines[idx - 1].trim() : '';
+        const prevWasJump = /^(?:return|break|continue|throw|raise)\b/.test(prevNonEmpty);
+        const shouldTraceClose =
+          !prevWasJump &&
+          (closedScope === 'MAIN' ||
+            closedScope === 'COND' ||
+            closedScope === 'TRY' ||
+            closedScope === 'CATCH' ||
+            closedScope === 'FINALLY');
+        const closeStepJs = shouldTraceClose
+          ? `__traceStep(${lineNum}, "BLOCK_END", __cap(), { subKind: "SCOPE_END" }); `
+          : '';
+        processedLines.push(
+          `${pyClosingPrefix}${closeStepJs}${trimmed === '};' ? '}' : trimmed}`
+        );
       }
       continue;
     }
@@ -670,6 +716,7 @@ function buildInstrumentedMultiLangScript(
         );
       } else {
         const hasOpen = Boolean(tryMatch[1]);
+        if (hasOpen) braceStack.push('TRY');
         processedLines.push(
           `${pyClosingPrefix}try ${
             hasOpen ? '{' : ''
@@ -702,9 +749,11 @@ function buildInstrumentedMultiLangScript(
         );
       } else {
         const hasLeadCloseBrace = Boolean(catchMatch[1] && catchMatch[1].includes('}'));
+        if (hasLeadCloseBrace) braceStack.pop();
         const excType = (catchMatch[2] || 'Exception').trim();
         const excVar = (catchMatch[3] || catchMatch[4] || '__exc').trim();
         const hasTrailOpenBrace = Boolean(catchMatch[6]);
+        if (hasTrailOpenBrace) braceStack.push('CATCH');
         seenVars.add(excVar);
 
         if (!inCatchChain) {
@@ -752,7 +801,9 @@ function buildInstrumentedMultiLangScript(
         );
       } else {
         const hasLeadCloseBrace = Boolean(finallyMatch[1] && finallyMatch[1].includes('}'));
+        if (hasLeadCloseBrace) braceStack.pop();
         const hasTrailOpenBrace = Boolean(finallyMatch[2]);
+        if (hasTrailOpenBrace) braceStack.push('FINALLY');
         let prefix = '';
         if (inCatchChain) {
           inCatchChain = false;
@@ -795,6 +846,8 @@ function buildInstrumentedMultiLangScript(
       if (language === 'python' && classMatch[2]?.includes(':')) {
         const indentSpaces = (rawLine.match(/^\s*/)?.[0] || '').replace(/\t/g, '    ').length;
         pyIndentStack.push(indentSpaces + 4);
+      } else if (hasOpen) {
+        braceStack.push('CLASS');
       }
       if (hasOpen) {
         processedLines.push(
@@ -819,6 +872,7 @@ function buildInstrumentedMultiLangScript(
     if (mainMatch) {
       const hasOpen = Boolean(mainMatch[1]);
       if (hasOpen) {
+        braceStack.push('MAIN');
         processedLines.push(
           `${pyClosingPrefix}if (true) { __traceStep(${lineNum}, "METHOD_ENTRY", __cap(), { subKind: "MAIN_ENTRY", fnName: "main" });`
         );
@@ -863,6 +917,7 @@ function buildInstrumentedMultiLangScript(
         );
       } else {
         const hasOpen = Boolean(fnMatch[3]);
+        if (hasOpen) braceStack.push('FUNC');
         processedLines.push(
           `${pyClosingPrefix}function ${fnName}(${paramList}) ${
             hasOpen ? '{' : ''
@@ -874,7 +929,30 @@ function buildInstrumentedMultiLangScript(
       continue;
     }
 
-    // 10. `while` loop header
+    // 10. `do` / `while` loop header & `} while (cond);`
+    const doWhileTailMatch = trimmed.match(/^(\}?\s*)while\s*\((.+)\)\s*;\s*$/);
+    if (doWhileTailMatch && language !== 'python') {
+      if (doWhileTailMatch[1] && doWhileTailMatch[1].includes('}')) braceStack.pop();
+      const rawCond = doWhileTailMatch[2].trim();
+      const jsCond = normalizeExpressionToJs(rawCond, language, false, lineNum);
+      processedLines.push(
+        `${pyClosingPrefix}${doWhileTailMatch[1] || ''} while (__traceLoopCheck(${lineNum}, () => (${jsCond}), ${JSON.stringify(
+          rawCond
+        )}, () => __cap()));`
+      );
+      continue;
+    }
+
+    const doOpenMatch = language !== 'python' ? trimmed.match(/^do\s*(\{)?\s*$/) : null;
+    if (doOpenMatch) {
+      const hasOpen = Boolean(doOpenMatch[1]);
+      if (hasOpen) braceStack.push('DO');
+      processedLines.push(
+        `${pyClosingPrefix}do ${hasOpen ? '{' : ''} __traceStep(${lineNum}, "LOOP_CHECK", __cap(), { subKind: "DO_LOOP", conditionExpr: "do-while", conditionResult: true });`
+      );
+      continue;
+    }
+
     const whileMatch =
       language === 'python'
         ? trimmed.match(/^while\s+(.+?)\s*:\s*$/)
@@ -892,6 +970,7 @@ function buildInstrumentedMultiLangScript(
         );
       } else {
         const brace = whileMatch[2] ? '{' : '';
+        if (brace) braceStack.push('LOOP');
         processedLines.push(
           `${pyClosingPrefix}while (__traceLoopCheck(${lineNum}, () => (${jsCond}), ${JSON.stringify(
             rawCond
@@ -970,6 +1049,7 @@ function buildInstrumentedMultiLangScript(
         const rawIter = forEachMatch[2].trim();
         const jsIter = normalizeExpressionToJs(rawIter, language, false, lineNum);
         const brace = forEachMatch[3] ? '{' : '';
+        if (brace) braceStack.push('LOOP');
         seenVars.add(loopVar);
         processedLines.push(
           `${pyClosingPrefix}for (let ${loopVar} of (${jsIter})) ${brace} __traceStep(${lineNum}, "LOOP_CHECK", __cap({ [${JSON.stringify(
@@ -989,6 +1069,7 @@ function buildInstrumentedMultiLangScript(
         const rawCond = cForMatch[2].trim();
         const rawStep = cForMatch[3].trim();
         const brace = cForMatch[4] ? '{' : '';
+        if (brace) braceStack.push('LOOP');
 
         const initAssignMatch = rawInit.match(
           /^(?:(?:let|const|var|int|long|short|size_t|auto)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(.+)$/
@@ -1043,8 +1124,10 @@ function buildInstrumentedMultiLangScript(
         );
       } else {
         const leadBrace = elseIfMatch[1] || '';
+        if (leadBrace.includes('}')) braceStack.pop();
         const rawCond = elseIfMatch[2].trim();
         const trailBrace = elseIfMatch[3] ? '{' : '';
+        if (trailBrace) braceStack.push('COND');
         const jsCond = normalizeExpressionToJs(rawCond, language, false, lineNum);
         processedLines.push(
           `${pyClosingPrefix}${leadBrace} else if (__traceCondCheck(${lineNum}, () => (${jsCond}), ${JSON.stringify(
@@ -1073,6 +1156,7 @@ function buildInstrumentedMultiLangScript(
         );
       } else {
         const brace = ifMatch[2] ? '{' : '';
+        if (brace) braceStack.push('COND');
         processedLines.push(
           `${pyClosingPrefix}if (__traceCondCheck(${lineNum}, () => (${jsCond}), ${JSON.stringify(
             rawCond
@@ -1091,12 +1175,80 @@ function buildInstrumentedMultiLangScript(
       if (language === 'python') {
         const indentSpaces = (rawLine.match(/^\s*/)?.[0] || '').replace(/\t/g, '    ').length;
         pyIndentStack.push(indentSpaces + 4);
-        processedLines.push(`${pyClosingPrefix}else {`);
+        processedLines.push(
+          `${pyClosingPrefix}else { __traceStep(${lineNum}, "CONDITION_CHECK", __cap(), { subKind: "ELSE_BRANCH", conditionExpr: "else", conditionResult: true });`
+        );
       } else {
         const leadBrace = elseMatch[1] || '';
+        if (leadBrace.includes('}')) braceStack.pop();
         const trailBrace = elseMatch[2] ? '{' : '';
-        processedLines.push(`${pyClosingPrefix}${leadBrace} else ${trailBrace}`);
+        if (trailBrace) braceStack.push('COND');
+        processedLines.push(
+          `${pyClosingPrefix}${leadBrace} else ${trailBrace} ${
+            trailBrace
+              ? `__traceStep(${lineNum}, "CONDITION_CHECK", __cap(), { subKind: "ELSE_BRANCH", conditionExpr: "else", conditionResult: true });`
+              : ''
+          }`
+        );
       }
+      continue;
+    }
+
+    // 14b. `switch` / `case` / `default` statements
+    const switchMatch =
+      language !== 'python' ? trimmed.match(/^switch\s*\((.+)\)\s*(\{)?\s*$/) : null;
+    if (switchMatch) {
+      const rawExpr = switchMatch[1].trim();
+      const jsExpr = normalizeExpressionToJs(rawExpr, language, false, lineNum);
+      const brace = switchMatch[2] ? '{' : '';
+      if (brace) braceStack.push('SWITCH');
+      processedLines.push(
+        `${pyClosingPrefix}switch ((() => { const __sw = (${jsExpr}); __traceStep(${lineNum}, "CONDITION_CHECK", __cap(), { subKind: "SWITCH_ENTER", conditionExpr: ${JSON.stringify(
+          `switch (${rawExpr})`
+        )}, conditionResult: true }); return __sw; })()) ${brace}`
+      );
+      continue;
+    }
+
+    const caseMatch =
+      language !== 'python' ? trimmed.match(/^case\s+([^:]+):\s*(.*)$/) : null;
+    if (caseMatch) {
+      const rawVal = caseMatch[1].trim();
+      const jsVal = normalizeExpressionToJs(rawVal, language, false, lineNum);
+      const rest = caseMatch[2].trim();
+      let restJs = '';
+      if (rest) {
+        const restClean = rest.replace(/;\s*break\s*;?$/, ';').replace(/;$/, '');
+        const hasBreak = /\bbreak\s*;?\s*$/.test(rest);
+        if (restClean && restClean !== 'break') {
+          restJs = `${normalizeExpressionToJs(restClean, language, false, lineNum)}; `;
+        }
+        if (hasBreak) restJs += 'break;';
+      }
+      processedLines.push(
+        `${pyClosingPrefix}case ${jsVal}: __traceStep(${lineNum}, "CONDITION_CHECK", __cap(), { subKind: "CASE_MATCH", conditionExpr: ${JSON.stringify(
+          `case ${rawVal}`
+        )}, conditionResult: true }); ${restJs}`
+      );
+      continue;
+    }
+
+    const defaultCaseMatch =
+      language !== 'python' ? trimmed.match(/^default\s*:\s*(.*)$/) : null;
+    if (defaultCaseMatch) {
+      const rest = defaultCaseMatch[1].trim();
+      let restJs = '';
+      if (rest) {
+        const restClean = rest.replace(/;\s*break\s*;?$/, ';').replace(/;$/, '');
+        const hasBreak = /\bbreak\s*;?\s*$/.test(rest);
+        if (restClean && restClean !== 'break') {
+          restJs = `${normalizeExpressionToJs(restClean, language, false, lineNum)}; `;
+        }
+        if (hasBreak) restJs += 'break;';
+      }
+      processedLines.push(
+        `${pyClosingPrefix}default: __traceStep(${lineNum}, "CONDITION_CHECK", __cap(), { subKind: "DEFAULT_CASE", conditionExpr: "default", conditionResult: true }); ${restJs}`
+      );
       continue;
     }
 
@@ -1225,6 +1377,104 @@ function buildInstrumentedMultiLangScript(
       }
     }
 
+    // 17b. C++ `cin >> a >> b;` or `getline(cin, str);`
+    const cppCinMatch =
+      language === 'cpp' ? trimmed.match(/^(?:std::)?cin\s*>>\s*(.+?)\s*;?\s*$/) : null;
+    if (cppCinMatch) {
+      const vars = cppCinMatch[1]
+        .split('>>')
+        .map((v) => v.trim())
+        .filter((v) => /^[A-Za-z_$][\w$]*$/.test(v));
+      if (vars.length > 0) {
+        const cinStmts = vars.map((v) => {
+          const isInt = intVars.has(v);
+          seenVars.add(v);
+          return `${v} = __cinRead(${JSON.stringify(isInt ? 'int' : hasFloatType ? 'float' : 'auto')}); __traceStep(${lineNum}, "ASSIGN", __cap(), { targetVar: ${JSON.stringify(
+            v
+          )}, rhsExpr: "cin >> ${v}" });`;
+        });
+        processedLines.push(`${pyClosingPrefix}${cinStmts.join(' ')}`);
+        continue;
+      }
+    }
+
+    // 18a. Multi-variable declaration (e.g. `int a = 1, b = 2;` or `double gpa, bonus;` or `String a, b;`)
+    const multiDeclMatch =
+      language !== 'python'
+        ? trimmed.match(
+            /^(?:final\s+|static\s+)*(let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char)\s+([^;]+?)\s*;?\s*$/
+          )
+        : null;
+    if (multiDeclMatch && multiDeclMatch[2].includes(',')) {
+      const declType = multiDeclMatch[1];
+      const declBody = multiDeclMatch[2];
+      // Split at top-level commas (outside quotes / parens / brackets)
+      const parts: string[] = [];
+      let cur = '';
+      let depth = 0;
+      let inStr: string | null = null;
+      for (let ci = 0; ci < declBody.length; ci++) {
+        const ch = declBody[ci];
+        if (inStr) {
+          cur += ch;
+          if (ch === inStr && declBody[ci - 1] !== '\\') inStr = null;
+        } else if (ch === '"' || ch === "'" || ch === '`') {
+          inStr = ch;
+          cur += ch;
+        } else if (ch === '(' || ch === '[' || ch === '{') {
+          depth++;
+          cur += ch;
+        } else if (ch === ')' || ch === ']' || ch === '}') {
+          depth = Math.max(0, depth - 1);
+          cur += ch;
+        } else if (ch === ',' && depth === 0) {
+          parts.push(cur.trim());
+          cur = '';
+        } else {
+          cur += ch;
+        }
+      }
+      if (cur.trim()) parts.push(cur.trim());
+
+      if (parts.length > 1 && parts.every((p) => /^[A-Za-z_$][\w$]*(\s*=\s*.+)?$/.test(p))) {
+        const stmts: string[] = [];
+        const isIntType =
+          (language === 'java' || language === 'cpp') &&
+          /^(?:int|long|short|byte)$/.test(declType);
+        for (const p of parts) {
+          const eqIdx = p.indexOf('=');
+          if (eqIdx >= 0) {
+            const varName = p.slice(0, eqIdx).trim();
+            const rawRhs = p.slice(eqIdx + 1).trim();
+            if (isIntType) intVars.add(varName);
+            seenVars.add(varName);
+            const jsRhs = normalizeExpressionToJs(
+              rawRhs,
+              language,
+              isIntType || intVars.has(varName),
+              lineNum
+            );
+            stmts.push(
+              `${varName} = ${jsRhs}; __traceStep(${lineNum}, "DECLARE", __cap(), { targetVar: ${JSON.stringify(
+                varName
+              )}, rhsExpr: ${JSON.stringify(rawRhs)} });`
+            );
+          } else {
+            const varName = p.trim();
+            if (isIntType) intVars.add(varName);
+            seenVars.add(varName);
+            stmts.push(
+              `${varName} = null; __traceStep(${lineNum}, "DECLARE", __cap(), { targetVar: ${JSON.stringify(
+                varName
+              )} });`
+            );
+          }
+        }
+        processedLines.push(`${pyClosingPrefix}${stmts.join(' ')}`);
+        continue;
+      }
+    }
+
     // 18. Typed variable declaration with initialization (JS/Java/C++)
     const typedDeclAssign = trimmed.match(
       /^(?:final\s+|static\s+)*(?:let|const|var|int|long|short|byte|float|double|boolean|bool|String|string|char|auto|FileReader|FileInputStream|BufferedReader|Scanner|Random|File|Object|Integer|Double|List|ArrayList|LinkedList|Map|HashMap|TreeMap|Set|HashSet|TreeSet|Queue|Deque|Stack|PriorityQueue|vector\s*<[^>]+>|(?:[A-Za-z_$][\w$]*\s*<[^>]+>)|(?:[A-Z][A-Za-z0-9_$]*))\s*(?:\[\s*\])?\s+([A-Za-z_$][\w$]*)\s*(?:\[\s*\])?\s*=\s*(.+?)\s*;?\s*$/
@@ -1339,10 +1589,27 @@ function buildInstrumentedMultiLangScript(
       continue;
     }
 
-    // 24. Fallback statement (e.g. method call `arr.push(10)`, `new FileReader(...)`, `break`, `continue`)
+    // 24. Resource close call (`scanner.close()`, `reader.close()`) & Fallback statement
+    const closeCallMatch = trimmed.match(/^([A-Za-z_$][\w$]*)\.close\s*\(\s*\)\s*;?\s*$/);
+    if (closeCallMatch) {
+      const targetVar = closeCallMatch[1];
+      processedLines.push(
+        `${pyClosingPrefix}${targetVar}?.close?.(); __traceStep(${lineNum}, "ASSIGN", __cap(), { subKind: "CLOSE_RESOURCE", targetVar: ${JSON.stringify(
+          targetVar
+        )}, rhsExpr: "close()" });`
+      );
+      continue;
+    }
+
     const normStmt = normalizeExpressionToJs(trimmed.replace(/;$/, ''), language, false, lineNum);
-    if (/^(?:break|continue|pass)\b/.test(normStmt)) {
-      processedLines.push(`${pyClosingPrefix}${normStmt === 'pass' ? '' : `${normStmt};`}`);
+    if (/^(?:break|continue)\b/.test(normStmt)) {
+      processedLines.push(
+        `${pyClosingPrefix}__traceStep(${lineNum}, "BLOCK_END", __cap(), { subKind: "LOOP_JUMP", conditionExpr: ${JSON.stringify(
+          normStmt
+        )} }); ${normStmt};`
+      );
+    } else if (normStmt === 'pass') {
+      processedLines.push(`${pyClosingPrefix}`);
     } else {
       processedLines.push(
         `${pyClosingPrefix}${normStmt}; __traceStep(${lineNum}, "ASSIGN", __cap());`
@@ -1394,6 +1661,9 @@ export function runDeterministicMultiLanguage(
   const recordedSteps: RecordedJsStep[] = [];
   const stdinLines = stdin.split('\n');
   let stdinIdx = 0;
+  const stdinTokens = String(stdin || '').trim().split(/\s+/).filter(Boolean);
+  let stdinTokIdx = 0;
+  let lastStdinRead: string | null = null;
   let prevVarsSnapshot: Record<string, any> = {};
   const loopIterationCounts = new Map<number, number>();
 
@@ -1463,6 +1733,14 @@ export function runDeterministicMultiLanguage(
         ? 'ASSIGN'
         : actionType;
 
+    const effectiveMeta: RecordedStepMeta | undefined =
+      lastStdinRead !== null && (effectiveActionType === 'DECLARE' || effectiveActionType === 'ASSIGN')
+        ? { ...(meta || {}), stdinRead: lastStdinRead }
+        : meta;
+    if (effectiveMeta?.stdinRead !== undefined) {
+      lastStdinRead = null;
+    }
+
     const snippet = cleanLines[line - 1] || '';
 
     recordedSteps.push({
@@ -1473,7 +1751,7 @@ export function runDeterministicMultiLanguage(
       memoryDelta: delta,
       consoleOutput: consoleOutOnThisStep,
       stdoutSoFar: flushInlineBufferToStdout(),
-      meta,
+      meta: effectiveMeta,
     });
 
     prevVarsSnapshot = { ...cleanedVars };
@@ -1519,8 +1797,16 @@ export function runDeterministicMultiLanguage(
         errors.push(args.map(String).join(' '));
       },
     },
-    prompt: () => stdinLines[stdinIdx++] ?? '',
-    input: () => stdinLines[stdinIdx++] ?? '',
+    prompt: () => {
+      const val = stdinLines[stdinIdx++] ?? '';
+      lastStdinRead = String(val);
+      return val;
+    },
+    input: () => {
+      const val = stdinLines[stdinIdx++] ?? '';
+      lastStdinRead = String(val);
+      return val;
+    },
     require: (modName: string) => {
       try {
         if (modName === 'crypto' || modName === 'node:crypto') return require('node:crypto');
@@ -1545,16 +1831,22 @@ export function runDeterministicMultiLanguage(
     Scanner: class Scanner {
       private tokens: string[];
       private idx = 0;
-      constructor(_src?: any) {
-        this.tokens = String(stdin || '').trim().split(/\s+/).filter(Boolean);
+      private closed = false;
+      constructor(src?: any) {
+        const rawSource = typeof src === 'string' ? src : String(stdin || '');
+        this.tokens = rawSource.trim().split(/\s+/).filter(Boolean);
       }
-      hasNext() { return this.idx < this.tokens.length; }
+      hasNext() { return !this.closed && this.idx < this.tokens.length; }
       hasNextInt() { return this.hasNext() && !Number.isNaN(Number(this.tokens[this.idx])); }
-      next() { return this.tokens[this.idx++] ?? ''; }
-      nextInt() { return Number.parseInt(this.tokens[this.idx++] ?? '0', 10); }
-      nextDouble() { return Number.parseFloat(this.tokens[this.idx++] ?? '0'); }
-      nextLine() { return stdinLines[stdinIdx++] ?? (this.tokens[this.idx++] ?? ''); }
-      close() {}
+      next() { const v = this.tokens[this.idx++] ?? ''; lastStdinRead = String(v); return v; }
+      nextInt() { const raw = this.tokens[this.idx++] ?? '0'; lastStdinRead = String(raw); return Number.parseInt(raw, 10); }
+      nextLong() { const raw = this.tokens[this.idx++] ?? '0'; lastStdinRead = String(raw); return Number.parseInt(raw, 10); }
+      nextDouble() { const raw = this.tokens[this.idx++] ?? '0'; lastStdinRead = String(raw); return Number.parseFloat(raw); }
+      nextFloat() { const raw = this.tokens[this.idx++] ?? '0'; lastStdinRead = String(raw); return Number.parseFloat(raw); }
+      nextBoolean() { const raw = String(this.tokens[this.idx++] ?? 'false'); lastStdinRead = raw; return raw.toLowerCase() === 'true'; }
+      nextLine() { const v = stdinLines[stdinIdx++] ?? (this.tokens[this.idx++] ?? ''); lastStdinRead = String(v); return v; }
+      close() { this.closed = true; }
+      toJSON() { return this.closed ? 'Scanner(closed)' : 'Scanner(System.in)'; }
     },
     Random: class Random {
       private seed: number;
@@ -1574,6 +1866,7 @@ export function runDeterministicMultiLanguage(
       }
       nextDouble() { return this.next(); }
       nextBoolean() { return this.next() >= 0.5; }
+      toJSON() { return `Random(seed=${this.seed})`; }
     },
     System: {
       in: {},
@@ -1749,6 +2042,14 @@ export function runDeterministicMultiLanguage(
     },
     __fmtOut: (val: any) =>
       typeof val === 'object' && val !== null ? JSON.stringify(val) : String(val),
+    __cinRead: (kind: string = 'auto') => {
+      const raw = stdinTokens[stdinTokIdx++] ?? '0';
+      lastStdinRead = String(raw);
+      if (kind === 'int') return Number.parseInt(raw, 10) || 0;
+      if (kind === 'float') return Number.parseFloat(raw) || 0;
+      const n = Number(raw);
+      return raw !== '' && !Number.isNaN(n) ? n : raw;
+    },
     __traceStep: (
       line: number,
       actionType: RuntimeActionType,

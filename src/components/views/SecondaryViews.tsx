@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { useLabStore } from '../../store/useLabStore';
 import { PROBLEM_LIBRARY } from '../../data/problemLibrary';
 import { StageCanvas } from '../stage/StageCanvas';
-import { PlayerBar } from '../player/PlayerBar';
 import { ExplainerDeck } from '../explainer/ExplainerDeck';
 import { FormattedText } from '../common/FormattedText';
 import {
@@ -978,7 +977,6 @@ export const SharedRunView: React.FC = () => {
 
         <div className="lg:col-span-7 space-y-3">
           <StageCanvas />
-          <PlayerBar />
           <ExplainerDeck />
         </div>
       </div>

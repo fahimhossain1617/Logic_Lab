@@ -20,8 +20,15 @@ import {
   extractDeclaredVariableTypes,
   resolveAccurateVariableType,
 } from '../../../shared/declaredTypeHelper';
+import {
+  analyzeBlockExecution,
+  analyzeCodeComplexity,
+  buildExecutionAwareLineNote,
+  generateLanguagePitfalls,
+} from '../../../shared/codeAnalysis';
 import { preprocessCode } from './codePreprocessor';
 import { ExecutionTraceSchema } from '../../../shared/traceSchema';
+import { classifyErrorCategory, tokenizeStdin } from '../../../shared/stdinHelper';
 import {
   GEMINI_TRACE_SYSTEM_PROMPT,
   buildUserTracePrompt,
@@ -166,6 +173,7 @@ const VALID_FAULT_TYPES = new Set([
   'stack_overflow',
   'off_by_one',
   'type_error',
+  'runtime_exception',
 ]);
 
 const VALID_VERDICTS = new Set([
@@ -253,6 +261,72 @@ const TRACE_RESPONSE_SCHEMA = {
             type: Type.STRING,
             description:
               'AST-accurate tag: DECLARATION, ALLOCATION, ASSIGN, CONDITION, LOOP, COMPARISON, CALL, OUTPUT, RETURN, or SCOPE_END',
+          },
+          animationAction: {
+            type: Type.STRING,
+            nullable: true,
+            description:
+              'Visual cue action: read_stdin, declare, assign, evaluate_condition, switch_jump, loop_step, compute, print_output, runtime_error, or close_resource',
+          },
+          banglaExplanation: {
+            type: Type.STRING,
+            nullable: true,
+            description:
+              'Crystal-clear beginner-friendly conversational Bangla explanation of what this step does and why',
+          },
+          cumulativeOutput: {
+            type: Type.STRING,
+            nullable: true,
+            description: 'All console stdout accumulated from step 1 through this step',
+          },
+          stdinConsumed: {
+            type: Type.OBJECT,
+            nullable: true,
+            properties: {
+              token: { type: Type.STRING },
+              targetVar: { type: Type.STRING, nullable: true },
+              targetType: { type: Type.STRING, nullable: true },
+              bufferIndex: { type: Type.INTEGER, nullable: true },
+              remainingTokens: {
+                type: Type.ARRAY,
+                nullable: true,
+                items: { type: Type.STRING },
+              },
+            },
+            required: ['token'],
+          },
+          conditionEval: {
+            type: Type.OBJECT,
+            nullable: true,
+            properties: {
+              expression: { type: Type.STRING },
+              result: { type: Type.STRING },
+              branchTaken: { type: Type.STRING, nullable: true },
+              kind: { type: Type.STRING, nullable: true },
+              casesChecked: {
+                type: Type.ARRAY,
+                nullable: true,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    label: { type: Type.STRING },
+                    matched: { type: Type.BOOLEAN },
+                  },
+                  required: ['label', 'matched'],
+                },
+              },
+            },
+            required: ['expression', 'result'],
+          },
+          loopInfo: {
+            type: Type.OBJECT,
+            nullable: true,
+            properties: {
+              iteration: { type: Type.INTEGER },
+              conditionText: { type: Type.STRING, nullable: true },
+              continuing: { type: Type.BOOLEAN },
+            },
+            required: ['iteration', 'continuing'],
           },
           from: { type: Type.STRING, nullable: true },
           to: { type: Type.STRING, nullable: true },
@@ -404,7 +478,9 @@ const TRACE_RESPONSE_SCHEMA = {
 function normalizeGeminiRawOutput(
   rawObj: any,
   fallbackLang: SupportedLanguage,
-  code: string
+  code: string,
+  stdin: string = '',
+  explainLanguage: ExplainLanguage = 'bn'
 ): any {
   if (!rawObj || typeof rawObj !== 'object') return rawObj;
   const cleanCode = stripCommentsPreservingLines(code, fallbackLang);
@@ -449,7 +525,20 @@ function normalizeGeminiRawOutput(
     ? rawObj.analogyType
     : 'generic_memory';
 
-  const lineNotes = Array.isArray(rawObj.lineNotes)
+  const cleanNonBoilerplateNote = (text: string, lineNum: number, rawLineText: string): string => {
+    const trimmed = String(text || '').trim();
+    if (
+      !trimmed ||
+      trimmed === rawLineText ||
+      /^লাইন\s+\d+\s*\([^)]*\)\s*(?:এক্সিকিউট\s+হয়েছে|সম্পন্ন\s+হয়েছে)/.test(trimmed) ||
+      /^Line\s+\d+\s*\([^)]*\)\s*executed\.?$/i.test(trimmed)
+    ) {
+      return '';
+    }
+    return trimmed;
+  };
+
+  const rawLineNotes = Array.isArray(rawObj.lineNotes)
     ? rawObj.lineNotes.map((ln: any, i: number) => {
         const lineNum =
           typeof ln.line === 'number' && ln.line >= 1 && ln.line <= maxLine
@@ -478,14 +567,24 @@ function normalizeGeminiRawOutput(
         return {
           line: lineNum,
           role: normalizedRole,
-          text: String(ln.text || ''),
-          why: ln.why ? String(ln.why) : undefined,
+          text: cleanNonBoilerplateNote(String(ln.text || ''), lineNum, rawLineText),
+          why: ln.why ? cleanNonBoilerplateNote(String(ln.why), lineNum, rawLineText) || undefined : undefined,
         };
       })
     : [];
 
+  const dedupedNotesMap = new Map<number, any>();
+  for (const n of rawLineNotes) {
+    if (!dedupedNotesMap.has(n.line) || (n.text && !dedupedNotesMap.get(n.line)?.text)) {
+      dedupedNotesMap.set(n.line, n);
+    }
+  }
+
   let runningVars: Record<string, any> = {};
   let runningSnapshotMeta: Record<string, VariableSnapshot> = {};
+  let runningStdout = '';
+  const stdinQueue = tokenizeStdin(stdin);
+  let runningStdinIdx = 0;
 
   const steps = Array.isArray(rawObj.steps)
     ? rawObj.steps.slice(0, 120).map((s: any, idx: number) => {
@@ -914,6 +1013,102 @@ function normalizeGeminiRawOutput(
           }
         }
 
+        const stepStdoutText = s.stdout ? String(s.stdout) : null;
+        if (stepStdoutText) {
+          runningStdout = runningStdout
+            ? `${runningStdout}${runningStdout.endsWith('\n') || runningStdout.endsWith(': ') ? '' : '\n'}${stepStdoutText}`
+            : stepStdoutText;
+        }
+        const computedCumulativeOutput =
+          typeof s.cumulativeOutput === 'string' && s.cumulativeOutput.length >= runningStdout.length
+            ? s.cumulativeOutput
+            : runningStdout || null;
+        if (typeof s.cumulativeOutput === 'string' && s.cumulativeOutput.length > runningStdout.length) {
+          runningStdout = s.cumulativeOutput;
+        }
+
+        // Normalize or infer stdinConsumed for input-reading steps
+        let normalizedStdinConsumed = null;
+        const isInputReadLine =
+          /\b(?:nextDouble|nextInt|nextLong|nextFloat|nextBoolean|nextLine|next|readLine|input|scanf|getline|prompt|readline)\s*\(/.test(
+            rawLineText
+          ) || /\bcin\s*>>/.test(rawLineText);
+        if (s.stdinConsumed && typeof s.stdinConsumed === 'object' && s.stdinConsumed.token !== undefined) {
+          const bufIdx =
+            typeof s.stdinConsumed.bufferIndex === 'number'
+              ? s.stdinConsumed.bufferIndex
+              : runningStdinIdx;
+          runningStdinIdx = Math.max(runningStdinIdx + 1, bufIdx + 1);
+          normalizedStdinConsumed = {
+            token: String(s.stdinConsumed.token),
+            targetVar: s.stdinConsumed.targetVar ? String(s.stdinConsumed.targetVar) : rawChanges[0]?.name || null,
+            targetType: s.stdinConsumed.targetType ? String(s.stdinConsumed.targetType) : null,
+            bufferIndex: bufIdx,
+            remainingTokens: Array.isArray(s.stdinConsumed.remainingTokens)
+              ? s.stdinConsumed.remainingTokens.map(String)
+              : stdinQueue.slice(runningStdinIdx),
+          };
+        } else if (isInputReadLine && runningStdinIdx < stdinQueue.length) {
+          const consumedTok = stdinQueue[runningStdinIdx];
+          runningStdinIdx += 1;
+          normalizedStdinConsumed = {
+            token: consumedTok,
+            targetVar: rawChanges[0]?.name || null,
+            targetType: normalizedSnapshots?.find((sn) => sn.name === rawChanges[0]?.name)?.type || null,
+            bufferIndex: runningStdinIdx - 1,
+            remainingTokens: stdinQueue.slice(runningStdinIdx),
+          };
+        }
+
+        // Normalize conditionEval if returned
+        let normalizedConditionEval = null;
+        if (s.conditionEval && typeof s.conditionEval === 'object' && s.conditionEval.expression) {
+          const rawRes = s.conditionEval.result;
+          const parsedRes =
+            rawRes === 'true'
+              ? true
+              : rawRes === 'false'
+              ? false
+              : typeof rawRes === 'boolean'
+              ? rawRes
+              : String(rawRes ?? '');
+          normalizedConditionEval = {
+            expression: String(s.conditionEval.expression),
+            result: parsedRes,
+            branchTaken: s.conditionEval.branchTaken ? String(s.conditionEval.branchTaken) : null,
+            kind: ['if', 'else_if', 'else', 'switch', 'loop', 'ternary'].includes(s.conditionEval.kind)
+              ? s.conditionEval.kind
+              : null,
+            casesChecked: Array.isArray(s.conditionEval.casesChecked)
+              ? s.conditionEval.casesChecked
+                  .filter((c: any) => c && typeof c === 'object' && c.label)
+                  .map((c: any) => ({
+                    label: String(c.label),
+                    matched: Boolean(c.matched),
+                  }))
+              : null,
+          };
+        } else if (normalizedVisualCue?.comparison) {
+          normalizedConditionEval = {
+            expression: `${normalizedVisualCue.comparison.leftLabel} ${normalizedVisualCue.comparison.operator} ${normalizedVisualCue.comparison.rightLabel}`,
+            result: normalizedVisualCue.comparison.result,
+            branchTaken: normalizedVisualCue.comparison.result ? 'true-branch' : 'false-branch',
+            kind: 'if',
+            casesChecked: null,
+          };
+        }
+
+        const normalizedLoopInfo =
+          s.loopInfo && typeof s.loopInfo === 'object' && typeof s.loopInfo.iteration === 'number'
+            ? {
+                iteration: s.loopInfo.iteration,
+                conditionText: s.loopInfo.conditionText ? String(s.loopInfo.conditionText) : null,
+                continuing: Boolean(s.loopInfo.continuing),
+              }
+            : null;
+
+        const resolvedBangla = String(s.banglaExplanation || s.explanation || '');
+
         return {
           stepIndex: idx + 1,
           activeLine,
@@ -921,9 +1116,9 @@ function normalizeGeminiRawOutput(
           action: uiAct,
           from: s.from ? String(s.from) : null,
           to: s.to ? String(s.to) : rawChanges[0]?.name || null,
-          explanation: String(s.explanation || ''),
+          explanation: String(s.explanation || resolvedBangla || ''),
           why: String(s.why || ''),
-          stdout: s.stdout ? String(s.stdout) : null,
+          stdout: stepStdoutText,
           changes: rawChanges,
           variables,
           fault: normalizedFault,
@@ -940,13 +1135,34 @@ function normalizeGeminiRawOutput(
                 newValue: rawChanges[0].to,
               }
             : { variable: null, oldValue: null, newValue: null },
-          consoleOutput: s.stdout ? String(s.stdout) : null,
-          whatHappenedBn: String(s.explanation || ''),
+          consoleOutput: stepStdoutText,
+          whatHappenedBn: resolvedBangla,
           logicBuildingBn: String(s.why || ''),
-          whatHappened: String(s.explanation || ''),
+          whatHappened: String(s.explanation || resolvedBangla || ''),
           whyAndLogic: String(s.why || ''),
           variableSnapshots: normalizedSnapshots,
           visualCue: normalizedVisualCue,
+          stdinConsumed: normalizedStdinConsumed,
+          conditionEval: normalizedConditionEval,
+          loopInfo: normalizedLoopInfo,
+          animationAction: s.animationAction
+            ? String(s.animationAction)
+            : normalizedStdinConsumed
+            ? 'read_stdin'
+            : normalizedFault
+            ? 'runtime_error'
+            : mappedActionType === 'OUTPUT'
+            ? 'print_output'
+            : normalizedConditionEval?.kind === 'switch'
+            ? 'switch_jump'
+            : normalizedConditionEval
+            ? 'evaluate_condition'
+            : normalizedLoopInfo
+            ? 'loop_step'
+            : mappedActionType.toLowerCase(),
+          banglaExplanation: resolvedBangla || null,
+          cumulativeOutput: computedCumulativeOutput,
+          variablesState: variables,
         };
       })
     : [];
@@ -957,7 +1173,104 @@ function normalizeGeminiRawOutput(
     ? 'logic_error'
     : 'ok';
 
-  const hasErr = Boolean(rawObj.hasError || verdictStatus === 'compile_error');
+  const isCompileFailure = verdictStatus === 'compile_error';
+  const isRuntimeFailure = verdictStatus === 'runtime_error' || verdictStatus === 'infinite_loop';
+  const hasErr = Boolean(rawObj.hasError || isCompileFailure || isRuntimeFailure);
+  const keepStepsOnError = !isCompileFailure && steps.length > 0;
+  const effectiveSteps = isCompileFailure ? [] : steps;
+
+  // Cross-reference lineNotes against runtime execution trace (skipped branches & closing braces)
+  const executedLines = new Set<number>(effectiveSteps.map((s: any) => s.activeLine));
+  const blockExec = analyzeBlockExecution(code, fallbackLang, executedLines);
+  const reconciledNotesMap = new Map<number, any>();
+
+  for (let i = 0; i < codeLines.length; i++) {
+    const ln = i + 1;
+    const trimmedLine = codeLines[i].trim();
+    if (!trimmedLine) continue;
+
+    const existing = dedupedNotesMap.get(ln);
+    const wasLineExecuted = executedLines.has(ln);
+    const braceInfo = blockExec.braceByCloseLine.get(ln);
+    const pythonEndInfo = blockExec.pythonEndsByLine.get(ln);
+    const isClosingBrace = trimmedLine === '}' || trimmedLine === '};';
+    const isConditionalHeader = /^(?:\}?\s*)?(?:else\s+if|elif|else|catch|except|case\b|default\s*:)/.test(
+      trimmedLine
+    );
+
+    if (!isCompileFailure && (isClosingBrace || (!wasLineExecuted && (blockExec.skippedBlockLines.has(ln) || isConditionalHeader)))) {
+      const aware = buildExecutionAwareLineNote({
+        lineNumber: ln,
+        trimmed: trimmedLine,
+        language: fallbackLang,
+        explainLanguage,
+        executedLines,
+        braceInfo,
+        pythonEndInfo,
+      });
+
+      const existingText = existing?.text || '';
+      const mentionsSkipped = /স্কিপ|চলেনি|প্রবেশ\s*করেনি|বাদ\s*পড়ে|হয়নি|skip|not\s+executed|bypassed|unentered|did\s+not\s+enter/i.test(
+        existingText
+      );
+      const claimsActiveReturn = /নিয়ন্ত্রণ\s+বাইরের|ব্লক\s+শেষ\s+হয়ে\s+নিয়ন্ত্রণ|returning\s+control|returns\s+control/i.test(
+        existingText
+      );
+
+      const shouldOverrideWithAware =
+        !existingText ||
+        (isClosingBrace && (!braceInfo?.wasBlockExecuted || claimsActiveReturn)) ||
+        (!wasLineExecuted && !mentionsSkipped);
+
+      reconciledNotesMap.set(ln, {
+        line: ln,
+        role: existing?.role || inferLineRole(trimmedLine),
+        text: shouldOverrideWithAware ? aware.text : existingText,
+        why: shouldOverrideWithAware ? aware.why : existing?.why || aware.why,
+      });
+      continue;
+    }
+
+    if (existing?.text) {
+      let updatedText = existing.text;
+      if (
+        !isCompileFailure &&
+        fallbackLang === 'python' &&
+        wasLineExecuted &&
+        pythonEndInfo?.wasBlockExecuted &&
+        !/ইন্ডেন্টেশন|ব্লক.*শেষ|block\s*end|ends\s+the\s+python/i.test(updatedText)
+      ) {
+        updatedText =
+          explainLanguage === 'bn'
+            ? `${updatedText} (এই লাইনের পর \`${pythonEndInfo.kind}\` ব্লকের ইন্ডেন্টেশন শেষ হয়ে নিয়ন্ত্রণ বাইরের স্তরে ফিরে আসে)`
+            : `${updatedText} (Ends the Python \`${pythonEndInfo.kind}\` block afterward, returning control outward)`;
+      }
+      reconciledNotesMap.set(ln, {
+        ...existing,
+        text: updatedText,
+      });
+    } else if (!isCompileFailure) {
+      const aware = buildExecutionAwareLineNote({
+        lineNumber: ln,
+        trimmed: trimmedLine,
+        language: fallbackLang,
+        explainLanguage,
+        executedLines,
+        braceInfo,
+        pythonEndInfo,
+      });
+      reconciledNotesMap.set(ln, {
+        line: ln,
+        role: existing?.role || inferLineRole(trimmedLine),
+        text: aware.text,
+        why: existing?.why || aware.why,
+      });
+    } else if (existing) {
+      reconciledNotesMap.set(ln, existing);
+    }
+  }
+
+  const finalLineNotes = Array.from(reconciledNotesMap.values()).sort((a, b) => a.line - b.line);
 
   let normalizedErrorDetails: TraceErrorDetails | null = null;
   if (rawObj.errorDetails && typeof rawObj.errorDetails === 'object' && rawObj.errorDetails.message) {
@@ -970,8 +1283,14 @@ function normalizeGeminiRawOutput(
     normalizedErrorDetails = {
       errorType:
         rawObj.errorDetails.errorType === 'FILE_NAME_MISMATCH' ||
-        rawObj.errorDetails.errorType === 'COMPILATION_ERROR'
+        rawObj.errorDetails.errorType === 'COMPILATION_ERROR' ||
+        rawObj.errorDetails.errorType === 'RUNTIME_ERROR' ||
+        rawObj.errorDetails.errorType === 'INPUT_ERROR'
           ? rawObj.errorDetails.errorType
+          : isRuntimeFailure
+          ? classifyErrorCategory(String(rawObj.errorDetails.message), false) === 'input_error'
+            ? 'INPUT_ERROR'
+            : 'RUNTIME_ERROR'
           : 'SYNTAX_ERROR',
       lineNumber: ln,
       lineCode: String(rawObj.errorDetails.lineCode || codeLines[ln - 1] || '').trim(),
@@ -982,13 +1301,61 @@ function normalizeGeminiRawOutput(
     };
   }
 
-  const timeComp = String(rawObj.logicSummary?.complexity?.time || 'O(n)');
-  const spaceComp = String(rawObj.logicSummary?.complexity?.space || 'O(1)');
-  const finalOut = String(rawObj.finalOutput ?? '');
+  const analyzedComplexity = analyzeCodeComplexity(code, fallbackLang, effectiveSteps);
+  const rawTime = String(rawObj.logicSummary?.complexity?.time || '').trim();
+  const rawSpace = String(rawObj.logicSummary?.complexity?.space || '').trim();
+  const hasSortCall = /\b(?:Arrays|Collections)\.sort\s*\(|\bsorted\s*\(|\bstd::sort\s*\(|\.sort\s*\(/.test(
+    code
+  );
+  const timeComp =
+    !rawTime ||
+    !/^O\(/i.test(rawTime) ||
+    (analyzedComplexity.time === 'O(1)' && !hasSortCall && rawTime !== 'O(1)') ||
+    (analyzedComplexity.time !== 'O(1)' && rawTime === 'O(1)')
+      ? analyzedComplexity.time
+      : rawTime;
+  const spaceComp =
+    !rawSpace ||
+    !/^O\(/i.test(rawSpace) ||
+    (analyzedComplexity.space !== 'O(1)' && rawSpace === 'O(1)')
+      ? analyzedComplexity.space
+      : rawSpace;
+  const rawComplexityNote = String(rawObj.logicSummary?.complexity?.note || '').trim();
+  const complexityNote =
+    !rawComplexityNote || timeComp !== rawTime || spaceComp !== rawSpace
+      ? explainLanguage === 'bn'
+        ? analyzedComplexity.noteBn
+        : analyzedComplexity.noteEn
+      : rawComplexityNote;
+
+  const rawMistakes = Array.isArray(rawObj.logicSummary?.commonMistakes)
+    ? rawObj.logicSummary.commonMistakes.map(String).map((m: string) => m.trim()).filter(Boolean)
+    : [];
+  const dynamicPitfalls = generateLanguagePitfalls(code, fallbackLang, explainLanguage);
+  const mergedMistakes: string[] = [...rawMistakes];
+  for (const pitfall of dynamicPitfalls) {
+    if (mergedMistakes.length >= 3) break;
+    if (!mergedMistakes.some((m) => m.toLowerCase() === pitfall.toLowerCase())) {
+      mergedMistakes.push(pitfall);
+    }
+  }
+  const commonMistakes =
+    mergedMistakes.length > 0 ? mergedMistakes.slice(0, 4) : dynamicPitfalls;
+
+  const finalOut = String(rawObj.finalOutput ?? runningStdout ?? '');
+
+  const resolvedErrorCategory = isCompileFailure
+    ? 'compile_error'
+    : isRuntimeFailure
+    ? classifyErrorCategory(normalizedErrorDetails?.message || rawObj.verdict?.message || '', false)
+    : null;
 
   return {
     ...rawObj,
     hasError: hasErr,
+    errorCategory: resolvedErrorCategory,
+    stdinUsed: stdin || null,
+    stdinTokens: stdinQueue,
     isValidLogic: Boolean(rawObj.isValidLogic ?? verdictStatus === 'ok'),
     errorDetails: normalizedErrorDetails,
     language: fallbackLang,
@@ -1005,24 +1372,23 @@ function normalizeGeminiRawOutput(
       complexity: {
         time: timeComp,
         space: spaceComp,
-        note: String(rawObj.logicSummary?.complexity?.note || ''),
+        note: complexityNote,
       },
-      commonMistakes: Array.isArray(rawObj.logicSummary?.commonMistakes)
-        ? rawObj.logicSummary.commonMistakes.map(String)
-        : [],
+      commonMistakes,
     },
-    lineNotes,
-    steps: hasErr ? [] : steps,
-    finalOutput: hasErr ? '' : finalOut,
+    lineNotes: finalLineNotes,
+    steps: effectiveSteps,
+    finalOutput: isCompileFailure ? '' : finalOut,
     outputExplanation: String(rawObj.outputExplanation ?? ''),
     verdict: {
       status: verdictStatus,
       message: String(rawObj.verdict?.message || ''),
     },
-    programSummary: hasErr
-      ? null
-      : {
-          totalExecutionSteps: steps.length,
+    programSummary:
+      isCompileFailure || (!keepStepsOnError && hasErr)
+        ? null
+        : {
+            totalExecutionSteps: steps.length,
           timeComplexity: timeComp,
           spaceComplexity: spaceComp,
           finalOutput: finalOut,
@@ -1035,7 +1401,12 @@ function formatResult(
   cached: boolean,
   diagnostics: ExecutionDiagnostic[] = []
 ): TraceServiceResult {
-  const hasError = Boolean(trace.hasError || trace.verdict.status === 'compile_error');
+  const isCompileError =
+    trace.verdict.status === 'compile_error' ||
+    (Boolean(trace.hasError) && trace.steps.length === 0 && trace.errorCategory === 'compile_error');
+  const isRuntimeError =
+    trace.verdict.status === 'runtime_error' || trace.verdict.status === 'infinite_loop';
+  const hasError = Boolean(trace.hasError || isCompileError || isRuntimeError);
   const allDiagnostics = [...diagnostics];
 
   if (hasError && trace.errorDetails) {
@@ -1049,13 +1420,24 @@ function formatResult(
     }
   }
 
+  const hasCompileDiagnostics =
+    isCompileError ||
+    allDiagnostics.some(
+      (d) => d.severity === 'error' && (!isRuntimeError || d.source !== 'runtime')
+    );
   const hasErrors = hasError || allDiagnostics.some((d) => d.severity === 'error');
   const hasWarnings = allDiagnostics.some((d) => d.severity === 'warning');
   const status: ExecutionStatus = hasErrors ? 'error' : hasWarnings ? 'warning' : 'success';
-  const canRun = !hasErrors;
+
+  // Compile errors block animation/visualization; runtime errors WITH trace steps still show the steps up to the crash
+  const hasPlayableRuntimeTrace =
+    isRuntimeError && !hasCompileDiagnostics && Array.isArray(trace.steps) && trace.steps.length > 0;
+  const canRun = !hasErrors || hasPlayableRuntimeTrace;
 
   const output = hasError
-    ? trace.errorDetails?.message || trace.verdict.message || 'Execution failed.'
+    ? trace.finalOutput
+      ? `${trace.finalOutput}\n${trace.errorDetails?.message || trace.verdict.message || 'Execution failed.'}`
+      : trace.errorDetails?.message || trace.verdict.message || 'Execution failed.'
     : trace.finalOutput || '';
 
   trace.status = status;
@@ -1069,8 +1451,8 @@ function formatResult(
     visualizerData: canRun ? trace : null,
     hasError,
     errorDetails: hasError ? trace.errorDetails : null,
-    programSummary: hasError ? null : trace.programSummary ?? null,
-    steps: hasError ? [] : trace.steps,
+    programSummary: canRun ? trace.programSummary ?? null : null,
+    steps: canRun ? trace.steps : [],
     trace,
     cached,
     apiNotice: null,
@@ -1093,10 +1475,17 @@ export async function generateExecutionTrace(params: {
 
   // 1. Real Compiler / Toolchain validation (source of truth)
   const toolchainAnalysis = await analyzeCode(codeToRun, params.language, params.fileName);
+  const adjustedToolchainDiagnostics = toolchainAnalysis.diagnostics.map((d) => ({
+    ...d,
+    line:
+      prep.injectedPrefixLines > 0 && d.line
+        ? Math.max(1, d.line - prep.injectedPrefixLines)
+        : d.line,
+  }));
   if (!toolchainAnalysis.canCompile) {
-    const firstErr = toolchainAnalysis.diagnostics.find((d) => d.severity === 'error');
+    const firstErr = adjustedToolchainDiagnostics.find((d) => d.severity === 'error');
     const errLine = firstErr?.line || 1;
-    const errTrace = buildFallbackTrace({ ...params, code: codeToRun });
+    const errTrace = buildFallbackTrace({ ...params, code: params.code });
     errTrace.hasError = true;
     errTrace.verdict.status = 'compile_error';
     errTrace.verdict.message = firstErr?.message || 'Compilation error.';
@@ -1112,7 +1501,7 @@ export async function generateExecutionTrace(params: {
     };
     return formatResult(errTrace, false, [
       ...initialDiagnostics,
-      ...toolchainAnalysis.diagnostics,
+      ...adjustedToolchainDiagnostics,
     ]);
   }
 
@@ -1163,24 +1552,43 @@ export async function generateExecutionTrace(params: {
   );
 
   const deterministicTrace = buildFallbackTrace({ ...params, code: codeToRun });
+  deterministicTrace.stdinUsed = params.stdin || null;
+  deterministicTrace.stdinTokens = tokenizeStdin(params.stdin || '');
 
   // Use real execution stdout as ground truth (normalized of trailing newline)
   const cleanedStdout = (realExec.stdout || sandboxResult.stdout || '').replace(/\r?\n$/, '');
   deterministicTrace.finalOutput = cleanedStdout;
 
+  const adjustedRuntimeErrorLine =
+    realExec.runtimeErrorLine && prep.injectedPrefixLines > 0
+      ? Math.max(1, realExec.runtimeErrorLine - prep.injectedPrefixLines)
+      : realExec.runtimeErrorLine;
+
   if (realExec.runtimeError) {
+    const errCat = classifyErrorCategory(realExec.runtimeError, false);
     deterministicTrace.hasError = true;
+    deterministicTrace.errorCategory = errCat;
     deterministicTrace.isValidLogic = false;
     deterministicTrace.verdict.status = realExec.timedOut ? 'infinite_loop' : 'runtime_error';
     deterministicTrace.verdict.message = realExec.runtimeError;
     deterministicTrace.errorDetails = {
-      lineNumber: realExec.runtimeErrorLine || 1,
-      line: realExec.runtimeErrorLine || 1,
+      errorType: errCat === 'input_error' ? 'INPUT_ERROR' : 'RUNTIME_ERROR',
+      lineNumber: adjustedRuntimeErrorLine || 1,
+      line: adjustedRuntimeErrorLine || 1,
       message: realExec.runtimeError,
+      messageBn:
+        errCat === 'input_error'
+          ? `ইনপুট (STDIN) অনুপস্থিত বা অপর্যাপ্ত থাকায় লাইন ${adjustedRuntimeErrorLine || 1}-এ প্রোগ্রামটি থেমে গেছে: ${realExec.runtimeError}`
+          : `লাইন ${adjustedRuntimeErrorLine || 1}-এ রানটাইম ত্রুটি হয়েছে: ${realExec.runtimeError}`,
+      solutionBn:
+        errCat === 'input_error'
+          ? 'নিচের "ইনপুট (STDIN)" ট্যাবে প্রয়োজনীয় ইনপুট মানগুলো দিয়ে আবার "ব্যাখ্যা ও অ্যানিমেট" চাপুন।'
+          : 'ত্রুটিযুক্ত লাইনটি পরীক্ষা করুন (যেমন: শূন্য দিয়ে ভাগ, ইনডেক্স সীমা বা নাল মান)।',
     };
   } else {
     // Real execution succeeded with exitCode 0
     deterministicTrace.hasError = false;
+    deterministicTrace.errorCategory = null;
     deterministicTrace.isValidLogic = true;
     deterministicTrace.errorDetails = null;
     deterministicTrace.verdict.status = 'ok';
@@ -1194,41 +1602,56 @@ export async function generateExecutionTrace(params: {
 
   // If deterministicTrace.steps is empty but sandbox recorded steps, use them!
   if (deterministicTrace.steps.length === 0 && sandboxResult.recordedSteps.length > 0) {
-    deterministicTrace.steps = sandboxResult.recordedSteps.map((st, idx) => ({
-      stepIndex: idx + 1,
-      step: idx + 1,
-      activeLine: st.line,
-      lineNumber: st.line,
-      codeSnippet: st.codeSnippet,
-      action: st.actionType === 'DECLARE' ? 'declare' : 'assign',
-      actionType: st.actionType,
-      analogyType: 'generic_memory',
-      from: null,
-      to: st.memoryDelta?.variable || null,
-      explanation: st.consoleOutput
-        ? `Output: ${st.consoleOutput}`
-        : `Executing line ${st.line}: ${st.codeSnippet}`,
-      why: '',
-      stdout: st.consoleOutput,
-      consoleOutput: st.consoleOutput,
-      changes: st.memoryDelta
-        ? [{ name: st.memoryDelta.variable || '', from: st.memoryDelta.oldValue, to: st.memoryDelta.newValue }]
-        : [],
-      variables: st.variables || {},
-      memoryState: st.variables || {},
-      memoryDelta: st.memoryDelta || { variable: null, oldValue: null, newValue: null },
-      fault: null,
-      structure: null,
-      whatHappenedBn: st.consoleOutput
-        ? `আউটপুট: ${st.consoleOutput}`
-        : `লাইন ${st.line} কার্যকর হয়েছে।`,
-      logicBuildingBn: '',
-    }));
-  } else if (deterministicTrace.steps.length === 0 && realExec.status === 'success') {
-    // Generate fallback steps from executable lines and final stdout
+    let runOut = '';
+    deterministicTrace.steps = sandboxResult.recordedSteps.map((st, idx) => {
+      if (st.consoleOutput) {
+        runOut = runOut ? `${runOut}\n${st.consoleOutput}` : st.consoleOutput;
+      }
+      return {
+        stepIndex: idx + 1,
+        step: idx + 1,
+        activeLine: st.line,
+        lineNumber: st.line,
+        codeSnippet: st.codeSnippet,
+        action: st.actionType === 'DECLARE' ? 'declare' : 'assign',
+        actionType: st.actionType,
+        analogyType: 'generic_memory',
+        from: null,
+        to: st.memoryDelta?.variable || null,
+        explanation: st.consoleOutput
+          ? `Output: ${st.consoleOutput}`
+          : `Executing line ${st.line}: ${st.codeSnippet}`,
+        why: '',
+        stdout: st.consoleOutput,
+        consoleOutput: st.consoleOutput,
+        cumulativeOutput: runOut || null,
+        changes: st.memoryDelta
+          ? [{ name: st.memoryDelta.variable || '', from: st.memoryDelta.oldValue, to: st.memoryDelta.newValue }]
+          : [],
+        variables: st.variables || {},
+        memoryState: st.variables || {},
+        memoryDelta: st.memoryDelta || { variable: null, oldValue: null, newValue: null },
+        fault: null,
+        structure: null,
+        whatHappenedBn: st.consoleOutput
+          ? `আউটপুট: ${st.consoleOutput}`
+          : `লাইন ${st.line} কার্যকর হয়েছে।`,
+        banglaExplanation: st.consoleOutput
+          ? `আউটপুট স্ক্রিনে "${st.consoleOutput}" প্রিন্ট হয়েছে।`
+          : `লাইন ${st.line} (${st.codeSnippet}) কার্যকর হয়েছে।`,
+        logicBuildingBn: '',
+      };
+    });
+  } else if (
+    deterministicTrace.steps.length === 0 &&
+    (realExec.status === 'success' || Boolean(realExec.runtimeError))
+  ) {
+    // Generate fallback steps from executable lines up to crash line (or all lines on success)
     const codeLines = codeToRun.split('\n');
+    const stopLine =
+      realExec.runtimeError && realExec.runtimeErrorLine ? realExec.runtimeErrorLine : codeLines.length;
     const execLines: { line: number; text: string }[] = [];
-    for (let i = 0; i < codeLines.length; i++) {
+    for (let i = 0; i < Math.min(codeLines.length, stopLine); i++) {
       const t = codeLines[i].trim();
       if (
         t &&
@@ -1243,60 +1666,161 @@ export async function generateExecutionTrace(params: {
       }
     }
     const sampleSteps = execLines.slice(0, 30);
-    deterministicTrace.steps = sampleSteps.map((el, idx) => ({
-      stepIndex: idx + 1,
-      step: idx + 1,
-      activeLine: el.line,
-      lineNumber: el.line,
-      codeSnippet: el.text,
-      action: 'assign',
-      actionType: idx === sampleSteps.length - 1 && cleanedStdout ? 'OUTPUT' : 'ASSIGN',
-      analogyType: 'generic_memory',
-      from: null,
-      to: null,
-      explanation:
-        idx === sampleSteps.length - 1 && cleanedStdout
+    deterministicTrace.steps = sampleSteps.map((el, idx) => {
+      const isErrStep = Boolean(realExec.runtimeError) && el.line === stopLine;
+      const isLastSuccessStep = !realExec.runtimeError && idx === sampleSteps.length - 1;
+      return {
+        stepIndex: idx + 1,
+        step: idx + 1,
+        activeLine: el.line,
+        lineNumber: el.line,
+        codeSnippet: el.text,
+        action: 'assign',
+        actionType: isLastSuccessStep && cleanedStdout ? 'OUTPUT' : 'ASSIGN',
+        animationAction: isErrStep ? 'runtime_error' : 'assign',
+        analogyType: 'generic_memory',
+        from: null,
+        to: null,
+        explanation: isErrStep
+          ? realExec.runtimeError || 'Runtime error occurred'
+          : isLastSuccessStep && cleanedStdout
           ? `Program Output: ${cleanedStdout.split('\n')[0]}`
           : `Line ${el.line}: ${el.text}`,
-      why: '',
-      stdout: idx === sampleSteps.length - 1 ? cleanedStdout : null,
-      consoleOutput: idx === sampleSteps.length - 1 ? cleanedStdout : null,
-      changes: [],
-      variables: {},
-      memoryState: {},
-      memoryDelta: { variable: null, oldValue: null, newValue: null },
-      fault: null,
-      structure: null,
-      whatHappenedBn:
-        idx === sampleSteps.length - 1 && cleanedStdout
+        why: isErrStep
+          ? deterministicTrace.errorDetails?.solutionBn || ''
+          : '',
+        stdout: isLastSuccessStep ? cleanedStdout : null,
+        consoleOutput: isLastSuccessStep ? cleanedStdout : null,
+        cumulativeOutput: isLastSuccessStep ? cleanedStdout || null : null,
+        changes: [],
+        variables: {},
+        memoryState: {},
+        memoryDelta: { variable: null, oldValue: null, newValue: null },
+        fault: isErrStep
+          ? {
+              type: 'runtime_exception',
+              message: realExec.runtimeError || 'Runtime exception',
+              fixHint: deterministicTrace.errorDetails?.solutionBn || '',
+            }
+          : null,
+        structure: null,
+        whatHappenedBn: isErrStep
+          ? deterministicTrace.errorDetails?.messageBn || realExec.runtimeError || ''
+          : isLastSuccessStep && cleanedStdout
           ? `প্রোগ্রাম আউটপুট: ${cleanedStdout.split('\n')[0]}`
           : `লাইন ${el.line}: ${el.text}`,
-      logicBuildingBn: '',
-    }));
+        banglaExplanation: isErrStep
+          ? deterministicTrace.errorDetails?.messageBn || realExec.runtimeError || ''
+          : `লাইন ${el.line} কার্যকর হয়েছে: \`${el.text}\``,
+        logicBuildingBn: '',
+      };
+    });
   }
 
-  // Adjust line numbers if boilerplate was prepended
+  // Adjust line numbers cleanly if boilerplate was prepended (discard injected header lines)
   if (prep.injectedPrefixLines > 0) {
-    for (const st of deterministicTrace.steps) {
-      st.activeLine = Math.max(1, st.activeLine - prep.injectedPrefixLines);
-      if (st.lineNumber) st.lineNumber = Math.max(1, st.lineNumber - prep.injectedPrefixLines);
+    deterministicTrace.steps = deterministicTrace.steps
+      .filter((st) => st.activeLine > prep.injectedPrefixLines)
+      .map((st, idx) => ({
+        ...st,
+        stepIndex: idx + 1,
+        step: idx + 1,
+        activeLine: st.activeLine - prep.injectedPrefixLines,
+        lineNumber: st.lineNumber ? Math.max(1, st.lineNumber - prep.injectedPrefixLines) : undefined,
+      }));
+    deterministicTrace.lineNotes = deterministicTrace.lineNotes
+      .filter((ln) => ln.line > prep.injectedPrefixLines)
+      .map((ln) => ({
+        ...ln,
+        line: ln.line - prep.injectedPrefixLines,
+      }));
+  }
+
+  if ((deterministicTrace.verdict?.status as string) !== 'compile_error') {
+    const detComplexity = analyzeCodeComplexity(params.code, params.language, deterministicTrace.steps);
+    deterministicTrace.logicSummary.complexity = {
+      time: detComplexity.time,
+      space: detComplexity.space,
+      note: params.explainLanguage === 'bn' ? detComplexity.noteBn : detComplexity.noteEn,
+    };
+    if (deterministicTrace.programSummary) {
+      deterministicTrace.programSummary.timeComplexity = detComplexity.time;
+      deterministicTrace.programSummary.spaceComplexity = detComplexity.space;
     }
-    for (const ln of deterministicTrace.lineNotes) {
-      ln.line = Math.max(1, ln.line - prep.injectedPrefixLines);
+    const detPitfalls = generateLanguagePitfalls(params.code, params.language, params.explainLanguage);
+    if (detPitfalls.length > 0) {
+      deterministicTrace.logicSummary.commonMistakes = detPitfalls;
+    }
+    if (deterministicTrace.steps.length > 0) {
+      const detExecLines = new Set<number>(deterministicTrace.steps.map((s) => s.activeLine));
+      const detBlocks = analyzeBlockExecution(params.code, params.language, detExecLines);
+      const userLines = params.code.split('\n');
+      const noteMap = new Map(deterministicTrace.lineNotes.map((n) => [n.line, n]));
+      deterministicTrace.lineNotes = userLines
+        .map((raw, idx) => {
+          const t = raw.trim();
+          if (!t) return null;
+          const ln = idx + 1;
+          const existing = noteMap.get(ln);
+          const braceInfo = detBlocks.braceByCloseLine.get(ln);
+          const pythonEndInfo = detBlocks.pythonEndsByLine.get(ln);
+          const isClosingBrace = t === '}' || t === '};';
+          if (existing && !isClosingBrace && detExecLines.has(ln)) {
+            if (
+              params.language === 'python' &&
+              pythonEndInfo?.wasBlockExecuted &&
+              !/ইন্ডেন্টেশন|ব্লক.*শেষ|block/i.test(existing.text)
+            ) {
+              return {
+                ...existing,
+                text:
+                  params.explainLanguage === 'bn'
+                    ? `${existing.text} (এই লাইনের পর \`${pythonEndInfo.kind}\` ব্লকের ইন্ডেন্টেশন শেষ হয়)`
+                    : `${existing.text} (Ends the Python \`${pythonEndInfo.kind}\` block)`,
+              };
+            }
+            return existing;
+          }
+          const aware = buildExecutionAwareLineNote({
+            lineNumber: ln,
+            trimmed: t,
+            language: params.language,
+            explainLanguage: params.explainLanguage,
+            executedLines: detExecLines,
+            braceInfo,
+            pythonEndInfo,
+          });
+          return {
+            line: ln,
+            role: existing?.role || inferLineRole(t),
+            text: aware.text,
+            why: aware.why,
+          };
+        })
+        .filter((n): n is NonNullable<typeof n> => n !== null);
     }
   }
+
+  const taggedRuntimeDiagnostics = realExec.diagnostics.map((d) => ({
+    ...d,
+    line:
+      prep.injectedPrefixLines > 0 && d.line
+        ? Math.max(1, d.line - prep.injectedPrefixLines)
+        : d.line,
+    ...(realExec.runtimeError && d.severity === 'error'
+      ? { source: d.source || ('runtime' as const) }
+      : {}),
+  }));
 
   const combinedDiagnostics: ExecutionDiagnostic[] = [
-    ...toolchainAnalysis.diagnostics,
-    ...realExec.diagnostics,
+    ...adjustedToolchainDiagnostics,
+    ...taggedRuntimeDiagnostics,
     ...initialDiagnostics,
   ];
 
-  // If real execution had fatal compilation failure, halt immediately
-  if (
-    deterministicTrace.hasError ||
-    (deterministicTrace.verdict.status as string) === 'compile_error'
-  ) {
+  // Halt BEFORE Gemini ONLY if real compilation/syntax failed (never skip Gemini just for missing STDIN or runtime exception)
+  if ((deterministicTrace.verdict.status as string) === 'compile_error') {
+    deterministicTrace.errorCategory = 'compile_error';
     return formatResult(deterministicTrace, false, combinedDiagnostics);
   }
 
@@ -1307,32 +1831,39 @@ export async function generateExecutionTrace(params: {
     return formatResult(deterministicTrace, false, combinedDiagnostics);
   }
 
-  const stepPreview =
-    params.language === 'javascript'
-      ? (sandboxResult.recordedSteps || [])
-          .slice(0, 45)
-          .map((st, i) => {
-            const userLine =
-              prep.injectedPrefixLines > 0
-                ? Math.max(1, st.line - prep.injectedPrefixLines)
-                : st.line;
-            return `  Step ${i + 1}: Line ${userLine} [${st.actionType}] (${st.codeSnippet}) -> memoryState=${JSON.stringify(
-              st.variables
-            )}, delta=${JSON.stringify(st.memoryDelta)}${
-              st.consoleOutput ? `, consoleOutput=${JSON.stringify(st.consoleOutput)}` : ''
-            }`;
-          })
-          .join('\n')
-      : '';
+  const rawStepsForPreview =
+    sandboxResult.recordedSteps && sandboxResult.recordedSteps.length > 0
+      ? sandboxResult.recordedSteps.slice(0, 55).map((st, i) => {
+          const userLine =
+            prep.injectedPrefixLines > 0
+              ? Math.max(1, st.line - prep.injectedPrefixLines)
+              : st.line;
+          const condMeta = st.meta?.conditionExpr
+            ? `, cond=${JSON.stringify(st.meta.conditionExpr)} -> ${String(Boolean(st.meta.conditionResult))}`
+            : '';
+          const stdinMeta = st.meta?.stdinRead !== undefined ? `, stdinRead=${JSON.stringify(st.meta.stdinRead)}` : '';
+          return `  Step ${i + 1}: Line ${userLine} [${st.actionType}] (${st.codeSnippet}) -> memoryState=${JSON.stringify(
+            st.variables
+          )}, delta=${JSON.stringify(st.memoryDelta)}${condMeta}${stdinMeta}${
+            st.consoleOutput ? `, consoleOutput=${JSON.stringify(st.consoleOutput)}` : ''
+          }`;
+        })
+      : deterministicTrace.steps.slice(0, 55).map((st, i) =>
+          `  Step ${i + 1}: Line ${st.activeLine} [${st.actionType || st.action}] (${st.codeSnippet || ''}) -> memoryState=${JSON.stringify(
+            st.variables
+          )}`
+        );
+  const stepPreview = rawStepsForPreview.join('\n');
 
   const groundTruthContext = [
     `- Real Compiler Status: Succeeded without errors`,
     `- Real Runtime Exit Code: ${realExec.exitCode}`,
     `- Real Runtime Execution Timed Out: ${realExec.timedOut}`,
     `- Real Runtime Error: ${realExec.runtimeError || 'None'}`,
+    adjustedRuntimeErrorLine ? `- Real Runtime Error Line: ${adjustedRuntimeErrorLine}` : '',
     `- Real Runtime Final Stdout: ${JSON.stringify(cleanedStdout)}`,
     `- Real Runtime Final Variables: ${JSON.stringify(sandboxResult.finalVariables)}`,
-    stepPreview ? `- Real Runtime Recorded Step Sequence:\n${stepPreview}` : '',
+    stepPreview ? `- Real Runtime Recorded Step Sequence (DO NOT SKIP STEPS):\n${stepPreview}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -1341,18 +1872,18 @@ export async function generateExecutionTrace(params: {
     apiKey: process.env.GEMINI_API_KEY,
   });
 
-  const DEPRECATED_MODEL_PREFIXES = ['gemini-2.5-', 'gemini-2.0-', 'gemini-1.5-', 'gemini-1.0-'];
+  const DEPRECATED_MODEL_PREFIXES = ['gemini-2.0-', 'gemini-1.5-', 'gemini-1.0-'];
   const configuredModel = process.env.GEMINI_MODEL?.trim();
   const isDeprecated =
     configuredModel &&
     DEPRECATED_MODEL_PREFIXES.some((prefix) => configuredModel.startsWith(prefix));
-  const primaryModel = !configuredModel || isDeprecated ? 'gemini-3.8-flash' : configuredModel;
+  const primaryModel = !configuredModel || isDeprecated ? 'gemini-2.5-flash' : configuredModel;
   const rawCandidateModels = [
     primaryModel,
+    'gemini-2.5-flash',
     'gemini-3.8-flash',
     'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
-    'gemini-4-argon',
   ].filter((v, i, a) => a.indexOf(v) === i);
 
   const nowMs = Date.now();
@@ -1366,18 +1897,20 @@ export async function generateExecutionTrace(params: {
 
   let lastValidationError = '';
   let abortAllModels = false;
-  const overallDeadline = Date.now() + 24000;
+  const overallDeadline = Date.now() + 45000;
 
   for (const modelName of candidateModels) {
     if (abortAllModels || Date.now() >= overallDeadline) break;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
       const remainingMs = overallDeadline - Date.now();
       if (remainingMs < 1500) break;
       try {
         const promptText =
           attempt === 1
             ? baseUserPrompt
-            : `${baseUserPrompt}\n\nVALIDATION ERROR ON PREVIOUS ATTEMPT:\n${lastValidationError}\nFix the JSON so it strictly passes validation.`;
+            : lastValidationError && !/429|503|UNAVAILABLE|RESOURCE_EXHAUSTED|timeout/i.test(lastValidationError)
+            ? `${baseUserPrompt}\n\nVALIDATION ERROR ON PREVIOUS ATTEMPT:\n${lastValidationError}\nFix the JSON so it strictly passes validation.`
+            : baseUserPrompt;
 
         const response = await ai.models.generateContent({
           model: modelName,
@@ -1387,7 +1920,7 @@ export async function generateExecutionTrace(params: {
             responseMimeType: 'application/json',
             responseSchema: TRACE_RESPONSE_SCHEMA,
             temperature: 0.2,
-            abortSignal: AbortSignal.timeout(Math.min(20000, remainingMs)),
+            abortSignal: AbortSignal.timeout(Math.min(24000, remainingMs)),
           },
         });
 
@@ -1396,25 +1929,38 @@ export async function generateExecutionTrace(params: {
         const normalized = normalizeGeminiRawOutput(
           parsedJson,
           params.language,
-          params.code
+          params.code,
+          params.stdin || '',
+          params.explainLanguage
         );
 
         // Align finalOutput with ground-truth runtime stdout while preserving Gemini's
-        // authentic step-by-step trace, variable transitions, analogyType, and 3D structures.
-        if (!normalized.hasError) {
-          if (cleanedStdout !== '') {
-            normalized.finalOutput = cleanedStdout;
-          }
-          if (normalized.programSummary) {
-            normalized.programSummary.totalExecutionSteps = Array.isArray(normalized.steps)
-              ? normalized.steps.length
-              : 0;
-            normalized.programSummary.finalOutput = normalized.finalOutput;
-          }
+        // authentic step-by-step trace, variable transitions, analogyType, and STDIN tracking.
+        if (cleanedStdout !== '') {
+          normalized.finalOutput = cleanedStdout;
+        }
+        if (realExec.runtimeError && !normalized.hasError) {
+          const errCat = classifyErrorCategory(realExec.runtimeError, false);
+          normalized.hasError = true;
+          normalized.errorCategory = errCat;
+          normalized.verdict = {
+            status: realExec.timedOut ? 'infinite_loop' : 'runtime_error',
+            message: realExec.runtimeError,
+          };
+          normalized.errorDetails = deterministicTrace.errorDetails;
+        }
+        if (normalized.programSummary) {
+          normalized.programSummary.totalExecutionSteps = Array.isArray(normalized.steps)
+            ? normalized.steps.length
+            : 0;
+          normalized.programSummary.finalOutput = normalized.finalOutput;
         }
 
-        if (!normalized.hasError && (!Array.isArray(normalized.steps) || normalized.steps.length === 0)) {
-          lastValidationError = 'Generated trace had 0 steps for valid code.';
+        if (
+          normalized.verdict?.status !== 'compile_error' &&
+          (!Array.isArray(normalized.steps) || normalized.steps.length === 0)
+        ) {
+          lastValidationError = 'Generated trace had 0 steps for compilable code.';
           continue;
         }
 
@@ -1432,35 +1978,62 @@ export async function generateExecutionTrace(params: {
       } catch (err: any) {
         lastValidationError = String(err?.message || err);
         console.warn(`[geminiTraceService] Model ${modelName} attempt ${attempt} failed:`, lastValidationError);
-        if (
-          lastValidationError.includes('429') ||
-          lastValidationError.includes('RESOURCE_EXHAUSTED') ||
+
+        const isDailyQuotaExhausted =
+          lastValidationError.includes('GenerateRequestsPerDay') ||
+          lastValidationError.includes('FreeTier');
+        const isNotFound =
           lastValidationError.includes('404') ||
-          lastValidationError.includes('NOT_FOUND')
-        ) {
-          // Put quota-exhausted or unavailable models on a 5-minute cooldown so subsequent runs skip straight to working fallback models
-          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1000);
-        }
+          lastValidationError.includes('NOT_FOUND');
+        const isTransient =
+          !isDailyQuotaExhausted &&
+          (lastValidationError.includes('429') ||
+            lastValidationError.includes('503') ||
+            lastValidationError.includes('RESOURCE_EXHAUSTED') ||
+            lastValidationError.includes('UNAVAILABLE') ||
+            /timeout|ETIMEDOUT|ECONNRESET|fetch failed/i.test(lastValidationError));
+
         if (
           lastValidationError.includes('403') ||
           lastValidationError.includes('PERMISSION_DENIED') ||
           lastValidationError.includes('API_KEY_INVALID')
         ) {
           abortAllModels = true;
+          break;
+        }
+
+        if (isDailyQuotaExhausted || isNotFound) {
+          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1000);
+          break;
+        }
+
+        if (isTransient && attempt < 3) {
+          const backoffMs = Math.min(
+            remainingMs - 1500,
+            450 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 150)
+          );
+          if (backoffMs > 100) {
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            continue;
+          }
+        }
+
+        if (lastValidationError.includes('429') || lastValidationError.includes('RESOURCE_EXHAUSTED')) {
+          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1000);
+        } else if (lastValidationError.includes('503') || lastValidationError.includes('UNAVAILABLE')) {
+          modelCooldownUntil.set(modelName, Date.now() + 60 * 1000);
         }
         break;
       }
     }
   }
 
+  // Serve deterministic verified runtime trace seamlessly without false "AI is busy" banners
+  if (!deterministicTrace.hasError && deterministicTrace.steps.length > 0) {
+    traceCache.set(hash, { trace: deterministicTrace, createdAt: Date.now() });
+  }
   const fallbackResult = formatResult(deterministicTrace, false, combinedDiagnostics);
-  fallbackResult.apiNotice = {
-    code: 'GEMINI_TEMPORARY_FALLBACK',
-    message_bn:
-      'Gemini AI সাময়িকভাবে ব্যস্ত বা অনুপলব্ধ থাকায় ডিটারমিনিস্টিক রানটাইম ট্রেস দেখানো হচ্ছে। কিছুক্ষণ পর আবার রান করুন।',
-    message_en:
-      'Gemini AI was temporarily unavailable, so the deterministic runtime trace is shown. Please run again shortly.',
-  };
+  fallbackResult.apiNotice = null;
   return fallbackResult;
 }
 

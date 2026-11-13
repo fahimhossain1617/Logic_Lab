@@ -50,6 +50,7 @@ except Exception as e:
     args: ['-c', pyCheckerScript],
     cwd: workspaceDir,
     timeoutMs: 4000,
+    env: { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
   });
 
   let diagnostics: ExecutionDiagnostic[] = [];
@@ -114,13 +115,14 @@ export async function executePython(
 
     const sourceFileName = fileName.endsWith('.py') ? fileName : 'script.py';
 
-    // Execute with unbuffered python (-u)
+    // Execute with unbuffered python (-u) and forced UTF-8 I/O on Windows
     const runRes = await runSandboxedProcess({
       cmd: 'python',
       args: ['-u', sourceFileName],
       cwd: syntaxRes.workspaceDir,
       stdin,
       timeoutMs,
+      env: { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
     });
 
     let runtimeError: string | null = null;

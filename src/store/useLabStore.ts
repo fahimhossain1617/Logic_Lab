@@ -15,6 +15,11 @@ import { SAMPLE_PROGRAMS, resolveTraceForCode } from '../data/sampleTraces';
 import { PROBLEM_LIBRARY } from '../data/problemLibrary';
 import { clampStepIndex, findFirstStepForLine } from '../utils/playerLogic';
 import {
+  detectInputCalls,
+  generateSampleStdin,
+  tokenizeStdin,
+} from '../../shared/stdinHelper';
+import {
   AppUserProfile,
   signInWithGooglePopup,
   completeGoogleRedirectSignIn,
@@ -196,6 +201,13 @@ interface LabState {
   fileName: string;
   code: string;
   stdin: string;
+  stdinSource: 'none' | 'manual' | 'terminal' | 'auto';
+  terminalCollectedInputs: string[];
+  lastTerminalSnapshot: { code: string; stdin: string } | null;
+  stdinPromptOpen: boolean;
+  stdinDraft: string;
+  pendingVisualizeCode: string | null;
+  autoInjectedStdinNotice: { tokens: string[]; raw: string; isAutoSample: boolean } | null;
   consoleOpen: boolean;
   isFastRunning: boolean;
   executionMode: ExecutionMode | null;
@@ -280,6 +292,12 @@ interface LabState {
   loadLibraryProblem: (problemId: string, useFaulty?: boolean) => Promise<void>;
   setCode: (code: string) => void;
   setStdin: (stdin: string) => void;
+  setStdinDraft: (draft: string) => void;
+  requestVisualize: (overrideCode?: string) => Promise<void>;
+  confirmStdinPromptAndVisualize: () => Promise<void>;
+  autoFillSampleAndVisualize: () => Promise<void>;
+  cancelStdinPrompt: () => void;
+  clearAutoInjectedStdinNotice: () => void;
   setCurrentInputValue: (val: string) => void;
   submitTerminalInput: () => Promise<void>;
   stopTerminalSession: () => void;
@@ -291,7 +309,7 @@ interface LabState {
   appendTerminalStdinAndRun: (inputLine: string, overrideCode?: string) => Promise<void>;
   restoreExecutionRecord: (record: CodeExecutionRecord) => void;
   clearRecentExecutions: () => void;
-  runVisualize: (overrideCode?: string) => Promise<void>;
+  runVisualize: (overrideCode?: string, overrideStdin?: string) => Promise<void>;
   toggleBreakpoint: (line: number) => void;
   clearBreakpoints: () => void;
   play: () => void;
@@ -381,6 +399,49 @@ function makeTerminalLineId(): string {
   return `tline-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+interface ClientCachedTrace {
+  trace: ExecutionTrace;
+  diagnostics: ExecutionDiagnostic[];
+  apiNotice?: BilingualMessage | null;
+}
+
+const clientTraceCache = new Map<string, ClientCachedTrace>();
+
+function isCodeDeterministicForCache(code: string): boolean {
+  // Never serve stale cache when code invokes unseeded RNG or current-time APIs
+  if (/\bnew\s+Random\s*\(\s*\)/.test(code)) return false;
+  if (/\bMath\.random\s*\(/.test(code)) return false;
+  if (/\brandom\.(?:randint|random|choice|shuffle|uniform|randrange)\s*\(/.test(code)) return false;
+  if (/\brandom_device\b|\btime\s*\(\s*(?:0|NULL|nullptr)\s*\)|\brand\s*\(\s*\)/.test(code)) return false;
+  return true;
+}
+
+function makeClientCacheKey(params: {
+  code: string;
+  language: SupportedLanguage;
+  explainLanguage: ExplainLanguage;
+  depth: ExplanationDepth;
+  fileName?: string;
+  stdin?: string;
+}): string {
+  return JSON.stringify([
+    params.language,
+    params.explainLanguage,
+    params.depth,
+    params.fileName || '',
+    params.stdin || '',
+    params.code,
+  ]);
+}
+
+function saveClientTraceCache(key: string, entry: ClientCachedTrace) {
+  if (clientTraceCache.size >= 40) {
+    const oldestKey = clientTraceCache.keys().next().value;
+    if (oldestKey) clientTraceCache.delete(oldestKey);
+  }
+  clientTraceCache.set(key, entry);
+}
+
 async function fetchTraceFromApi(
   params: {
     code: string;
@@ -448,11 +509,18 @@ export const useLabStore = create<LabState>((set, get) => ({
   fileName: INITIAL_USER_FILE.fileName,
   code: INITIAL_USER_FILE.code,
   stdin: '',
+  stdinSource: 'none',
+  terminalCollectedInputs: [],
+  lastTerminalSnapshot: null,
   consoleOpen: true,
   isFastRunning: false,
   executionMode: null,
   fastRunResult: null,
   terminalHistory: [],
+  stdinPromptOpen: false,
+  stdinDraft: '',
+  pendingVisualizeCode: null,
+  autoInjectedStdinNotice: null,
   currentPrompt: '',
   currentInputValue: '',
   terminalExecState: 'IDLE',
@@ -728,12 +796,35 @@ export const useLabStore = create<LabState>((set, get) => ({
     const { code, language, depth, hasExecuted, fileName, stdin, user } = get();
     set({ explainLanguage: nextLang });
     if (!hasExecuted || !code.trim()) return;
+    const isDet = isCodeDeterministicForCache(code);
+    const cacheKey = makeClientCacheKey({
+      code,
+      language,
+      explainLanguage: nextLang,
+      depth,
+      fileName,
+      stdin,
+    });
+    if (isDet) {
+      const hit = clientTraceCache.get(cacheKey);
+      if (hit) {
+        set({ trace: hit.trace, apiNotice: null });
+        return;
+      }
+    }
     fetchTraceFromApi(
-      { code, language, explainLanguage: nextLang, depth, fileName, stdin },
+      { code, language, explainLanguage: nextLang, depth, fileName, stdin, bypassCache: !isDet },
       user?.uid
     )
       .then((res) => {
         if (res.trace) {
+          if (isDet && !res.trace.hasError) {
+            saveClientTraceCache(cacheKey, {
+              trace: res.trace,
+              diagnostics: res.diagnostics || [],
+              apiNotice: res.apiNotice || null,
+            });
+          }
           set({ trace: res.trace, apiNotice: null });
         }
       })
@@ -744,9 +835,35 @@ export const useLabStore = create<LabState>((set, get) => ({
     const { code, language, explainLanguage, hasExecuted, fileName, stdin, user } = get();
     set({ depth });
     if (!hasExecuted || !code.trim()) return;
-    fetchTraceFromApi({ code, language, explainLanguage, depth, fileName, stdin }, user?.uid)
+    const isDet = isCodeDeterministicForCache(code);
+    const cacheKey = makeClientCacheKey({
+      code,
+      language,
+      explainLanguage,
+      depth,
+      fileName,
+      stdin,
+    });
+    if (isDet) {
+      const hit = clientTraceCache.get(cacheKey);
+      if (hit) {
+        set({ trace: hit.trace, apiNotice: null });
+        return;
+      }
+    }
+    fetchTraceFromApi(
+      { code, language, explainLanguage, depth, fileName, stdin, bypassCache: !isDet },
+      user?.uid
+    )
       .then((res) => {
         if (res.trace) {
+          if (isDet && !res.trace.hasError) {
+            saveClientTraceCache(cacheKey, {
+              trace: res.trace,
+              diagnostics: res.diagnostics || [],
+              apiNotice: res.apiNotice || null,
+            });
+          }
           set({ trace: res.trace, apiNotice: null });
         }
       })
@@ -925,6 +1042,10 @@ export const useLabStore = create<LabState>((set, get) => ({
     const updated = userFiles.map((f) => (f.id === activeFileId ? { ...f, code: emptyCode } : f));
     set({
       code: emptyCode,
+      stdin: get().stdinSource === 'manual' ? get().stdin : '',
+      stdinSource: get().stdinSource === 'manual' ? 'manual' : 'none',
+      terminalCollectedInputs: [],
+      lastTerminalSnapshot: null,
       userFiles: updated,
       hasExecuted: false,
       trace: EMPTY_INITIAL_TRACE,
@@ -939,7 +1060,85 @@ export const useLabStore = create<LabState>((set, get) => ({
     });
   },
 
-  setStdin: (stdin) => set({ stdin }),
+  setStdin: (stdin) =>
+    set({
+      stdin,
+      stdinSource: stdin.trim() ? 'manual' : 'none',
+      autoInjectedStdinNotice: null,
+    }),
+  setStdinDraft: (stdinDraft) => set({ stdinDraft }),
+  clearAutoInjectedStdinNotice: () => set({ autoInjectedStdinNotice: null }),
+  cancelStdinPrompt: () =>
+    set({ stdinPromptOpen: false, pendingVisualizeCode: null }),
+  requestVisualize: async (overrideCode?: string) => {
+    const state = get();
+    const targetCode = typeof overrideCode === 'string' ? overrideCode : state.code;
+    let effectiveLang = state.language;
+    if (
+      effectiveLang === 'javascript' &&
+      state.fileName === 'main.js' &&
+      (/\bpublic\s+class\s+[A-Za-z_$]/.test(targetCode) ||
+        /\bSystem\.out\.print/.test(targetCode))
+    ) {
+      effectiveLang = 'java';
+    }
+    const detectedInputs = targetCode.trim()
+      ? detectInputCalls(targetCode, effectiveLang)
+      : [];
+    if (detectedInputs.length > 0 && !state.stdin.trim()) {
+      const sample = generateSampleStdin(targetCode, effectiveLang);
+      set({
+        stdinPromptOpen: true,
+        stdinDraft: sample,
+        pendingVisualizeCode: targetCode,
+        consoleOpen: true,
+      });
+      return;
+    }
+    await get().runVisualize(targetCode, state.stdin);
+  },
+  confirmStdinPromptAndVisualize: async () => {
+    const { stdinDraft, pendingVisualizeCode, code } = get();
+    const chosenCode = pendingVisualizeCode ?? code;
+    const finalStdin = stdinDraft;
+    const tokens = tokenizeStdin(finalStdin);
+    set({
+      stdin: finalStdin,
+      stdinSource: finalStdin.trim() ? 'manual' : 'none',
+      stdinPromptOpen: false,
+      pendingVisualizeCode: null,
+      autoInjectedStdinNotice:
+        tokens.length > 0
+          ? { tokens, raw: finalStdin, isAutoSample: false }
+          : null,
+    });
+    await get().runVisualize(chosenCode, finalStdin);
+  },
+  autoFillSampleAndVisualize: async () => {
+    const { pendingVisualizeCode, code, language, fileName } = get();
+    const chosenCode = pendingVisualizeCode ?? code;
+    let effectiveLang = language;
+    if (
+      effectiveLang === 'javascript' &&
+      fileName === 'main.js' &&
+      (/\bpublic\s+class\s+[A-Za-z_$]/.test(chosenCode) ||
+        /\bSystem\.out\.print/.test(chosenCode))
+    ) {
+      effectiveLang = 'java';
+    }
+    const sample = generateSampleStdin(chosenCode, effectiveLang) || '10\n5\n+';
+    const tokens = tokenizeStdin(sample);
+    set({
+      stdin: sample,
+      stdinSource: 'auto',
+      stdinDraft: sample,
+      stdinPromptOpen: false,
+      pendingVisualizeCode: null,
+      consoleOpen: true,
+      autoInjectedStdinNotice: { tokens, raw: sample, isAutoSample: true },
+    });
+    await get().runVisualize(chosenCode, sample);
+  },
   setCurrentInputValue: (currentInputValue) => set({ currentInputValue }),
   stopTerminalSession: () => {
     closeActiveEventSource();
@@ -976,6 +1175,8 @@ export const useLabStore = create<LabState>((set, get) => ({
       currentInputValue: '',
       terminalExecState: 'IDLE',
       activeSessionId: null,
+      terminalCollectedInputs: [],
+      lastTerminalSnapshot: null,
       isFastRunning: false,
       diagnostics: [],
       executionStatus: 'idle',
@@ -1059,7 +1260,17 @@ export const useLabStore = create<LabState>((set, get) => ({
     const controller = new AbortController();
     fastAbortController = controller;
 
-    let { code, stdin, language, fileName, user, userFiles, activeFileId, explainLanguage } = get();
+    let {
+      code,
+      stdin,
+      stdinSource,
+      language,
+      fileName,
+      user,
+      userFiles,
+      activeFileId,
+      explainLanguage,
+    } = get();
 
     if (typeof overrideCode === 'string') {
       code = overrideCode;
@@ -1068,7 +1279,25 @@ export const useLabStore = create<LabState>((set, get) => ({
     }
     if (typeof overrideStdin === 'string') {
       stdin = overrideStdin;
-      set({ stdin });
+      set({
+        stdin,
+        stdinSource: stdin.trim() ? 'manual' : 'none',
+        terminalCollectedInputs: [],
+        lastTerminalSnapshot: null,
+      });
+    } else if (stdinSource !== 'manual') {
+      // Fresh interactive run: clear previous terminal/auto-sample inputs so user enters live inputs
+      stdin = '';
+      set({
+        stdin: '',
+        stdinDraft: '',
+        stdinSource: 'none',
+        terminalCollectedInputs: [],
+        lastTerminalSnapshot: null,
+        autoInjectedStdinNotice: null,
+      });
+    } else {
+      set({ terminalCollectedInputs: [], lastTerminalSnapshot: null });
     }
 
     set({
@@ -1475,6 +1704,13 @@ export const useLabStore = create<LabState>((set, get) => ({
                     : `Execution timed out (${executionTimeMs}ms). Possible infinite loop.`,
               });
             }
+            const usedStdinNormalized = String(payload.stdinUsed || '')
+              .replace(/\r\n/g, '\n')
+              .replace(/\n$/, '');
+            const shouldSyncTerminalStdin =
+              s.terminalCollectedInputs.length > 0 ||
+              (s.stdinSource !== 'manual' && usedStdinNormalized.length > 0);
+            const nextStdin = shouldSyncTerminalStdin ? usedStdinNormalized : s.stdin;
             return {
               isFastRunning: false,
               activeSessionId: null,
@@ -1485,6 +1721,15 @@ export const useLabStore = create<LabState>((set, get) => ({
               fastRunResult: fastRes,
               diagnostics: exitDiags,
               executionStatus: fastExecStatus,
+              ...(shouldSyncTerminalStdin
+                ? {
+                    stdin: nextStdin,
+                    stdinDraft: nextStdin,
+                    stdinSource: nextStdin.trim() ? 'terminal' : 'none',
+                    autoInjectedStdinNotice: null,
+                  }
+                : {}),
+              lastTerminalSnapshot: { code, stdin: nextStdin },
             };
           });
 
@@ -1549,22 +1794,32 @@ export const useLabStore = create<LabState>((set, get) => ({
     if (!activeSessionId || terminalExecState !== 'WAITING_FOR_INPUT') return;
 
     const answer = currentInputValue;
-    set((s) => ({
-      terminalHistory: [
-        ...s.terminalHistory,
-        {
-          id: makeTerminalLineId(),
-          type: 'prompt-answered',
-          text: `${currentPrompt}${answer}`,
-          prompt: currentPrompt,
-          answer,
-        },
-      ],
-      currentPrompt: '',
-      currentInputValue: '',
-      terminalExecState: 'RUNNING',
-      isFastRunning: true,
-    }));
+    set((s) => {
+      const nextCollected = [...s.terminalCollectedInputs, answer];
+      const nextStdin = nextCollected.join('\n');
+      return {
+        terminalHistory: [
+          ...s.terminalHistory,
+          {
+            id: makeTerminalLineId(),
+            type: 'prompt-answered',
+            text: `${currentPrompt}${answer}`,
+            prompt: currentPrompt,
+            answer,
+          },
+        ],
+        terminalCollectedInputs: nextCollected,
+        stdin: nextStdin,
+        stdinDraft: nextStdin,
+        stdinSource: 'terminal',
+        autoInjectedStdinNotice: null,
+        lastTerminalSnapshot: { code: s.code, stdin: nextStdin },
+        currentPrompt: '',
+        currentInputValue: '',
+        terminalExecState: 'RUNNING',
+        isFastRunning: true,
+      };
+    });
 
     try {
       await fetch('/api/execute/input', {
@@ -1585,7 +1840,7 @@ export const useLabStore = create<LabState>((set, get) => ({
     await get().runFast(overrideCode, nextStdin);
   },
 
-  runVisualize: async (overrideCode?: string) => {
+  runVisualize: async (overrideCode?: string, overrideStdin?: string) => {
     // 1. Abort any previous hanging execution/Gemini requests
     if (activeAbortController) {
       activeAbortController.abort();
@@ -1609,6 +1864,11 @@ export const useLabStore = create<LabState>((set, get) => ({
     } = get();
 
     const explainStartedAt = Date.now();
+
+    if (typeof overrideStdin === 'string') {
+      stdin = overrideStdin;
+      set({ stdin });
+    }
 
     if (typeof overrideCode === 'string') {
       code = overrideCode;
@@ -1685,6 +1945,17 @@ export const useLabStore = create<LabState>((set, get) => ({
       set({ language, fileName, userFiles: updatedFiles });
     }
 
+    const isDet = isCodeDeterministicForCache(code);
+    const cacheKey = makeClientCacheKey({
+      code,
+      language,
+      explainLanguage,
+      depth,
+      fileName,
+      stdin,
+    });
+    const cachedClientHit = isDet ? clientTraceCache.get(cacheKey) : undefined;
+
     const stage2Timer = setTimeout(() => {
       if (get().isTracing) set({ traceProgressStage: 2 });
     }, 60);
@@ -1694,11 +1965,17 @@ export const useLabStore = create<LabState>((set, get) => ({
     }, 120);
 
     try {
-      const apiRes = await fetchTraceFromApi(
-        { code, language, explainLanguage, depth, fileName, stdin, bypassCache: true },
-        user?.uid,
-        currentAbortController.signal
-      );
+      const apiRes = cachedClientHit
+        ? {
+            trace: cachedClientHit.trace,
+            diagnostics: cachedClientHit.diagnostics,
+            apiNotice: cachedClientHit.apiNotice ?? null,
+          }
+        : await fetchTraceFromApi(
+            { code, language, explainLanguage, depth, fileName, stdin, bypassCache: !isDet },
+            user?.uid,
+            currentAbortController.signal
+          );
 
       clearTimeout(stage2Timer);
       clearTimeout(stage3Timer);
@@ -1719,9 +1996,13 @@ export const useLabStore = create<LabState>((set, get) => ({
         : hasWarnings
         ? 'warning'
         : 'success';
-      const canRun = apiRes.canRun ?? !hasErrors;
+      const hasPlayableSteps = Boolean(apiRes.trace?.steps && apiRes.trace.steps.length > 0);
+      const isCompileError =
+        Boolean(apiRes.error && !apiRes.trace) ||
+        apiRes.trace?.verdict.status === 'compile_error' ||
+        !hasPlayableSteps;
 
-      if (hasErrors) {
+      if (hasErrors && isCompileError) {
         const errMsg =
           apiRes.trace?.errorDetails?.message ||
           apiRes.error?.message_en ||
@@ -1733,7 +2014,7 @@ export const useLabStore = create<LabState>((set, get) => ({
           traceProgressStage: 0,
           fastRunResult: {
             success: false,
-            stdout: '',
+            stdout: apiRes.trace?.finalOutput || '',
             stderr: errMsg,
             exitCode: 1,
             executionTimeMs: Math.max(1, Date.now() - explainStartedAt),
@@ -1750,7 +2031,7 @@ export const useLabStore = create<LabState>((set, get) => ({
             message_bn:
               apiRes.trace?.errorDetails?.messageBn ||
               apiRes.trace?.verdict.message ||
-              'কোড কম্পাইল বা রান করতে ত্রুটি হয়েছে।',
+              'কোড কম্পাইল বা সিনট্যাক্স ত্রুটি হয়েছে।',
             message_en: errMsg,
           },
           executionStatus: 'error',
@@ -1759,6 +2040,7 @@ export const useLabStore = create<LabState>((set, get) => ({
           trace: apiRes.trace || {
             ...EMPTY_INITIAL_TRACE,
             hasError: true,
+            errorCategory: 'compile_error',
             isValidLogic: false,
             errorDetails: null,
             verdict: {
@@ -1773,8 +2055,63 @@ export const useLabStore = create<LabState>((set, get) => ({
         return;
       }
 
+      if (hasErrors && !isCompileError && apiRes.trace) {
+        const runtimeTrace = apiRes.trace;
+        runtimeTrace.status = 'error';
+        runtimeTrace.diagnostics = diagnostics;
+        const errMsg =
+          runtimeTrace.errorDetails?.message ||
+          runtimeTrace.verdict.message ||
+          'Runtime error encountered.';
+        const errCat = runtimeTrace.errorCategory || 'runtime_error';
+        set({
+          hasExecuted: true,
+          isTracing: false,
+          traceProgressStage: 0,
+          currentStepIndex: 0,
+          prevStepIndex: 0,
+          isPlaying: false,
+          executionStatus: 'error',
+          canRun: true,
+          diagnostics,
+          apiNotice: apiRes.apiNotice || null,
+          apiError: {
+            code: errCat === 'input_error' ? 'INPUT_ERROR' : 'RUNTIME_ERROR',
+            message_bn:
+              runtimeTrace.errorDetails?.messageBn ||
+              (errCat === 'input_error'
+                ? 'ইনপুট (STDIN) অনুপস্থিত বা অপর্যাপ্ত থাকায় রানটাইম ত্রুটি হয়েছে।'
+                : 'কোড রান করার সময় রানটাইম ত্রুটি হয়েছে।'),
+            message_en: errMsg,
+          },
+          fastRunResult: {
+            success: false,
+            stdout: runtimeTrace.finalOutput || '',
+            stderr: errMsg,
+            exitCode: 1,
+            executionTimeMs: Math.max(1, Date.now() - explainStartedAt),
+            language,
+            stdinUsed: stdin,
+            timestamp: new Date().toLocaleTimeString('en-US', {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            diagnostics,
+          },
+          trace: runtimeTrace,
+        });
+        return;
+      }
+
       if (apiRes.trace) {
         const nextTrace = apiRes.trace;
+        if (isDet && !cachedClientHit && !nextTrace.hasError && nextTrace.steps.length > 0) {
+          saveClientTraceCache(cacheKey, {
+            trace: nextTrace,
+            diagnostics,
+            apiNotice: apiRes.apiNotice || null,
+          });
+        }
         nextTrace.status = executionStatus;
         nextTrace.diagnostics = diagnostics;
 
@@ -2034,7 +2371,9 @@ export const useLabStore = create<LabState>((set, get) => ({
     }
   },
 
-  setSpeed: () => set({ speed: 1 }),
+  setSpeed: () => {
+    set({ speed: 1 });
+  },
 
   setReduceMotion: (reduceMotion) => {
     if (typeof document !== 'undefined') {

@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 
 export interface ProcessRunOptions {
   cmd: string;
@@ -128,11 +129,17 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
       });
 
       let finished = false;
+      const stdoutDecoder = new StringDecoder('utf8');
+      const stderrDecoder = new StringDecoder('utf8');
 
       const finish = (exitCode: number | null) => {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        const tailOut = stdoutDecoder.end();
+        const tailErr = stderrDecoder.end();
+        if (tailOut && stdoutData.length < maxBufferBytes) stdoutData += tailOut;
+        if (tailErr && stderrData.length < maxBufferBytes) stderrData += tailErr;
         resolve({
           stdout: stdoutData,
           stderr: stderrData,
@@ -163,13 +170,13 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
 
       childProcess.stdout.on('data', (chunk: Buffer) => {
         if (stdoutData.length < maxBufferBytes) {
-          stdoutData += chunk.toString('utf8');
+          stdoutData += stdoutDecoder.write(chunk);
         }
       });
 
       childProcess.stderr.on('data', (chunk: Buffer) => {
         if (stderrData.length < maxBufferBytes) {
-          stderrData += chunk.toString('utf8');
+          stderrData += stderrDecoder.write(chunk);
         }
       });
 
@@ -186,7 +193,8 @@ export async function runSandboxedProcess(options: ProcessRunOptions): Promise<P
       if (stdin) {
         const normalizedStdin = stdin.replace(/\r\n/g, '\n');
         childProcess.stdin.write(
-          normalizedStdin.endsWith('\n') ? normalizedStdin : `${normalizedStdin}\n`
+          normalizedStdin.endsWith('\n') ? normalizedStdin : `${normalizedStdin}\n`,
+          'utf8'
         );
       }
       childProcess.stdin.end();

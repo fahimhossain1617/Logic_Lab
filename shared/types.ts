@@ -60,7 +60,8 @@ export type FaultType =
   | 'null_pointer'
   | 'stack_overflow'
   | 'off_by_one'
-  | 'type_error';
+  | 'type_error'
+  | 'runtime_exception';
 
 export type VerdictStatus =
   | 'ok'
@@ -162,6 +163,28 @@ export interface ProgramSummary {
   finalOutput: string;
 }
 
+export interface StdinConsumption {
+  token: string;
+  targetVar?: string | null;
+  targetType?: string | null;
+  bufferIndex?: number | null;
+  remainingTokens?: string[] | null;
+}
+
+export interface ConditionEvaluation {
+  expression: string;
+  result: boolean | string;
+  branchTaken?: string | null;
+  kind?: 'if' | 'else_if' | 'else' | 'switch' | 'loop' | 'ternary' | null;
+  casesChecked?: Array<{ label: string; matched: boolean }> | null;
+}
+
+export interface LoopStepInfo {
+  iteration: number;
+  conditionText?: string | null;
+  continuing: boolean;
+}
+
 export interface TraceStep {
   stepIndex: number;
   activeLine: number;
@@ -190,6 +213,14 @@ export interface TraceStep {
   whyAndLogic?: string;
   variableSnapshots?: VariableSnapshot[] | null;
   visualCue?: VisualCue | null;
+  // Enhanced visualization & Bangla AI trace fields
+  stdinConsumed?: StdinConsumption | null;
+  conditionEval?: ConditionEvaluation | null;
+  loopInfo?: LoopStepInfo | null;
+  animationAction?: string | null;
+  banglaExplanation?: string | null;
+  cumulativeOutput?: string | null;
+  variablesState?: Record<string, any> | null;
 }
 
 export interface LineNote {
@@ -242,7 +273,9 @@ export interface ExecutionResultPayload {
 export type CompilationErrorType =
   | 'COMPILATION_ERROR'
   | 'SYNTAX_ERROR'
-  | 'FILE_NAME_MISMATCH';
+  | 'FILE_NAME_MISMATCH'
+  | 'RUNTIME_ERROR'
+  | 'INPUT_ERROR';
 
 export interface TraceErrorDetails {
   errorType?: CompilationErrorType;
@@ -256,6 +289,9 @@ export interface TraceErrorDetails {
 
 export interface ExecutionTrace {
   hasError?: boolean;
+  errorCategory?: 'compile_error' | 'runtime_error' | 'input_error' | null;
+  stdinUsed?: string | null;
+  stdinTokens?: string[] | null;
   isValidLogic: boolean;
   errorDetails: TraceErrorDetails | null;
   language: SupportedLanguage;

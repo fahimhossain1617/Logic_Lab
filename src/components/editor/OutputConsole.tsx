@@ -14,9 +14,11 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
   onJumpToDiagnostic,
 }) => {
   const {
+    code,
     fileName,
     explainLanguage,
     stdin,
+    lastTerminalSnapshot,
     consoleOpen,
     isFastRunning,
     isTracing,
@@ -32,6 +34,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
     apiError,
     diagnostics,
     executionStatus,
+    autoInjectedStdinNotice,
     setStdin,
     setCurrentInputValue,
     submitTerminalInput,
@@ -81,8 +84,14 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
     (executionStatus === 'warning' || diagnostics.some((d) => d.severity === 'warning'));
 
   const stdoutText = trace.finalOutput;
-  const showTraceExplanation =
-    executionMode === 'explain' && hasExecuted && Boolean(trace.outputExplanation);
+  const hasSyncedTerminalSession =
+    executionMode === 'explain' &&
+    hasExecuted &&
+    !isCompileError &&
+    Boolean(lastTerminalSnapshot) &&
+    lastTerminalSnapshot!.code === code &&
+    lastTerminalSnapshot!.stdin === stdin &&
+    terminalHistory.length > 0;
 
   // Auto-focus inline input whenever waiting for user input
   useEffect(() => {
@@ -199,9 +208,17 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
               data-testid="console-status-badge"
             >
               {isCompileError
-                ? explainLanguage === 'bn'
-                  ? 'ত্রুটি'
-                  : 'Error'
+                ? trace.verdict.status === 'runtime_error' || trace.verdict.status === 'infinite_loop'
+                  ? explainLanguage === 'bn'
+                    ? trace.errorCategory === 'input_error'
+                      ? 'ইনপুট ত্রুটি'
+                      : 'রানটাইম ত্রুটি'
+                    : trace.errorCategory === 'input_error'
+                    ? 'Input Error'
+                    : 'Runtime Error'
+                  : explainLanguage === 'bn'
+                  ? 'কম্পাইল ত্রুটি'
+                  : 'Compile Error'
                 : hasWarnings
                 ? explainLanguage === 'bn'
                   ? 'সতর্কতা'
@@ -214,7 +231,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
         </div>
 
         <div className="flex items-center gap-2.5 shrink-0">
-          {hasExecuted && !isCompileError && !isBusy && trace.steps.length > 0 && (
+          {hasExecuted && trace.verdict.status !== 'compile_error' && !isBusy && trace.steps.length > 0 && (
             <span
               className="text-xs font-mono text-[var(--text-secondary)]"
               data-testid="total-steps-badge"
@@ -267,6 +284,22 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
           >
             {activeTab === 'stdin' ? (
               <div className="p-1 space-y-2 select-text" onClick={(e) => e.stopPropagation()}>
+                {autoInjectedStdinNotice && (
+                  <div
+                    className="px-2.5 py-1.5 rounded-lg bg-[#10B981]/10 border border-[#10B981]/35 text-[11px] font-mono text-[#34D399] flex flex-wrap items-center justify-between gap-2"
+                    data-testid="auto-stdin-notice"
+                  >
+                    <span>
+                      {explainLanguage === 'bn'
+                        ? autoInjectedStdinNotice.isAutoSample
+                          ? `অটো স্যাম্পল ইনপুট যুক্ত হয়েছে: [${autoInjectedStdinNotice.tokens.join(', ')}] — চাইলে পরিবর্তন করতে পারেন।`
+                          : `STDIN ইনপুট যুক্ত হয়েছে: [${autoInjectedStdinNotice.tokens.join(', ')}]`
+                        : autoInjectedStdinNotice.isAutoSample
+                        ? `Auto-sample STDIN injected: [${autoInjectedStdinNotice.tokens.join(', ')}]`
+                        : `STDIN applied: [${autoInjectedStdinNotice.tokens.join(', ')}]`}
+                    </span>
+                  </div>
+                )}
                 <div className="flex items-center justify-between text-xs font-mono text-slate-400">
                   <span>
                     {explainLanguage === 'bn'
@@ -357,6 +390,11 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                 </div>
               ) : isCompileError ? (
                 <div className="space-y-2" role="alert" data-testid="output-error-state">
+                  {stdoutText && (
+                    <pre className="m-0 pb-2 border-b border-[var(--border-subtle)] whitespace-pre-wrap break-words text-xs font-mono text-slate-300">
+                      {stdoutText}
+                    </pre>
+                  )}
                   {trace.errorDetails && (
                     <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
                       <span className="px-2 py-0.5 rounded bg-[#EF4444]/15 text-[var(--text-danger)] font-bold">
@@ -396,8 +434,42 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                   )}
                 </div>
               ) : (
-                <div className="space-y-2" data-testid="output-success-state">
-                  {stdoutText ? (
+                <div className="space-y-0.5" data-testid="output-success-state">
+                  {hasSyncedTerminalSession ? (
+                    terminalHistory.map((line) => {
+                      if (line.type === 'prompt-answered') {
+                        return (
+                          <div
+                            key={line.id}
+                            className="whitespace-pre-wrap break-words leading-relaxed"
+                          >
+                            {line.prompt && (
+                              <span className="text-emerald-300 font-semibold">{line.prompt}</span>
+                            )}
+                            <span className="text-cyan-300 font-semibold">{line.answer}</span>
+                          </div>
+                        );
+                      }
+                      if (line.type === 'error') {
+                        return (
+                          <div
+                            key={line.id}
+                            className="whitespace-pre-wrap break-words text-rose-400 leading-relaxed"
+                          >
+                            {line.text || '\u00A0'}
+                          </div>
+                        );
+                      }
+                      return (
+                        <div
+                          key={line.id}
+                          className="whitespace-pre-wrap break-words text-emerald-300 font-semibold leading-relaxed"
+                        >
+                          {line.text || '\u00A0'}
+                        </div>
+                      );
+                    })
+                  ) : stdoutText ? (
                     <pre className="m-0 whitespace-pre-wrap break-words text-xs sm:text-sm font-semibold text-emerald-300 leading-relaxed font-mono">
                       {stdoutText}
                     </pre>
@@ -407,14 +479,6 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                         ? '(প্রোগ্রামটি কোনো আউটপুট প্রিন্ট করেনি)'
                         : '(Program produced no stdout output)'}
                     </div>
-                  )}
-                  {showTraceExplanation && (
-                    <p
-                      lang={explainLanguage}
-                      className="text-xs text-[var(--text-secondary)] leading-relaxed m-0 pt-2 border-t border-[var(--border-subtle)] font-sans"
-                    >
-                      {trace.outputExplanation}
-                    </p>
                   )}
                 </div>
               )

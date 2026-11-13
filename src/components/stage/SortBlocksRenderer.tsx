@@ -56,6 +56,19 @@ export const SortBlocksRenderer: React.FC<SortBlocksRendererProps> = ({
             : '3D Sliding Height Blocks'}
         </span>
         <div className="flex items-center gap-3 font-mono text-[11px] font-semibold">
+          {highlight.length >= 2 &&
+            rawValues[highlight[0]] !== undefined &&
+            rawValues[highlight[1]] !== undefined && (
+              <span className="px-2 py-0.5 rounded bg-[#3B82F6]/15 border border-[#3B82F6]/40 text-[#93C5FD]">
+                {String(rawValues[highlight[0]])}{' '}
+                {Number(rawValues[highlight[0]]) > Number(rawValues[highlight[1]])
+                  ? '>'
+                  : Number(rawValues[highlight[0]]) < Number(rawValues[highlight[1]])
+                  ? '<'
+                  : '=='}{' '}
+                {String(rawValues[highlight[1]])}
+              </span>
+            )}
           <span className="px-2 py-0.5 rounded bg-[var(--bg-gutter)] text-[var(--text-warning)] border border-[var(--border-subtle)]">Compare</span>
           <span className="px-2 py-0.5 rounded bg-[var(--bg-gutter)] text-[var(--text-accent)] border border-[var(--border-subtle)]">Swap</span>
           <span className="px-2 py-0.5 rounded bg-[var(--bg-gutter)] text-[var(--text-success)] border border-[var(--border-subtle)]">Sorted</span>

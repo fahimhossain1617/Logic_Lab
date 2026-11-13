@@ -81,7 +81,7 @@ test('Auth session endpoints manage authenticated users, history wipe, and logou
   }
 });
 
-test('Guest mode allows code execution without saving history and locks playback speed at 1x', async () => {
+test('Guest mode allows code execution without saving history and keeps playback speed hardcoded to 1x', async () => {
   // Reset store cleanly in Node environment
   useLabStore.setState({
     user: null,
@@ -91,8 +91,12 @@ test('Guest mode allows code execution without saving history and locks playback
     activeRoute: '/',
   });
 
-  // 1. Speed stays locked at 1x
+  // 1. Playback speed is hardcoded to 1x permanently
   useLabStore.getState().setSpeed(2);
+  assert.equal(useLabStore.getState().speed, 1);
+  useLabStore.getState().setSpeed(0.5);
+  assert.equal(useLabStore.getState().speed, 1);
+  useLabStore.getState().setSpeed(1);
   assert.equal(useLabStore.getState().speed, 1);
 
   // 2. Login route navigation & Continue as Guest work properly

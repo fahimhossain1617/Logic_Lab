@@ -15,6 +15,7 @@ import { SAMPLE_PROGRAMS } from '../../../src/data/sampleTraces';
 import { PROBLEM_LIBRARY } from '../../../src/data/problemLibrary';
 import { runDeterministicMultiLanguage } from '../tracers/realExecutionRunner';
 import { analyzeCode, executeCode } from '../services/toolchains/toolchainManager';
+import { getToolchainAvailability } from '../services/toolchains/sandbox';
 import {
   sendSessionInput,
   startInteractiveSession,
@@ -242,11 +243,18 @@ function resolveUid(req: Request): string {
   return 'guest-local';
 }
 
-apiRouter.get('/health', (_req: Request, res: Response) => {
+apiRouter.get('/health', async (_req: Request, res: Response) => {
+  const availability = await getToolchainAvailability();
   res.json({
     status: 'ok',
     service: 'logic-lab-api',
     geminiConfigured: isGeminiKeyConfigured(),
+    toolchains: {
+      java: Boolean(availability.javac && availability.java),
+      cpp: Boolean(availability['g++']),
+      python: Boolean(availability.python),
+      javascript: Boolean(availability.node),
+    },
     cacheSize: getCacheSize(),
     problemsCount: PROBLEM_LIBRARY.length,
     sharesCount: sharesById.size,

@@ -7065,11 +7065,178 @@ import path2 from "node:path";
 
 // server/src/services/toolchains/sandbox.ts
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+var executableCache = /* @__PURE__ */ new Map();
+function isExecutableFile(filePath) {
+  try {
+    const stat = fsSync.statSync(filePath);
+    if (!stat.isFile()) return false;
+    if (process.platform === "win32" && stat.size === 0) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function findInDir(dir, names) {
+  if (!dir) return null;
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  for (const name of names) {
+    for (const ext of exts) {
+      const candidate = name.toLowerCase().endsWith(ext) ? path.join(dir, name) : path.join(dir, `${name}${ext}`);
+      if (isExecutableFile(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+function listSubdirBins(parentDir, prefixPattern) {
+  try {
+    if (!fsSync.existsSync(parentDir)) return [];
+    const entries = fsSync.readdirSync(parentDir, { withFileTypes: true }).filter((d) => d.isDirectory() && (!prefixPattern || prefixPattern.test(d.name))).map((d) => d.name).sort().reverse();
+    const bins = [];
+    for (const name of entries) {
+      bins.push(path.join(parentDir, name, "bin"));
+      if (process.platform === "darwin") {
+        bins.push(path.join(parentDir, name, "Contents", "Home", "bin"));
+      }
+    }
+    return bins;
+  } catch {
+    return [];
+  }
+}
+function getStandardSearchDirs(tool) {
+  const isWin = process.platform === "win32";
+  const dirs = [];
+  if (tool === "javac" || tool === "java") {
+    if (process.env.JAVA_HOME?.trim()) {
+      dirs.push(path.join(process.env.JAVA_HOME.trim(), "bin"));
+    }
+    if (isWin) {
+      const pf = process.env.ProgramFiles || "C:\\Program Files";
+      const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+      dirs.push(
+        path.join(pf, "Common Files", "Oracle", "Java", "javapath"),
+        path.join(pf86, "Common Files", "Oracle", "Java", "javapath"),
+        ...listSubdirBins(path.join(pf, "Java")),
+        ...listSubdirBins(path.join(pf, "Eclipse Adoptium")),
+        ...listSubdirBins(path.join(pf, "Microsoft")),
+        ...listSubdirBins(path.join(pf, "Amazon Corretto")),
+        ...listSubdirBins(path.join(pf, "Zulu")),
+        ...listSubdirBins(path.join(pf, "BellSoft"))
+      );
+    } else {
+      dirs.push(
+        "/usr/bin",
+        "/usr/local/bin",
+        ...listSubdirBins("/usr/lib/jvm"),
+        ...listSubdirBins("/Library/Java/JavaVirtualMachines"),
+        ...listSubdirBins("/opt/homebrew/opt", /^openjdk/)
+      );
+    }
+  } else if (tool === "g++") {
+    if (isWin) {
+      dirs.push(
+        "C:\\MinGW\\bin",
+        "C:\\msys64\\ucrt64\\bin",
+        "C:\\msys64\\mingw64\\bin",
+        "C:\\msys64\\mingw32\\bin",
+        "C:\\TDM-GCC-64\\bin"
+      );
+    } else {
+      dirs.push("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin");
+    }
+  } else if (tool === "python") {
+    if (isWin) {
+      const localApp = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+      dirs.push(
+        path.join(localApp, "Python", "bin"),
+        ...listSubdirBins(path.join(localApp, "Programs", "Python")).map((b) => path.dirname(b))
+      );
+    } else {
+      dirs.push("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin");
+    }
+  } else if (tool === "node") {
+    if (isWin) {
+      dirs.push(path.join(process.env.ProgramFiles || "C:\\Program Files", "nodejs"));
+    } else {
+      dirs.push("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin");
+    }
+  }
+  return dirs;
+}
+async function resolveExecutable(tool) {
+  if (executableCache.has(tool)) {
+    return executableCache.get(tool) ?? null;
+  }
+  const envOverrides = {
+    javac: [
+      process.env.JAVAC_PATH,
+      process.env.JAVA_HOME ? path.join(process.env.JAVA_HOME, "bin", process.platform === "win32" ? "javac.exe" : "javac") : void 0
+    ],
+    java: [
+      process.env.JAVA_PATH,
+      process.env.JAVA_HOME ? path.join(process.env.JAVA_HOME, "bin", process.platform === "win32" ? "java.exe" : "java") : void 0
+    ],
+    "g++": [process.env.GPP_PATH, process.env.CXX],
+    python: [process.env.PYTHON_PATH],
+    node: [
+      process.env.LOGICLAB_NODE_PATH,
+      path.basename(process.execPath).toLowerCase().startsWith("node") ? process.execPath : void 0
+    ]
+  };
+  for (const override of envOverrides[tool]) {
+    const trimmed = override?.trim();
+    if (trimmed && isExecutableFile(trimmed)) {
+      executableCache.set(tool, trimmed);
+      return trimmed;
+    }
+  }
+  const rawPath = process.env.PATH || process.env.Path || "";
+  const pathDirs = rawPath.split(path.delimiter).filter(Boolean);
+  const candidateNames = tool === "python" ? process.platform === "win32" ? ["python", "python3"] : ["python3", "python"] : [tool];
+  for (const dir of pathDirs) {
+    const found = findInDir(dir, candidateNames);
+    if (found) {
+      executableCache.set(tool, found);
+      return found;
+    }
+  }
+  for (const dir of getStandardSearchDirs(tool)) {
+    const found = findInDir(dir, candidateNames);
+    if (found) {
+      executableCache.set(tool, found);
+      return found;
+    }
+  }
+  executableCache.set(tool, null);
+  return null;
+}
+async function getToolchainAvailability() {
+  const [javac, java, gpp, python, node] = await Promise.all([
+    resolveExecutable("javac"),
+    resolveExecutable("java"),
+    resolveExecutable("g++"),
+    resolveExecutable("python"),
+    resolveExecutable("node")
+  ]);
+  return { javac, java, "g++": gpp, python, node };
+}
+function sanitizeSourceFileName(fileName, defaultName, allowedExts) {
+  const base = fileName ? path.basename(fileName).replace(/[^A-Za-z0-9_.-]/g, "") : "";
+  if (!base) return defaultName;
+  const lower = base.toLowerCase();
+  if (allowedExts.some((ext) => lower.endsWith(ext))) {
+    return base;
+  }
+  return defaultName;
+}
 var SANDBOX_BASE_DIR = path.join(os.tmpdir(), "logic-lab-sandbox");
 async function createSandboxWorkspace() {
   const dirName = `run-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
@@ -7087,17 +7254,20 @@ async function cleanupSandboxWorkspace(dirPath) {
 }
 function getSanitizedEnv() {
   const cleanEnv = {
-    PATH: process.env.PATH || "",
+    PATH: process.env.PATH || process.env.Path || "",
     SYSTEMROOT: process.env.SYSTEMROOT || "C:\\Windows",
     WINDIR: process.env.WINDIR || "C:\\Windows",
     TEMP: process.env.TEMP || os.tmpdir(),
     TMP: process.env.TMP || os.tmpdir(),
-    USERPROFILE: process.env.USERPROFILE || "C:\\Users\\fahim",
-    LOCALAPPDATA: process.env.LOCALAPPDATA || "C:\\Users\\fahim\\AppData\\Local",
-    APPDATA: process.env.APPDATA || "C:\\Users\\fahim\\AppData\\Roaming",
+    USERPROFILE: process.env.USERPROFILE || os.homedir(),
+    LOCALAPPDATA: process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"),
+    APPDATA: process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
     HOMEDRIVE: process.env.HOMEDRIVE || "C:",
     HOMEPATH: process.env.HOMEPATH || "\\Users\\fahim"
   };
+  if (process.env.JAVA_HOME) {
+    cleanEnv.JAVA_HOME = process.env.JAVA_HOME;
+  }
   return cleanEnv;
 }
 function killProcessTree(childProcess) {
@@ -7120,6 +7290,22 @@ function killProcessTree(childProcess) {
     }
   }
 }
+var MAX_CONCURRENT_SANDBOX_PROCESSES = 4;
+var activeSandboxProcesses = 0;
+var processWaitQueue = [];
+async function acquireProcessSlot() {
+  if (activeSandboxProcesses < MAX_CONCURRENT_SANDBOX_PROCESSES) {
+    activeSandboxProcesses += 1;
+    return;
+  }
+  await new Promise((resolve) => processWaitQueue.push(resolve));
+  activeSandboxProcesses += 1;
+}
+function releaseProcessSlot() {
+  activeSandboxProcesses = Math.max(0, activeSandboxProcesses - 1);
+  const next = processWaitQueue.shift();
+  if (next) next();
+}
 async function runSandboxedProcess(options) {
   const {
     cmd,
@@ -7130,96 +7316,104 @@ async function runSandboxedProcess(options) {
     env = {},
     maxBufferBytes = 128 * 1024
   } = options;
+  await acquireProcessSlot();
   const startTime = Date.now();
   let timedOut = false;
   let stdoutData = "";
   let stderrData = "";
+  let spawnErrorCode;
   let childProcess = null;
-  return new Promise((resolve) => {
-    try {
-      const mergedEnv = {
-        ...getSanitizedEnv(),
-        ...env
-      };
-      childProcess = spawn(cmd, args, {
-        cwd,
-        env: mergedEnv,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"]
-      });
-      let finished = false;
-      const stdoutDecoder = new StringDecoder("utf8");
-      const stderrDecoder = new StringDecoder("utf8");
-      const finish = (exitCode) => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        const tailOut = stdoutDecoder.end();
-        const tailErr = stderrDecoder.end();
-        if (tailOut && stdoutData.length < maxBufferBytes) stdoutData += tailOut;
-        if (tailErr && stderrData.length < maxBufferBytes) stderrData += tailErr;
-        resolve({
-          stdout: stdoutData,
-          stderr: stderrData,
-          exitCode,
-          timedOut,
-          executionTimeMs: Date.now() - startTime
+  try {
+    return await new Promise((resolve) => {
+      try {
+        const mergedEnv = {
+          ...getSanitizedEnv(),
+          ...env
+        };
+        childProcess = spawn(cmd, args, {
+          cwd,
+          env: mergedEnv,
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"]
         });
-      };
-      const timer = setTimeout(() => {
-        timedOut = true;
-        if (childProcess && childProcess.pid) {
-          if (process.platform === "win32") {
-            try {
-              spawn("taskkill", ["/pid", String(childProcess.pid), "/T", "/F"], {
-                windowsHide: true
-              });
-            } catch {
+        let finished = false;
+        const stdoutDecoder = new StringDecoder("utf8");
+        const stderrDecoder = new StringDecoder("utf8");
+        const finish = (exitCode) => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          const tailOut = stdoutDecoder.end();
+          const tailErr = stderrDecoder.end();
+          if (tailOut && stdoutData.length < maxBufferBytes) stdoutData += tailOut;
+          if (tailErr && stderrData.length < maxBufferBytes) stderrData += tailErr;
+          resolve({
+            stdout: stdoutData,
+            stderr: stderrData,
+            exitCode,
+            timedOut,
+            executionTimeMs: Date.now() - startTime,
+            ...spawnErrorCode ? { spawnErrorCode } : {}
+          });
+        };
+        const timer = setTimeout(() => {
+          timedOut = true;
+          if (childProcess && childProcess.pid) {
+            if (process.platform === "win32") {
+              try {
+                spawn("taskkill", ["/pid", String(childProcess.pid), "/T", "/F"], {
+                  windowsHide: true
+                });
+              } catch {
+                childProcess.kill("SIGKILL");
+              }
+            } else {
               childProcess.kill("SIGKILL");
             }
-          } else {
-            childProcess.kill("SIGKILL");
           }
-        }
-        finish(null);
-      }, timeoutMs);
-      childProcess.stdout.on("data", (chunk) => {
-        if (stdoutData.length < maxBufferBytes) {
-          stdoutData += stdoutDecoder.write(chunk);
-        }
-      });
-      childProcess.stderr.on("data", (chunk) => {
-        if (stderrData.length < maxBufferBytes) {
-          stderrData += stderrDecoder.write(chunk);
-        }
-      });
-      childProcess.on("error", (err) => {
-        stderrData += `
+          finish(null);
+        }, timeoutMs);
+        childProcess.stdout.on("data", (chunk) => {
+          if (stdoutData.length < maxBufferBytes) {
+            stdoutData += stdoutDecoder.write(chunk);
+          }
+        });
+        childProcess.stderr.on("data", (chunk) => {
+          if (stderrData.length < maxBufferBytes) {
+            stderrData += stderrDecoder.write(chunk);
+          }
+        });
+        childProcess.on("error", (err) => {
+          spawnErrorCode = err.code;
+          stderrData += `
 Failed to start process: ${err.message}`;
-        finish(-1);
-      });
-      childProcess.on("close", (code) => {
-        finish(code);
-      });
-      if (stdin) {
-        const normalizedStdin = stdin.replace(/\r\n/g, "\n");
-        childProcess.stdin.write(
-          normalizedStdin.endsWith("\n") ? normalizedStdin : `${normalizedStdin}
+          finish(-1);
+        });
+        childProcess.on("close", (code) => {
+          finish(code);
+        });
+        if (stdin) {
+          const normalizedStdin = stdin.replace(/\r\n/g, "\n");
+          childProcess.stdin.write(
+            normalizedStdin.endsWith("\n") ? normalizedStdin : `${normalizedStdin}
 `,
-          "utf8"
-        );
+            "utf8"
+          );
+        }
+        childProcess.stdin.end();
+      } catch (err) {
+        resolve({
+          stdout: "",
+          stderr: err?.message || "Process invocation error",
+          exitCode: -1,
+          timedOut: false,
+          executionTimeMs: Date.now() - startTime
+        });
       }
-      childProcess.stdin.end();
-    } catch (err) {
-      resolve({
-        stdout: "",
-        stderr: err?.message || "Process invocation error",
-        exitCode: -1,
-        timedOut: false,
-        executionTimeMs: Date.now() - startTime
-      });
-    }
-  });
+    });
+  } finally {
+    releaseProcessSlot();
+  }
 }
 
 // server/src/services/toolchains/remoteSandbox.ts
@@ -7448,15 +7642,44 @@ ${stdout}`;
 async function compileJava(code, fileName = "Main.java") {
   const workspaceDir = await createSandboxWorkspace();
   const className = extractJavaClassName(code, fileName);
-  const sourceFileName = fileName && /\.java$/i.test(fileName) ? path2.basename(fileName) : `${className}.java`;
+  const sourceFileName = sanitizeSourceFileName(fileName, `${className}.java`, [".java"]);
   const sourceFilePath = path2.join(workspaceDir, sourceFileName);
   await fs2.writeFile(sourceFilePath, code, "utf8");
+  const javacPath = await resolveExecutable("javac");
+  if (!javacPath) {
+    const configMsg = "Java compiler (javac) not found. Ensure a JDK is installed and 'javac' is in PATH, or set JAVA_HOME / JAVAC_PATH.";
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: "",
+      stderr: configMsg,
+      mainClass: className,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg
+    };
+  }
   const procRes = await runSandboxedProcess({
-    cmd: "javac",
+    cmd: javacPath,
     args: ["-encoding", "UTF-8", "-Xlint:all", "-d", workspaceDir, sourceFileName],
     cwd: workspaceDir,
-    timeoutMs: 8e3
+    timeoutMs: 15e3
   });
+  if (procRes.spawnErrorCode === "ENOENT" || procRes.spawnErrorCode === "EACCES" || procRes.spawnErrorCode === "EPERM") {
+    const configMsg = `Java compiler failed to start (${procRes.spawnErrorCode}): ${procRes.stderr.trim()}`;
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: procRes.stdout,
+      stderr: configMsg,
+      mainClass: className,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg
+    };
+  }
   const diagnostics = parseJavacDiagnostics(procRes.stderr, procRes.stdout);
   const hasErrors = procRes.exitCode !== 0 || diagnostics.some((d) => d.severity === "error");
   return {
@@ -7473,7 +7696,7 @@ async function executeJava(code, stdin = "", timeoutMs = 4e3, fileName = "Main.j
   const compileRes = await compileJava(code, fileName);
   try {
     if (!compileRes.success) {
-      if (isLocalExecutionBlockedError(compileRes.stderr)) {
+      if (compileRes.compilerUnavailable || isLocalExecutionBlockedError(compileRes.stderr)) {
         const remote = await executeViaRemoteSandbox("java", code, stdin, timeoutMs);
         if (remote) {
           const remoteDiagnostics = remote.compileOutput ? parseJavacDiagnostics(remote.compileOutput, "") : [];
@@ -7484,6 +7707,21 @@ async function executeJava(code, stdin = "", timeoutMs = 4e3, fileName = "Main.j
             hasRemoteCompileErr ? remoteDiagnostics[0]?.line || 1 : void 0
           );
         }
+      }
+      if (compileRes.compilerUnavailable) {
+        const configMsg = compileRes.compilerError || compileRes.stderr.trim() || "Java compiler (javac) is unavailable on this host.";
+        return {
+          status: "error",
+          canRun: false,
+          stdout: "",
+          stderr: configMsg,
+          output: configMsg,
+          exitCode: 1,
+          timedOut: false,
+          runtimeError: configMsg,
+          executionTimeMs: 0,
+          diagnostics: []
+        };
       }
       const firstError = compileRes.diagnostics.find((d) => d.severity === "error");
       const errorMsg = firstError?.message || compileRes.stderr.trim() || "Java compilation failed.";
@@ -7502,8 +7740,28 @@ async function executeJava(code, stdin = "", timeoutMs = 4e3, fileName = "Main.j
       };
     }
     const mainClass = compileRes.mainClass || "Main";
+    const javaPath = await resolveExecutable("java");
+    if (!javaPath) {
+      const remote = await executeViaRemoteSandbox("java", code, stdin, timeoutMs);
+      if (remote) {
+        return buildRemoteToolchainResult(remote, compileRes.diagnostics);
+      }
+      const configMsg = "Java runtime (java) not found. Ensure a JDK/JRE is installed and 'java' is in PATH, or set JAVA_HOME / JAVA_PATH.";
+      return {
+        status: "error",
+        canRun: false,
+        stdout: "",
+        stderr: configMsg,
+        output: configMsg,
+        exitCode: 1,
+        timedOut: false,
+        runtimeError: configMsg,
+        executionTimeMs: 0,
+        diagnostics: compileRes.diagnostics
+      };
+    }
     const runRes = await runSandboxedProcess({
-      cmd: "java",
+      cmd: javaPath,
       args: [
         "-Dfile.encoding=UTF-8",
         "-Dstdout.encoding=UTF-8",
@@ -7590,16 +7848,32 @@ ${stdout}`;
 }
 async function compileCpp(code, fileName = "main.cpp") {
   const workspaceDir = await createSandboxWorkspace();
-  const sourceFileName = fileName.endsWith(".cpp") ? fileName : "main.cpp";
+  const sourceFileName = sanitizeSourceFileName(fileName, "main.cpp", [".cpp", ".cc", ".cxx", ".c"]);
   const sourceFilePath = path3.join(workspaceDir, sourceFileName);
   const binaryFileName = process.platform === "win32" ? "program.exe" : "program.out";
   const binaryFilePath = path3.join(workspaceDir, binaryFileName);
   await fs3.writeFile(sourceFilePath, code, "utf8");
+  const gppPath = await resolveExecutable("g++");
+  if (!gppPath) {
+    const configMsg = "C++ compiler (g++) not found. Ensure g++ is installed and in PATH, or set GPP_PATH.";
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: "",
+      stderr: configMsg,
+      executablePath: binaryFilePath,
+      binaryPath: binaryFilePath,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg
+    };
+  }
   const procRes = await runSandboxedProcess({
-    cmd: "g++",
-    args: ["-std=c++17", "-Wall", "-Wextra", "-O2", sourceFileName, "-o", binaryFileName],
+    cmd: gppPath,
+    args: ["-std=c++17", "-Wall", "-Wextra", "-O0", sourceFileName, "-o", binaryFileName],
     cwd: workspaceDir,
-    timeoutMs: 8e3
+    timeoutMs: 15e3
   });
   const diagnostics = parseGppDiagnostics(procRes.stderr, procRes.stdout);
   const hasErrors = procRes.exitCode !== 0 || diagnostics.some((d) => d.severity === "error");
@@ -7704,9 +7978,23 @@ import fs4 from "node:fs/promises";
 import path4 from "node:path";
 async function checkPythonSyntax(code, fileName = "script.py") {
   const workspaceDir = await createSandboxWorkspace();
-  const sourceFileName = fileName.endsWith(".py") ? fileName : "script.py";
+  const sourceFileName = sanitizeSourceFileName(fileName, "script.py", [".py"]);
   const sourceFilePath = path4.join(workspaceDir, sourceFileName);
   await fs4.writeFile(sourceFilePath, code, "utf8");
+  const pythonPath = await resolveExecutable("python");
+  if (!pythonPath) {
+    const configMsg = "Python interpreter not found. Ensure Python 3 is installed and in PATH, or set PYTHON_PATH.";
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: "",
+      stderr: configMsg,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg
+    };
+  }
   const pyCheckerScript = `
 import ast, json, sys
 
@@ -7734,7 +8022,7 @@ except Exception as e:
     print(json.dumps({"success": False, "diagnostics": diag}))
 `.trim();
   const procRes = await runSandboxedProcess({
-    cmd: "python",
+    cmd: pythonPath,
     args: ["-c", pyCheckerScript],
     cwd: workspaceDir,
     timeoutMs: 4e3,
@@ -7792,9 +8080,10 @@ async function executePython(code, stdin = "", timeoutMs = 4e3, fileName = "scri
         diagnostics: syntaxRes.diagnostics
       };
     }
-    const sourceFileName = fileName.endsWith(".py") ? fileName : "script.py";
+    const sourceFileName = sanitizeSourceFileName(fileName, "script.py", [".py"]);
+    const pythonPath = await resolveExecutable("python") || "python";
     const runRes = await runSandboxedProcess({
-      cmd: "python",
+      cmd: pythonPath,
       args: ["-u", sourceFileName],
       cwd: syntaxRes.workspaceDir,
       stdin,
@@ -7881,11 +8170,12 @@ ${stdout}`;
 }
 async function checkJsSyntax(code, fileName = "script.js") {
   const workspaceDir = await createSandboxWorkspace();
-  const sourceFileName = fileName.endsWith(".js") ? fileName : "script.js";
+  const sourceFileName = sanitizeSourceFileName(fileName, "script.js", [".js", ".mjs", ".cjs"]);
   const sourceFilePath = path5.join(workspaceDir, sourceFileName);
   await fs5.writeFile(sourceFilePath, code, "utf8");
+  const nodePath = await resolveExecutable("node") || process.execPath;
   const procRes = await runSandboxedProcess({
-    cmd: "node",
+    cmd: nodePath,
     args: ["--check", sourceFileName],
     cwd: workspaceDir,
     timeoutMs: 4e3
@@ -7921,9 +8211,10 @@ async function executeJs(code, stdin = "", timeoutMs = 4e3, fileName = "script.j
         diagnostics: syntaxRes.diagnostics
       };
     }
-    const sourceFileName = fileName.endsWith(".js") ? fileName : "script.js";
+    const sourceFileName = sanitizeSourceFileName(fileName, "script.js", [".js", ".mjs", ".cjs"]);
+    const nodePath = await resolveExecutable("node") || process.execPath;
     const runRes = await runSandboxedProcess({
-      cmd: "node",
+      cmd: nodePath,
       args: [sourceFileName],
       cwd: syntaxRes.workspaceDir,
       stdin,
@@ -9345,17 +9636,15 @@ ${stepPreview}` : ""
   const DEPRECATED_MODEL_PREFIXES = ["gemini-2.0-", "gemini-1.5-", "gemini-1.0-"];
   const configuredModel = process.env.GEMINI_MODEL?.trim();
   const isDeprecated = configuredModel && DEPRECATED_MODEL_PREFIXES.some((prefix) => configuredModel.startsWith(prefix));
-  const primaryModel = !configuredModel || isDeprecated ? "gemini-2.5-flash" : configuredModel;
+  const primaryModel = !configuredModel || isDeprecated ? "gemini-3.8-flash" : configuredModel;
   const rawCandidateModels = [
     primaryModel,
-    "gemini-2.5-flash",
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite"
   ].filter((v, i, a) => a.indexOf(v) === i);
   const nowMs = Date.now();
-  const activeModels = rawCandidateModels.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= nowMs);
-  const candidateModels = activeModels.length > 0 ? activeModels : rawCandidateModels;
+  const candidateModels = rawCandidateModels.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= nowMs);
   const baseUserPrompt = buildUserTracePrompt({
     ...params,
     groundTruthContext: groundTruthContext || void 0
@@ -9435,7 +9724,8 @@ Fix the JSON so it strictly passes validation.` : baseUserPrompt;
           break;
         }
         if (isDailyQuotaExhausted || isNotFound) {
-          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1e3);
+          const cooldownMs = isNotFound ? 60 * 60 * 1e3 : 15 * 60 * 1e3;
+          modelCooldownUntil.set(modelName, Date.now() + cooldownMs);
           break;
         }
         if (isTransient && attempt < 3) {
@@ -9449,7 +9739,9 @@ Fix the JSON so it strictly passes validation.` : baseUserPrompt;
           }
         }
         if (lastValidationError.includes("429") || lastValidationError.includes("RESOURCE_EXHAUSTED")) {
-          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1e3);
+          const retryMatch = lastValidationError.match(/"retryDelay"\s*:\s*"(\d+)s"/);
+          const parsedDelayMs = retryMatch ? Math.min(60 * 60 * 1e3, Number(retryMatch[1]) * 1e3) : 5 * 60 * 1e3;
+          modelCooldownUntil.set(modelName, Date.now() + Math.max(60 * 1e3, parsedDelayMs));
         } else if (lastValidationError.includes("503") || lastValidationError.includes("UNAVAILABLE")) {
           modelCooldownUntil.set(modelName, Date.now() + 60 * 1e3);
         }
@@ -9808,17 +10100,30 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
     if (language === "cpp") {
       workspaceDir = await createSandboxWorkspace();
       const isC = Boolean(fileName && fileName.toLowerCase().endsWith(".c"));
-      const sourceFileName = isC ? path6.basename(fileName) : fileName && fileName.endsWith(".cpp") ? path6.basename(fileName) : "main.cpp";
+      const sourceFileName = sanitizeSourceFileName(
+        fileName,
+        isC ? "main.c" : "main.cpp",
+        [".cpp", ".cc", ".cxx", ".c"]
+      );
       const binaryFileName = process.platform === "win32" ? "program.exe" : "program.out";
       const binaryPath = path6.join(workspaceDir, binaryFileName);
       await fs6.writeFile(path6.join(workspaceDir, sourceFileName), code, "utf8");
       await fs6.writeFile(path6.join(workspaceDir, "_unbuf.c"), UNBUF_C_CODE, "utf8");
-      const compileArgs = isC ? ["-Wall", "-Wextra", "-O2", sourceFileName, "_unbuf.c", "-o", binaryFileName] : ["-std=c++17", "-Wall", "-Wextra", "-O2", sourceFileName, "_unbuf.c", "-o", binaryFileName];
+      const gppPath = await resolveExecutable("g++");
+      if (!gppPath) {
+        await cleanupSandboxWorkspace(workspaceDir);
+        if (process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
+        const cfgErr = "C++ compiler (g++) not found. Ensure g++ is installed and in PATH, or set GPP_PATH.";
+        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };
+      }
+      const compileArgs = isC ? ["-Wall", "-Wextra", "-O0", sourceFileName, "_unbuf.c", "-o", binaryFileName] : ["-std=c++17", "-Wall", "-Wextra", "-O0", sourceFileName, "_unbuf.c", "-o", binaryFileName];
       const compileRes = await runSandboxedProcess({
-        cmd: "g++",
+        cmd: gppPath,
         args: compileArgs,
         cwd: workspaceDir,
-        timeoutMs: 8e3
+        timeoutMs: 15e3
       });
       const cppDiags = parseGppDiagnostics(compileRes.stderr, compileRes.stdout);
       diagnostics = [...cppDiags, ...prep.diagnostics];
@@ -9827,7 +10132,7 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
         await cleanupSandboxWorkspace(workspaceDir);
         const firstErr = cppDiags.find((d) => d.severity === "error");
         const errMsg = compileRes.stderr.trim() || firstErr?.message || "C/C++ compilation failed.";
-        if (isLocalExecutionBlockedError(errMsg)) {
+        if (isLocalExecutionBlockedError(errMsg) && process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
           return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
         }
         return {
@@ -9846,22 +10151,35 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
       if (!compileRes.success) {
         await cleanupSandboxWorkspace(workspaceDir);
         const firstErr = compileRes.diagnostics.find((d) => d.severity === "error");
-        const errMsg = compileRes.stderr.trim() || firstErr?.message || "Java compilation failed.";
+        const errMsg = compileRes.compilerError || compileRes.stderr.trim() || firstErr?.message || "Java compilation failed.";
+        if ((compileRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) && process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
         return {
           ok: false,
-          diagnostics,
+          diagnostics: compileRes.compilerUnavailable ? [] : diagnostics,
           stderr: errMsg,
           runtimeError: errMsg
         };
       }
+      const javacPath = await resolveExecutable("javac");
+      const javaPath = await resolveExecutable("java");
+      if (!javaPath) {
+        await cleanupSandboxWorkspace(workspaceDir);
+        if (process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
+        const cfgErr = "Java runtime (java) not found. Ensure a JDK/JRE is installed and 'java' is in PATH, or set JAVA_HOME / JAVA_PATH.";
+        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };
+      }
       const className = extractJavaClassName(code, fileName || "Main.java");
       await fs6.writeFile(path6.join(workspaceDir, "_LogicLabRunner.java"), JAVA_RUNNER_CODE, "utf8");
-      const runnerCompile = await runSandboxedProcess({
-        cmd: "javac",
+      const runnerCompile = javacPath ? await runSandboxedProcess({
+        cmd: javacPath,
         args: ["-encoding", "UTF-8", "_LogicLabRunner.java"],
         cwd: workspaceDir,
-        timeoutMs: 8e3
-      });
+        timeoutMs: 12e3
+      }) : { exitCode: 1 };
       const javaUtf8Flags = [
         "-Dfile.encoding=UTF-8",
         "-Dstdout.encoding=UTF-8",
@@ -9870,7 +10188,7 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
         "-Dsun.stdout.encoding=UTF-8",
         "-Dsun.stderr.encoding=UTF-8"
       ];
-      cmd = "java";
+      cmd = javaPath;
       args = runnerCompile.exitCode === 0 ? [...javaUtf8Flags, "-cp", workspaceDir, "_LogicLabRunner", className] : [...javaUtf8Flags, "-cp", workspaceDir, className];
     } else if (language === "python") {
       const syntaxRes = await checkPythonSyntax(code, fileName || "script.py");
@@ -9879,16 +10197,19 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
       if (!syntaxRes.success) {
         await cleanupSandboxWorkspace(workspaceDir);
         const firstErr = syntaxRes.diagnostics.find((d) => d.severity === "error");
-        const errMsg = firstErr?.message || syntaxRes.stderr.trim() || "Python syntax error.";
+        const errMsg = syntaxRes.compilerError || firstErr?.message || syntaxRes.stderr.trim() || "Python syntax error.";
+        if ((syntaxRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) && process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
         return {
           ok: false,
-          diagnostics,
+          diagnostics: syntaxRes.compilerUnavailable ? [] : diagnostics,
           stderr: errMsg,
           runtimeError: errMsg
         };
       }
-      const sourceFileName = fileName && fileName.endsWith(".py") ? path6.basename(fileName) : "script.py";
-      cmd = "python";
+      const sourceFileName = sanitizeSourceFileName(fileName, "script.py", [".py"]);
+      cmd = await resolveExecutable("python") || "python";
       args = ["-u", sourceFileName];
       extraEnv = { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" };
     } else {
@@ -9906,9 +10227,9 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
           runtimeError: errMsg
         };
       }
-      const sourceFileName = fileName && fileName.endsWith(".js") ? path6.basename(fileName) : "script.js";
+      const sourceFileName = sanitizeSourceFileName(fileName, "script.js", [".js", ".mjs", ".cjs"]);
       await fs6.writeFile(path6.join(workspaceDir, "_preload.cjs"), NODE_PRELOAD_CJS, "utf8");
-      cmd = "node";
+      cmd = await resolveExecutable("node") || process.execPath;
       args = ["--require", "./_preload.cjs", sourceFileName];
     }
     const sessionId = `exec-${Date.now()}-${crypto3.randomBytes(4).toString("hex")}`;
@@ -9978,11 +10299,20 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
     });
     child.on("error", (err) => {
       const msg = `Failed to start process: ${err.message}`;
+      if (isLocalExecutionBlockedError(msg) && process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
+        session.isRemoteReplay = true;
+        session.child = null;
+        session.collectedInputs = initialStdin ? initialStdin.replace(/\r\n/g, "\n").split("\n") : [];
+        clearSessionTimers(session);
+        void cleanupSandboxWorkspace(session.workspaceDir);
+        void runRemoteReplayStep(session);
+        return;
+      }
       session.stderrAll += msg;
       emitSessionEvent(session, { type: "stderr", data: { text: msg } });
     });
     child.on("close", (exitCode) => {
-      if (session.exited) return;
+      if (session.exited || session.isRemoteReplay) return;
       const tailOut = stdoutDecoder.end();
       if (tailOut) {
         if (session.stdoutAll.length < MAX_OUTPUT_BYTES) session.stdoutAll += tailOut;
@@ -10027,11 +10357,15 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
     if (workspaceDir) {
       await cleanupSandboxWorkspace(workspaceDir);
     }
+    const msg = err?.message || "Execution failed to start.";
+    if (isLocalExecutionBlockedError(msg) && process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
+      return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+    }
     return {
       ok: false,
       diagnostics,
-      stderr: err?.message || "Execution failed to start.",
-      runtimeError: err?.message || "Execution failed to start."
+      stderr: msg,
+      runtimeError: msg
     };
   }
 }
@@ -10237,11 +10571,18 @@ function resolveUid(req) {
   }
   return "guest-local";
 }
-apiRouter.get("/health", (_req, res) => {
+apiRouter.get("/health", async (_req, res) => {
+  const availability = await getToolchainAvailability();
   res.json({
     status: "ok",
     service: "logic-lab-api",
     geminiConfigured: isGeminiKeyConfigured(),
+    toolchains: {
+      java: Boolean(availability.javac && availability.java),
+      cpp: Boolean(availability["g++"]),
+      python: Boolean(availability.python),
+      javascript: Boolean(availability.node)
+    },
     cacheSize: getCacheSize(),
     problemsCount: PROBLEM_LIBRARY.length,
     sharesCount: sharesById.size,

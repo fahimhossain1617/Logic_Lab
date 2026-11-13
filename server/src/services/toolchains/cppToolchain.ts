@@ -1,6 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
+import {
+  runSandboxedProcess,
+  createSandboxWorkspace,
+  cleanupSandboxWorkspace,
+  resolveExecutable,
+  sanitizeSourceFileName,
+} from './sandbox';
 import {
   buildRemoteToolchainResult,
   executeViaRemoteSandbox,
@@ -51,19 +57,37 @@ export async function compileCpp(
   fileName = 'main.cpp'
 ): Promise<ToolchainCompileResult & { workspaceDir: string; binaryPath: string }> {
   const workspaceDir = await createSandboxWorkspace();
-  const sourceFileName = fileName.endsWith('.cpp') ? fileName : 'main.cpp';
+  const sourceFileName = sanitizeSourceFileName(fileName, 'main.cpp', ['.cpp', '.cc', '.cxx', '.c']);
   const sourceFilePath = path.join(workspaceDir, sourceFileName);
   const binaryFileName = process.platform === 'win32' ? 'program.exe' : 'program.out';
   const binaryFilePath = path.join(workspaceDir, binaryFileName);
 
   await fs.writeFile(sourceFilePath, code, 'utf8');
 
-  // Compile with C++17 and standard warning flags
+  const gppPath = await resolveExecutable('g++');
+  if (!gppPath) {
+    const configMsg =
+      "C++ compiler (g++) not found. Ensure g++ is installed and in PATH, or set GPP_PATH.";
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: '',
+      stderr: configMsg,
+      executablePath: binaryFilePath,
+      binaryPath: binaryFilePath,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg,
+    };
+  }
+
+  // Compile with C++17 and standard warning flags (-O0 for fast, contention-free compilation)
   const procRes = await runSandboxedProcess({
-    cmd: 'g++',
-    args: ['-std=c++17', '-Wall', '-Wextra', '-O2', sourceFileName, '-o', binaryFileName],
+    cmd: gppPath,
+    args: ['-std=c++17', '-Wall', '-Wextra', '-O0', sourceFileName, '-o', binaryFileName],
     cwd: workspaceDir,
-    timeoutMs: 8000,
+    timeoutMs: 15000,
   });
 
   const diagnostics = parseGppDiagnostics(procRes.stderr, procRes.stdout);

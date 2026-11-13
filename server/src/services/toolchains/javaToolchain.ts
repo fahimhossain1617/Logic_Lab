@@ -1,6 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
+import {
+  runSandboxedProcess,
+  createSandboxWorkspace,
+  cleanupSandboxWorkspace,
+  resolveExecutable,
+  sanitizeSourceFileName,
+} from './sandbox';
 import {
   buildRemoteToolchainResult,
   executeViaRemoteSandbox,
@@ -83,20 +89,50 @@ export async function compileJava(
 ): Promise<ToolchainCompileResult & { workspaceDir: string }> {
   const workspaceDir = await createSandboxWorkspace();
   const className = extractJavaClassName(code, fileName);
-  const sourceFileName = (fileName && /\.java$/i.test(fileName))
-    ? path.basename(fileName)
-    : `${className}.java`;
+  const sourceFileName = sanitizeSourceFileName(fileName, `${className}.java`, ['.java']);
   const sourceFilePath = path.join(workspaceDir, sourceFileName);
 
   await fs.writeFile(sourceFilePath, code, 'utf8');
 
+  const javacPath = await resolveExecutable('javac');
+  if (!javacPath) {
+    const configMsg =
+      "Java compiler (javac) not found. Ensure a JDK is installed and 'javac' is in PATH, or set JAVA_HOME / JAVAC_PATH.";
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: '',
+      stderr: configMsg,
+      mainClass: className,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg,
+    };
+  }
+
   // Run javac with standard UTF-8 encoding and -Xlint
   const procRes = await runSandboxedProcess({
-    cmd: 'javac',
+    cmd: javacPath,
     args: ['-encoding', 'UTF-8', '-Xlint:all', '-d', workspaceDir, sourceFileName],
     cwd: workspaceDir,
-    timeoutMs: 8000,
+    timeoutMs: 15000,
   });
+
+  if (procRes.spawnErrorCode === 'ENOENT' || procRes.spawnErrorCode === 'EACCES' || procRes.spawnErrorCode === 'EPERM') {
+    const configMsg = `Java compiler failed to start (${procRes.spawnErrorCode}): ${procRes.stderr.trim()}`;
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: procRes.stdout,
+      stderr: configMsg,
+      mainClass: className,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg,
+    };
+  }
 
   const diagnostics = parseJavacDiagnostics(procRes.stderr, procRes.stdout);
   const hasErrors = procRes.exitCode !== 0 || diagnostics.some((d) => d.severity === 'error');
@@ -126,7 +162,7 @@ export async function executeJava(
   try {
     if (!compileRes.success) {
       // Fallback to remote sandbox if javac is unavailable on host (e.g. serverless)
-      if (isLocalExecutionBlockedError(compileRes.stderr)) {
+      if (compileRes.compilerUnavailable || isLocalExecutionBlockedError(compileRes.stderr)) {
         const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs);
         if (remote) {
           const remoteDiagnostics = remote.compileOutput
@@ -139,6 +175,25 @@ export async function executeJava(
             hasRemoteCompileErr ? remoteDiagnostics[0]?.line || 1 : undefined
           );
         }
+      }
+
+      if (compileRes.compilerUnavailable) {
+        const configMsg =
+          compileRes.compilerError ||
+          compileRes.stderr.trim() ||
+          'Java compiler (javac) is unavailable on this host.';
+        return {
+          status: 'error',
+          canRun: false,
+          stdout: '',
+          stderr: configMsg,
+          output: configMsg,
+          exitCode: 1,
+          timedOut: false,
+          runtimeError: configMsg,
+          executionTimeMs: 0,
+          diagnostics: [],
+        };
       }
 
       const firstError = compileRes.diagnostics.find((d) => d.severity === 'error');
@@ -160,10 +215,31 @@ export async function executeJava(
     }
 
     const mainClass = compileRes.mainClass || 'Main';
+    const javaPath = await resolveExecutable('java');
+    if (!javaPath) {
+      const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs);
+      if (remote) {
+        return buildRemoteToolchainResult(remote, compileRes.diagnostics);
+      }
+      const configMsg =
+        "Java runtime (java) not found. Ensure a JDK/JRE is installed and 'java' is in PATH, or set JAVA_HOME / JAVA_PATH.";
+      return {
+        status: 'error',
+        canRun: false,
+        stdout: '',
+        stderr: configMsg,
+        output: configMsg,
+        exitCode: 1,
+        timedOut: false,
+        runtimeError: configMsg,
+        executionTimeMs: 0,
+        diagnostics: compileRes.diagnostics,
+      };
+    }
 
     // Execute with java runtime in sandbox (force UTF-8 across stdio and default charset on Windows/Java 18+)
     const runRes = await runSandboxedProcess({
-      cmd: 'java',
+      cmd: javaPath,
       args: [
         '-Dfile.encoding=UTF-8',
         '-Dstdout.encoding=UTF-8',

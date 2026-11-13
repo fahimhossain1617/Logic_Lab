@@ -1877,18 +1877,16 @@ export async function generateExecutionTrace(params: {
   const isDeprecated =
     configuredModel &&
     DEPRECATED_MODEL_PREFIXES.some((prefix) => configuredModel.startsWith(prefix));
-  const primaryModel = !configuredModel || isDeprecated ? 'gemini-2.5-flash' : configuredModel;
+  const primaryModel = !configuredModel || isDeprecated ? 'gemini-3.8-flash' : configuredModel;
   const rawCandidateModels = [
     primaryModel,
-    'gemini-2.5-flash',
     'gemini-3.8-flash',
     'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
   ].filter((v, i, a) => a.indexOf(v) === i);
 
   const nowMs = Date.now();
-  const activeModels = rawCandidateModels.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= nowMs);
-  const candidateModels = activeModels.length > 0 ? activeModels : rawCandidateModels;
+  const candidateModels = rawCandidateModels.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= nowMs);
 
   const baseUserPrompt = buildUserTracePrompt({
     ...params,
@@ -2003,7 +2001,8 @@ export async function generateExecutionTrace(params: {
         }
 
         if (isDailyQuotaExhausted || isNotFound) {
-          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1000);
+          const cooldownMs = isNotFound ? 60 * 60 * 1000 : 15 * 60 * 1000;
+          modelCooldownUntil.set(modelName, Date.now() + cooldownMs);
           break;
         }
 
@@ -2019,7 +2018,9 @@ export async function generateExecutionTrace(params: {
         }
 
         if (lastValidationError.includes('429') || lastValidationError.includes('RESOURCE_EXHAUSTED')) {
-          modelCooldownUntil.set(modelName, Date.now() + 5 * 60 * 1000);
+          const retryMatch = lastValidationError.match(/"retryDelay"\s*:\s*"(\d+)s"/);
+          const parsedDelayMs = retryMatch ? Math.min(60 * 60 * 1000, Number(retryMatch[1]) * 1000) : 5 * 60 * 1000;
+          modelCooldownUntil.set(modelName, Date.now() + Math.max(60 * 1000, parsedDelayMs));
         } else if (lastValidationError.includes('503') || lastValidationError.includes('UNAVAILABLE')) {
           modelCooldownUntil.set(modelName, Date.now() + 60 * 1000);
         }

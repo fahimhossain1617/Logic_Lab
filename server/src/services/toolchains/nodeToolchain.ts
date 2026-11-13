@@ -1,6 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
+import {
+  runSandboxedProcess,
+  createSandboxWorkspace,
+  cleanupSandboxWorkspace,
+  resolveExecutable,
+  sanitizeSourceFileName,
+} from './sandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
 
@@ -58,13 +64,14 @@ export async function checkJsSyntax(
   fileName = 'script.js'
 ): Promise<ToolchainCompileResult & { workspaceDir: string }> {
   const workspaceDir = await createSandboxWorkspace();
-  const sourceFileName = fileName.endsWith('.js') ? fileName : 'script.js';
+  const sourceFileName = sanitizeSourceFileName(fileName, 'script.js', ['.js', '.mjs', '.cjs']);
   const sourceFilePath = path.join(workspaceDir, sourceFileName);
 
   await fs.writeFile(sourceFilePath, code, 'utf8');
 
+  const nodePath = (await resolveExecutable('node')) || process.execPath;
   const procRes = await runSandboxedProcess({
-    cmd: 'node',
+    cmd: nodePath,
     args: ['--check', sourceFileName],
     cwd: workspaceDir,
     timeoutMs: 4000,
@@ -114,10 +121,11 @@ export async function executeJs(
       };
     }
 
-    const sourceFileName = fileName.endsWith('.js') ? fileName : 'script.js';
+    const sourceFileName = sanitizeSourceFileName(fileName, 'script.js', ['.js', '.mjs', '.cjs']);
+    const nodePath = (await resolveExecutable('node')) || process.execPath;
 
     const runRes = await runSandboxedProcess({
-      cmd: 'node',
+      cmd: nodePath,
       args: [sourceFileName],
       cwd: syntaxRes.workspaceDir,
       stdin,

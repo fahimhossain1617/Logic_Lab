@@ -8,6 +8,8 @@ export interface ToolchainCompileResult {
   mainClass?: string;
   executablePath?: string;
   workingDir?: string;
+  compilerUnavailable?: boolean;
+  compilerError?: string;
 }
 
 export interface ToolchainExecutionResult {

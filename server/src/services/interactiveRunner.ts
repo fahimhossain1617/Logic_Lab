@@ -10,7 +10,9 @@ import {
   createSandboxWorkspace,
   getSanitizedEnv,
   killProcessTree,
+  resolveExecutable,
   runSandboxedProcess,
+  sanitizeSourceFileName,
 } from './toolchains/sandbox';
 import { parseGppDiagnostics } from './toolchains/cppToolchain';
 import { compileJava, extractJavaClassName } from './toolchains/javaToolchain';
@@ -382,26 +384,36 @@ export async function startInteractiveSession(
     if (language === 'cpp') {
       workspaceDir = await createSandboxWorkspace();
       const isC = Boolean(fileName && fileName.toLowerCase().endsWith('.c'));
-      const sourceFileName = isC
-        ? path.basename(fileName!)
-        : fileName && fileName.endsWith('.cpp')
-        ? path.basename(fileName)
-        : 'main.cpp';
+      const sourceFileName = sanitizeSourceFileName(
+        fileName,
+        isC ? 'main.c' : 'main.cpp',
+        ['.cpp', '.cc', '.cxx', '.c']
+      );
       const binaryFileName = process.platform === 'win32' ? 'program.exe' : 'program.out';
       const binaryPath = path.join(workspaceDir, binaryFileName);
 
       await fs.writeFile(path.join(workspaceDir, sourceFileName), code, 'utf8');
       await fs.writeFile(path.join(workspaceDir, '_unbuf.c'), UNBUF_C_CODE, 'utf8');
 
+      const gppPath = await resolveExecutable('g++');
+      if (!gppPath) {
+        await cleanupSandboxWorkspace(workspaceDir);
+        if (process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
+        const cfgErr = "C++ compiler (g++) not found. Ensure g++ is installed and in PATH, or set GPP_PATH.";
+        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };
+      }
+
       const compileArgs = isC
-        ? ['-Wall', '-Wextra', '-O2', sourceFileName, '_unbuf.c', '-o', binaryFileName]
-        : ['-std=c++17', '-Wall', '-Wextra', '-O2', sourceFileName, '_unbuf.c', '-o', binaryFileName];
+        ? ['-Wall', '-Wextra', '-O0', sourceFileName, '_unbuf.c', '-o', binaryFileName]
+        : ['-std=c++17', '-Wall', '-Wextra', '-O0', sourceFileName, '_unbuf.c', '-o', binaryFileName];
 
       const compileRes = await runSandboxedProcess({
-        cmd: 'g++',
+        cmd: gppPath,
         args: compileArgs,
         cwd: workspaceDir,
-        timeoutMs: 8000,
+        timeoutMs: 15000,
       });
 
       const cppDiags = parseGppDiagnostics(compileRes.stderr, compileRes.stdout);
@@ -414,7 +426,7 @@ export async function startInteractiveSession(
         const firstErr = cppDiags.find((d) => d.severity === 'error');
         const errMsg =
           compileRes.stderr.trim() || firstErr?.message || 'C/C++ compilation failed.';
-        if (isLocalExecutionBlockedError(errMsg)) {
+        if (isLocalExecutionBlockedError(errMsg) && process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
           return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
         }
         return {
@@ -436,23 +448,46 @@ export async function startInteractiveSession(
         await cleanupSandboxWorkspace(workspaceDir);
         const firstErr = compileRes.diagnostics.find((d) => d.severity === 'error');
         const errMsg =
-          compileRes.stderr.trim() || firstErr?.message || 'Java compilation failed.';
+          compileRes.compilerError ||
+          compileRes.stderr.trim() ||
+          firstErr?.message ||
+          'Java compilation failed.';
+        if (
+          (compileRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) &&
+          process.env.REMOTE_SANDBOX_FALLBACK !== 'false'
+        ) {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
         return {
           ok: false,
-          diagnostics,
+          diagnostics: compileRes.compilerUnavailable ? [] : diagnostics,
           stderr: errMsg,
           runtimeError: errMsg,
         };
       }
 
+      const javacPath = await resolveExecutable('javac');
+      const javaPath = await resolveExecutable('java');
+      if (!javaPath) {
+        await cleanupSandboxWorkspace(workspaceDir);
+        if (process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
+        const cfgErr =
+          "Java runtime (java) not found. Ensure a JDK/JRE is installed and 'java' is in PATH, or set JAVA_HOME / JAVA_PATH.";
+        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };
+      }
+
       const className = extractJavaClassName(code, fileName || 'Main.java');
       await fs.writeFile(path.join(workspaceDir, '_LogicLabRunner.java'), JAVA_RUNNER_CODE, 'utf8');
-      const runnerCompile = await runSandboxedProcess({
-        cmd: 'javac',
-        args: ['-encoding', 'UTF-8', '_LogicLabRunner.java'],
-        cwd: workspaceDir,
-        timeoutMs: 8000,
-      });
+      const runnerCompile = javacPath
+        ? await runSandboxedProcess({
+            cmd: javacPath,
+            args: ['-encoding', 'UTF-8', '_LogicLabRunner.java'],
+            cwd: workspaceDir,
+            timeoutMs: 12000,
+          })
+        : { exitCode: 1 };
 
       const javaUtf8Flags = [
         '-Dfile.encoding=UTF-8',
@@ -462,7 +497,7 @@ export async function startInteractiveSession(
         '-Dsun.stdout.encoding=UTF-8',
         '-Dsun.stderr.encoding=UTF-8',
       ];
-      cmd = 'java';
+      cmd = javaPath;
       args =
         runnerCompile.exitCode === 0
           ? [...javaUtf8Flags, '-cp', workspaceDir, '_LogicLabRunner', className]
@@ -475,18 +510,27 @@ export async function startInteractiveSession(
       if (!syntaxRes.success) {
         await cleanupSandboxWorkspace(workspaceDir);
         const firstErr = syntaxRes.diagnostics.find((d) => d.severity === 'error');
-        const errMsg = firstErr?.message || syntaxRes.stderr.trim() || 'Python syntax error.';
+        const errMsg =
+          syntaxRes.compilerError ||
+          firstErr?.message ||
+          syntaxRes.stderr.trim() ||
+          'Python syntax error.';
+        if (
+          (syntaxRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) &&
+          process.env.REMOTE_SANDBOX_FALLBACK !== 'false'
+        ) {
+          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+        }
         return {
           ok: false,
-          diagnostics,
+          diagnostics: syntaxRes.compilerUnavailable ? [] : diagnostics,
           stderr: errMsg,
           runtimeError: errMsg,
         };
       }
 
-      const sourceFileName =
-        fileName && fileName.endsWith('.py') ? path.basename(fileName) : 'script.py';
-      cmd = 'python';
+      const sourceFileName = sanitizeSourceFileName(fileName, 'script.py', ['.py']);
+      cmd = (await resolveExecutable('python')) || 'python';
       args = ['-u', sourceFileName];
       extraEnv = { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
     } else {
@@ -507,10 +551,9 @@ export async function startInteractiveSession(
         };
       }
 
-      const sourceFileName =
-        fileName && fileName.endsWith('.js') ? path.basename(fileName) : 'script.js';
+      const sourceFileName = sanitizeSourceFileName(fileName, 'script.js', ['.js', '.mjs', '.cjs']);
       await fs.writeFile(path.join(workspaceDir, '_preload.cjs'), NODE_PRELOAD_CJS, 'utf8');
-      cmd = 'node';
+      cmd = (await resolveExecutable('node')) || process.execPath;
       args = ['--require', './_preload.cjs', sourceFileName];
     }
 
@@ -588,12 +631,21 @@ export async function startInteractiveSession(
 
     child.on('error', (err: Error) => {
       const msg = `Failed to start process: ${err.message}`;
+      if (isLocalExecutionBlockedError(msg) && process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
+        session.isRemoteReplay = true;
+        session.child = null;
+        session.collectedInputs = initialStdin ? initialStdin.replace(/\r\n/g, '\n').split('\n') : [];
+        clearSessionTimers(session);
+        void cleanupSandboxWorkspace(session.workspaceDir);
+        void runRemoteReplayStep(session);
+        return;
+      }
       session.stderrAll += msg;
       emitSessionEvent(session, { type: 'stderr', data: { text: msg } });
     });
 
     child.on('close', (exitCode: number | null) => {
-      if (session.exited) return;
+      if (session.exited || session.isRemoteReplay) return;
       const tailOut = stdoutDecoder.end();
       if (tailOut) {
         if (session.stdoutAll.length < MAX_OUTPUT_BYTES) session.stdoutAll += tailOut;
@@ -642,11 +694,15 @@ export async function startInteractiveSession(
     if (workspaceDir) {
       await cleanupSandboxWorkspace(workspaceDir);
     }
+    const msg = err?.message || 'Execution failed to start.';
+    if (isLocalExecutionBlockedError(msg) && process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
+      return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+    }
     return {
       ok: false,
       diagnostics,
-      stderr: err?.message || 'Execution failed to start.',
-      runtimeError: err?.message || 'Execution failed to start.',
+      stderr: msg,
+      runtimeError: msg,
     };
   }
 }

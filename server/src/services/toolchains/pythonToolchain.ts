@@ -1,6 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { runSandboxedProcess, createSandboxWorkspace, cleanupSandboxWorkspace } from './sandbox';
+import {
+  runSandboxedProcess,
+  createSandboxWorkspace,
+  cleanupSandboxWorkspace,
+  resolveExecutable,
+  sanitizeSourceFileName,
+} from './sandbox';
 import {
   buildRemoteToolchainResult,
   executeViaRemoteSandbox,
@@ -17,10 +23,26 @@ export async function checkPythonSyntax(
   fileName = 'script.py'
 ): Promise<ToolchainCompileResult & { workspaceDir: string }> {
   const workspaceDir = await createSandboxWorkspace();
-  const sourceFileName = fileName.endsWith('.py') ? fileName : 'script.py';
+  const sourceFileName = sanitizeSourceFileName(fileName, 'script.py', ['.py']);
   const sourceFilePath = path.join(workspaceDir, sourceFileName);
 
   await fs.writeFile(sourceFilePath, code, 'utf8');
+
+  const pythonPath = await resolveExecutable('python');
+  if (!pythonPath) {
+    const configMsg =
+      "Python interpreter not found. Ensure Python 3 is installed and in PATH, or set PYTHON_PATH.";
+    return {
+      success: false,
+      diagnostics: [],
+      stdout: '',
+      stderr: configMsg,
+      workingDir: workspaceDir,
+      workspaceDir,
+      compilerUnavailable: true,
+      compilerError: configMsg,
+    };
+  }
 
   // Use python built-in ast parser via command line to get exact syntax diagnostics as JSON
   const pyCheckerScript = `
@@ -51,7 +73,7 @@ except Exception as e:
 `.trim();
 
   const procRes = await runSandboxedProcess({
-    cmd: 'python',
+    cmd: pythonPath,
     args: ['-c', pyCheckerScript],
     cwd: workspaceDir,
     timeoutMs: 4000,
@@ -126,11 +148,12 @@ export async function executePython(
       };
     }
 
-    const sourceFileName = fileName.endsWith('.py') ? fileName : 'script.py';
+    const sourceFileName = sanitizeSourceFileName(fileName, 'script.py', ['.py']);
+    const pythonPath = (await resolveExecutable('python')) || 'python';
 
     // Execute with unbuffered python (-u) and forced UTF-8 I/O on Windows
     const runRes = await runSandboxedProcess({
-      cmd: 'python',
+      cmd: pythonPath,
       args: ['-u', sourceFileName],
       cwd: syntaxRes.workspaceDir,
       stdin,

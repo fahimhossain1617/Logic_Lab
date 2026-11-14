@@ -130,18 +130,49 @@ async function runPiston(
   }
 }
 
+/**
+ * Judge0 CE always compiles Java submissions as `Main.java` and runs `java Main`.
+ * When the user's Java code uses a custom `public class <ClassName>` that matches
+ * their active filename (or default Main.java), adapt the source so Judge0 compiles
+ * and invokes `<ClassName>.main(args)` without throwing a `Main.java` filename error.
+ */
+function adaptJavaCodeForJudge0(code: string, fileName?: string): string {
+  const pubMatch = code.match(/\bpublic\s+((?:final\s+|abstract\s+)?class\s+)([A-Za-z_$][\w$]*)\b/);
+  if (!pubMatch || !pubMatch[2] || pubMatch[2] === 'Main') {
+    return code;
+  }
+  const className = pubMatch[2];
+  const trimmedFile = (fileName || '').trim();
+  const stem = trimmedFile.replace(/\.java$/i, '');
+  const isDefaultOrMatching =
+    !stem || /^main\d*$/i.test(stem) || stem === className;
+  if (!isDefaultOrMatching) {
+    return code;
+  }
+  const demoted = code.replace(
+    /\bpublic\s+((?:final\s+|abstract\s+)?class\s+)([A-Za-z_$][\w$]*)\b/,
+    '$1$2'
+  );
+  if (/\bclass\s+Main\b/.test(demoted)) {
+    return demoted;
+  }
+  return `${demoted}\npublic class Main { public static void main(String[] args) throws Exception { ${className}.main(args); } }\n`;
+}
+
 async function runJudge0(
   baseUrl: string,
   language: SupportedLanguage,
   code: string,
   stdin: string,
-  timeoutMs: number
+  timeoutMs: number,
+  fileName?: string
 ): Promise<RemoteSandboxResult | null> {
   const endpoint = `${baseUrl.replace(/\/+$/, '')}/submissions?base64_encoded=false&wait=true`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(timeoutMs + 8000, 12000));
   const startedAt = Date.now();
   const cpuLimitSec = Math.max(1, Math.min(10, Math.ceil(timeoutMs / 1000)));
+  const sourceCode = language === 'java' ? adaptJavaCodeForJudge0(code, fileName) : code;
 
   try {
     const res = await fetch(endpoint, {
@@ -150,7 +181,7 @@ async function runJudge0(
       signal: controller.signal,
       body: JSON.stringify({
         language_id: JUDGE0_LANGUAGE_IDS[language],
-        source_code: code,
+        source_code: sourceCode,
         stdin: normalizeStdin(stdin),
         cpu_time_limit: cpuLimitSec,
         wall_time_limit: cpuLimitSec + 2,
@@ -277,6 +308,6 @@ export async function executeViaRemoteSandbox(
   }
 
   const judge0Url = process.env.JUDGE0_API_URL?.trim() || DEFAULT_JUDGE0_URL;
-  return await runJudge0(judge0Url, language, code, stdin, timeoutMs);
+  return await runJudge0(judge0Url, language, code, stdin, timeoutMs, fileName);
 }
 

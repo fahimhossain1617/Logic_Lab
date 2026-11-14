@@ -271,7 +271,11 @@ export function validateSourceFileName(
   if (trimmed.length > 128) {
     return { valid: false, error: 'Filename exceeds maximum allowed length (128 characters).' };
   }
-  const lower = trimmed.toLowerCase();
+  const candidate =
+    !trimmed.includes('.') && allowedExts.length > 0
+      ? `${trimmed}${allowedExts[0]}`
+      : trimmed;
+  const lower = candidate.toLowerCase();
   const matchedExt = allowedExts.find((ext) => lower.endsWith(ext.toLowerCase()));
   if (!matchedExt) {
     return {
@@ -279,7 +283,7 @@ export function validateSourceFileName(
       error: `Filename "${trimmed}" does not match expected extension (${allowedExts.join(', ')}).`,
     };
   }
-  const stem = trimmed.slice(0, trimmed.length - matchedExt.length).trim();
+  const stem = candidate.slice(0, candidate.length - matchedExt.length).trim();
   if (!stem || stem === '.' || stem.startsWith('.')) {
     return {
       valid: false,
@@ -288,7 +292,7 @@ export function validateSourceFileName(
   }
   const sanitized = WINDOWS_RESERVED_BASENAMES.test(stem)
     ? `_${stem}${matchedExt}`
-    : trimmed;
+    : candidate;
   return { valid: true, sanitized };
 }
 
@@ -312,17 +316,21 @@ export function sanitizeSourceFileName(
 
   if (!cleaned || cleaned.length > 128) return defaultName;
 
-  const lower = cleaned.toLowerCase();
+  const withExt =
+    !cleaned.includes('.') && allowedExts.length > 0
+      ? `${cleaned}${allowedExts[0]}`
+      : cleaned;
+  const lower = withExt.toLowerCase();
   const matchedExt = allowedExts.find((ext) => lower.endsWith(ext.toLowerCase()));
   if (!matchedExt) return defaultName;
 
-  const stem = cleaned.slice(0, cleaned.length - matchedExt.length).trim();
+  const stem = withExt.slice(0, withExt.length - matchedExt.length).trim();
   if (!stem || stem === '.') return defaultName;
 
   if (WINDOWS_RESERVED_BASENAMES.test(stem)) {
     return `_${stem}${matchedExt}`;
   }
-  return cleaned;
+  return withExt;
 }
 
 const SANDBOX_BASE_DIR = path.resolve(path.join(os.tmpdir(), 'logic-lab-sandbox'));

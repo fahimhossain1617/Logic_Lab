@@ -235,7 +235,13 @@ function startStepTimer(session: InteractiveSession): void {
 async function runRemoteReplayStep(session: InteractiveSession): Promise<void> {
   const inputs = session.collectedInputs || [];
   const stdinStr = inputs.join('\n');
-  const remote = await executeViaRemoteSandbox(session.language, session.code, stdinStr, 5000);
+  const remote = await executeViaRemoteSandbox(
+    session.language,
+    session.code,
+    stdinStr,
+    5000,
+    session.fileName
+  );
 
   if (!remote) {
     session.exited = true;
@@ -474,7 +480,14 @@ export async function startInteractiveSession(
           (compileRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) &&
           process.env.REMOTE_SANDBOX_FALLBACK !== 'false'
         ) {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+          return createRemoteReplaySession(
+            rawCode,
+            language,
+            compileRes.sourceFileName || fileName,
+            isInteractive,
+            prep.diagnostics,
+            initialStdin
+          );
         }
         return {
           ok: false,
@@ -489,7 +502,14 @@ export async function startInteractiveSession(
       if (!javaPath) {
         await cleanupSandboxWorkspace(workspaceDir);
         if (process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+          return createRemoteReplaySession(
+            rawCode,
+            language,
+            compileRes.sourceFileName || fileName,
+            isInteractive,
+            prep.diagnostics,
+            initialStdin
+          );
         }
         const cfgErr =
           "Java runtime (java) not found. Ensure a JDK/JRE is installed and 'java' is in PATH, or set JAVA_HOME / JAVA_PATH.";

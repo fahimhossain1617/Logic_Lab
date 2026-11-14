@@ -617,4 +617,41 @@ test('9.6 Frontend useLabStore file & tab state management', () => {
   useLabStore.getState().selectUserFile(secondFileId);
   assert.equal(useLabStore.getState().code, 'print("tab2")');
   assert.equal(useLabStore.getState().executionStatus, 'idle');
+
+  // Dynamic Java public class sync when on default Main.java or extensionless tab name
+  useLabStore.getState().setLanguage('java');
+  useLabStore.getState().setFileName('Main.java');
+  useLabStore.getState().setCode(
+    `public class PalindromeChecker {\n  public static void main(String[] args) {\n    System.out.println("ok");\n  }\n}`
+  );
+  assert.equal(useLabStore.getState().fileName, 'PalindromeChecker.java');
+});
+
+test('9.7 Dynamic Java Filename Compilation (PalindromeChecker with/without extension and default Main.java)', async () => {
+  const palindromeCode = `public class PalindromeChecker {
+    public static boolean isPalindrome(String str) {
+        String clean = str.replaceAll("[^a-zA-Z0-9]", "").toLowerCase();
+        String reversed = new StringBuilder(clean).reverse().toString();
+        return clean.equals(reversed);
+    }
+    public static void main(String[] args) {
+        String word = "Level";
+        System.out.println(word + " কি প্যালিনড্রোম? " + isPalindrome(word));
+    }
+}`;
+
+  // 1. Extensionless tab name ("PalindromeChecker") compiles as PalindromeChecker.java and runs java PalindromeChecker
+  const rExtless = await executeCode(palindromeCode, 'java', '', 5000, 'PalindromeChecker');
+  assert.equal(rExtless.status, 'success', `Expected success for extensionless PalindromeChecker, got: ${rExtless.stderr}`);
+  assert.ok(rExtless.stdout.includes('Level কি প্যালিনড্রোম? true'));
+
+  // 2. Default placeholder ("Main.java") with public class PalindromeChecker auto-syncs and compiles cleanly
+  const rDefault = await executeCode(palindromeCode, 'java', '', 5000, 'Main.java');
+  assert.equal(rDefault.status, 'success', `Expected success for default Main.java with public class, got: ${rDefault.stderr}`);
+  assert.ok(rDefault.stdout.includes('Level কি প্যালিনড্রোম? true'));
+
+  // 3. validateSourceFileName accepts extensionless filename and appends language extension
+  const vJava = validateSourceFileName('PalindromeChecker', ['.java']);
+  assert.equal(vJava.valid, true);
+  assert.equal(vJava.sanitized, 'PalindromeChecker.java');
 });

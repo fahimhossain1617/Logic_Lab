@@ -39,6 +39,15 @@ export function extractJavaPackageName(code: string): string | null {
 }
 
 /**
+ * Extracts explicit `public class <Name>` declaration from Java source if present.
+ */
+export function extractJavaPublicClassName(code: string): string | null {
+  const clean = stripJavaCommentsAndStrings(code);
+  const pubMatch = clean.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
+  return pubMatch && pubMatch[1] ? pubMatch[1] : null;
+}
+
+/**
  * Extracts public class name or main-entry class name from Java source.
  * Prefers `public class ...`, then any top-level class containing `main(`, then first `class`, then filename stem.
  */
@@ -46,9 +55,9 @@ export function extractJavaClassName(code: string, fallbackFileName = 'Main.java
   const clean = stripJavaCommentsAndStrings(code);
 
   // 1. Look for public class declaration
-  const pubMatch = clean.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
-  if (pubMatch && pubMatch[1]) {
-    return pubMatch[1];
+  const pubClass = extractJavaPublicClassName(code);
+  if (pubClass) {
+    return pubClass;
   }
 
   // 2. Look for a class that declares a main method (handles multi-class non-public files)
@@ -125,10 +134,22 @@ export async function compileJava(
   fileName = 'Main.java'
 ): Promise<ToolchainCompileResult & { workspaceDir: string; sourceFileName: string }> {
   const workspaceDir = await createSandboxWorkspace();
+  const publicClassName = extractJavaPublicClassName(code);
   const simpleClassName = extractJavaClassName(code, fileName);
   const pkgName = extractJavaPackageName(code);
   const fullyQualifiedMainClass = pkgName ? `${pkgName}.${simpleClassName}` : simpleClassName;
-  const sourceFileName = sanitizeSourceFileName(fileName, `${simpleClassName}.java`, ['.java']);
+
+  // If the caller passed a default placeholder filename (e.g. 'Main.java', 'Main2.java', 'main.js')
+  // while the code declares a specific `public class ClassName`, sync the source file name to
+  // `${publicClassName}.java` so single-file execution works seamlessly.
+  const trimmedInputName = (fileName || '').trim();
+  const isDefaultPlaceholderName = !trimmedInputName || /^main\d*(?:\.[a-z0-9]+)?$/i.test(trimmedInputName);
+  const effectiveInputFileName =
+    isDefaultPlaceholderName && publicClassName
+      ? `${publicClassName}.java`
+      : fileName;
+
+  const sourceFileName = sanitizeSourceFileName(effectiveInputFileName, `${simpleClassName}.java`, ['.java']);
   const sourceFilePath = path.join(workspaceDir, sourceFileName);
 
   await fs.writeFile(sourceFilePath, code, 'utf8');
@@ -265,7 +286,7 @@ export async function executeJava(
     const mainClass = compileRes.mainClass || 'Main';
     const javaPath = await resolveExecutable('java');
     if (!javaPath) {
-      const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs);
+      const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs, compileRes.sourceFileName);
       if (remote) {
         return buildRemoteToolchainResult(remote, compileRes.diagnostics);
       }
@@ -306,7 +327,7 @@ export async function executeJava(
     });
 
     if (runRes.exitCode !== 0 && isLocalExecutionBlockedError(runRes.stderr)) {
-      const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs);
+      const remote = await executeViaRemoteSandbox('java', code, stdin, timeoutMs, compileRes.sourceFileName);
       if (remote) {
         return buildRemoteToolchainResult(remote, compileRes.diagnostics);
       }

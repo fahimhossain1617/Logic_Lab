@@ -487,39 +487,69 @@ export const CodeEditorPanel: React.FC = () => {
       <div className="flex flex-wrap items-center justify-between px-3 sm:px-5 py-2.5 bg-[var(--bg-gutter)] border-b border-[var(--border-subtle)] gap-3">
         {/* Left: Active File Inline Rename, Other File Tabs, and + New File */}
         <div
-          className="flex items-center gap-2 overflow-x-auto max-w-full"
+          className="flex flex-wrap items-center gap-2 overflow-visible max-w-full"
           role="tablist"
           aria-label={explainLanguage === 'bn' ? 'ফাইল তালিকা' : 'File list'}
         >
           {userFiles.map((f) => {
             const isSelected = f.id === activeFileId;
+            const displayLen = Math.max((fileName || 'main.js').length, 4);
             return (
               <div
                 key={f.id}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono transition-colors border ${
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono transition-all border shrink-0 overflow-visible ${
                   isSelected
-                    ? 'bg-[var(--bg-panel-raised)] border-[var(--border-active)]/70 text-[var(--text-primary)] font-semibold'
+                    ? 'bg-[var(--bg-panel-raised)] border-[var(--border-active)]/70 text-[var(--text-primary)] font-semibold shadow-sm'
                     : 'bg-transparent border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-panel)]'
                 }`}
               >
-                <FileCode className={`w-3.5 h-3.5 ${isSelected ? 'text-[var(--text-accent)]' : 'text-[var(--text-muted)]'}`} />
+                <FileCode className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-[var(--text-accent)]' : 'text-[var(--text-muted)]'}`} />
                 {isSelected ? (
-                  <input
-                    type="text"
-                    value={fileName}
-                    onChange={(e) => setFileName(e.target.value)}
-                    placeholder="main.js"
-                    aria-label={explainLanguage === 'bn' ? 'ফাইলের নাম' : 'File name'}
-                    data-testid="file-name-input"
-                    className="w-24 sm:w-28 bg-transparent text-[var(--text-primary)] font-semibold focus:outline-none"
-                  />
+                  <span className="inline-grid items-center overflow-visible">
+                    <span
+                      aria-hidden="true"
+                      className="col-start-1 row-start-1 invisible whitespace-pre font-semibold px-0.5 pointer-events-none select-none"
+                    >
+                      {`${fileName || 'main.js'} `}
+                    </span>
+                    <input
+                      type="text"
+                      value={fileName}
+                      onChange={(e) => setFileName(e.target.value)}
+                      onBlur={() => {
+                        const trimmed = fileName.trim();
+                        const ext =
+                          language === 'java'
+                            ? '.java'
+                            : language === 'python'
+                            ? '.py'
+                            : language === 'cpp'
+                            ? '.cpp'
+                            : '.js';
+                        if (!trimmed) {
+                          setFileName(`${language === 'java' ? 'Main' : 'main'}${ext}`);
+                        } else if (!trimmed.includes('.')) {
+                          setFileName(`${trimmed}${ext}`);
+                        }
+                      }}
+                      placeholder="main.js"
+                      aria-label={explainLanguage === 'bn' ? 'ফাইলের নাম' : 'File name'}
+                      data-testid="file-name-input"
+                      size={displayLen}
+                      style={{
+                        width: `${displayLen + 1}ch`,
+                        minWidth: '4.5ch',
+                      }}
+                      className="col-start-1 row-start-1 w-full bg-transparent text-[var(--text-primary)] font-semibold focus:outline-none overflow-visible"
+                    />
+                  </span>
                 ) : (
                   <button
                     type="button"
                     role="tab"
                     aria-selected={false}
                     onClick={() => selectUserFile(f.id)}
-                    className="cursor-pointer truncate max-w-[140px]"
+                    className="cursor-pointer whitespace-nowrap"
                   >
                     {f.fileName}
                   </button>
@@ -528,7 +558,7 @@ export const CodeEditorPanel: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => deleteUserFile(f.id)}
-                    className="text-[var(--text-muted)] hover:text-[var(--text-danger)] cursor-pointer ml-0.5 p-0.5 rounded"
+                    className="text-[var(--text-muted)] hover:text-[var(--text-danger)] cursor-pointer ml-0.5 p-0.5 rounded shrink-0"
                     aria-label={`Close ${f.fileName}`}
                     title="Close file"
                   >
@@ -542,11 +572,11 @@ export const CodeEditorPanel: React.FC = () => {
           <button
             type="button"
             onClick={createNewUserFile}
-            className="px-2 py-1 rounded-lg text-xs font-medium text-[var(--text-accent)] hover:bg-[var(--code-pill-bg)] transition-colors cursor-pointer whitespace-nowrap inline-flex items-center gap-1"
+            className="px-2.5 py-1 rounded-full text-xs font-medium text-[var(--text-accent)] hover:bg-[var(--code-pill-bg)] transition-colors cursor-pointer whitespace-nowrap inline-flex items-center gap-1 shrink-0"
             data-testid="new-user-file-btn"
             title={explainLanguage === 'bn' ? 'নতুন ফাইল তৈরি করুন' : 'Create new file'}
           >
-            <Plus className="w-3.5 h-3.5" />
+            <Plus className="w-3.5 h-3.5 shrink-0" />
             <span>{explainLanguage === 'bn' ? 'নতুন ফাইল' : 'New File'}</span>
           </button>
         </div>

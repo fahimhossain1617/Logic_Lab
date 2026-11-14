@@ -181,10 +181,19 @@ function inferLanguageFromFileName(
   return fallback;
 }
 
-function extractJavaClassNameForFile(code: string): string {
-  const clean = code.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
+function extractJavaPublicClassForFile(code: string): string | null {
+  const clean = code.replace(
+    /\/\*[\s\S]*?\*\/|\/\/.*$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/gm,
+    (m) => (m.startsWith('/') ? ' ' : '""')
+  );
   const pubMatch = clean.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
-  if (pubMatch?.[1]) return pubMatch[1];
+  return pubMatch?.[1] || null;
+}
+
+function extractJavaClassNameForFile(code: string): string {
+  const pub = extractJavaPublicClassForFile(code);
+  if (pub) return pub;
+  const clean = code.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
   const anyMatch = clean.match(/\bclass\s+([A-Za-z_$][\w$]*)\b/);
   if (anyMatch?.[1]) return anyMatch[1];
   return 'Main';
@@ -202,6 +211,45 @@ function defaultExtensionForLanguage(lang: SupportedLanguage): string {
     default:
       return '.js';
   }
+}
+
+function ensureFileNameExtension(fileName: string, lang: SupportedLanguage): string {
+  const trimmed = fileName.trim();
+  if (!trimmed) {
+    return `${lang === 'java' ? 'Main' : 'main'}${defaultExtensionForLanguage(lang)}`;
+  }
+  if (!trimmed.includes('.')) {
+    return `${trimmed}${defaultExtensionForLanguage(lang)}`;
+  }
+  return trimmed;
+}
+
+function resolveExecutionFileAndLanguage(
+  code: string,
+  fileName: string,
+  language: SupportedLanguage
+): { fileName: string; language: SupportedLanguage } {
+  const trimmed = fileName.trim();
+  if (
+    language === 'javascript' &&
+    (!trimmed || /^main\d*(?:\.js)?$/i.test(trimmed)) &&
+    (/\bpublic\s+(?:final\s+|abstract\s+)?class\s+[A-Za-z_$]/.test(code) ||
+      /\bSystem\.out\.print/.test(code))
+  ) {
+    return {
+      language: 'java',
+      fileName: `${extractJavaClassNameForFile(code)}.java`,
+    };
+  }
+
+  let resolvedName = ensureFileNameExtension(fileName, language);
+  if (language === 'java') {
+    const pubClass = extractJavaPublicClassForFile(code);
+    if (pubClass && /^main\d*\.java$/i.test(resolvedName)) {
+      resolvedName = `${pubClass}.java`;
+    }
+  }
+  return { language, fileName: resolvedName };
 }
 
 interface LabState {
@@ -1008,11 +1056,14 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   setLanguage: (language) => {
-    const { fileName, activeFileId, userFiles, language: prevLang } = get();
+    const { fileName, activeFileId, userFiles, language: prevLang, code } = get();
     const rawBase =
       fileName.replace(/\.(js|mjs|cjs|ts|py|cpp|cc|cxx|c|h|hpp|java)$/i, '') || 'main';
+    const pubClass = language === 'java' ? extractJavaPublicClassForFile(code) : null;
     const baseName =
-      language === 'java' && rawBase.toLowerCase() === 'main'
+      language === 'java' && /^main\d*$/i.test(rawBase) && pubClass
+        ? pubClass
+        : language === 'java' && rawBase.toLowerCase() === 'main'
         ? 'Main'
         : language !== 'java' && rawBase === 'Main'
         ? 'main'
@@ -1160,11 +1211,44 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   setCode: (code) => {
-    const { activeFileId, userFiles, trace } = get();
-    const updated = userFiles.map((f) => (f.id === activeFileId ? { ...f, code } : f));
+    const { activeFileId, userFiles, trace, language, fileName, code: prevCode } = get();
+    let nextLanguage = language;
+    let nextFileName = fileName;
+    const trimmedFile = nextFileName.trim();
+
+    if (
+      nextLanguage === 'javascript' &&
+      (!trimmedFile || /^main\d*(?:\.js)?$/i.test(trimmedFile)) &&
+      (/\bpublic\s+(?:final\s+|abstract\s+)?class\s+[A-Za-z_$]/.test(code) ||
+        /\bSystem\.out\.print/.test(code))
+    ) {
+      nextLanguage = 'java';
+      nextFileName = `${extractJavaClassNameForFile(code)}.java`;
+    } else if (nextLanguage === 'java') {
+      const pubClass = extractJavaPublicClassForFile(code);
+      if (pubClass) {
+        const prevPubClass = extractJavaPublicClassForFile(prevCode);
+        const isDefaultJavaFile = !trimmedFile || /^main\d*(?:\.java|\.js)?$/i.test(trimmedFile);
+        const wasSyncedWithPrevClass = Boolean(
+          prevPubClass && (trimmedFile === `${prevPubClass}.java` || trimmedFile === prevPubClass)
+        );
+        const matchesStemWithoutExt = trimmedFile === pubClass;
+        if (isDefaultJavaFile || wasSyncedWithPrevClass || matchesStemWithoutExt) {
+          nextFileName = `${pubClass}.java`;
+        }
+      }
+    }
+
+    const updated = userFiles.map((f) =>
+      f.id === activeFileId
+        ? { ...f, code, language: nextLanguage, fileName: nextFileName }
+        : f
+    );
     const wasError = Boolean(trace.hasError || trace.verdict.status === 'compile_error');
     set({
       code,
+      language: nextLanguage,
+      fileName: nextFileName,
       userFiles: updated,
       isDirty: true,
       apiError: null,
@@ -1497,14 +1581,11 @@ export const useLabStore = create<LabState>((set, get) => ({
       return;
     }
 
-    // Auto-switch from untouched default main.js to Java if the user pasted a Java class
-    if (
-      language === 'javascript' &&
-      fileName === 'main.js' &&
-      (/\bpublic\s+class\s+[A-Za-z_$]/.test(code) || /\bSystem\.out\.print/.test(code))
-    ) {
-      language = 'java';
-      fileName = `${extractJavaClassNameForFile(code)}.java`;
+    // Sync language and filename (including extensionless tab names and Java public class names) before running
+    const resolvedExecMeta = resolveExecutionFileAndLanguage(code, fileName, language);
+    if (resolvedExecMeta.language !== language || resolvedExecMeta.fileName !== fileName) {
+      language = resolvedExecMeta.language;
+      fileName = resolvedExecMeta.fileName;
       const updatedFiles = userFiles.map((f) =>
         f.id === activeFileId ? { ...f, language, fileName } : f
       );
@@ -2098,14 +2179,11 @@ export const useLabStore = create<LabState>((set, get) => ({
       return;
     }
 
-    // Auto-switch from untouched default main.js to Java if the user pasted a Java class
-    if (
-      language === 'javascript' &&
-      fileName === 'main.js' &&
-      (/\bpublic\s+class\s+[A-Za-z_$]/.test(code) || /\bSystem\.out\.print/.test(code))
-    ) {
-      language = 'java';
-      fileName = `${extractJavaClassNameForFile(code)}.java`;
+    // Sync language and filename (including extensionless tab names and Java public class names) before running
+    const resolvedExecMeta = resolveExecutionFileAndLanguage(code, fileName, language);
+    if (resolvedExecMeta.language !== language || resolvedExecMeta.fileName !== fileName) {
+      language = resolvedExecMeta.language;
+      fileName = resolvedExecMeta.fileName;
       const updatedFiles = userFiles.map((f) =>
         f.id === activeFileId ? { ...f, language, fileName } : f
       );

@@ -181,6 +181,46 @@ test('Browser E2E Regression Suite across Java, JavaScript, C++, Python, STDIN, 
     await runVisualizeAndWait(page);
     const errVisible = await page.locator('[data-testid="output-error-state"]').isVisible();
     assert.equal(errVisible, true, 'Compilation error banner must be displayed on invalid Java code');
+
+    // 8. Responsive auto-expanding file tab input & extensionless PalindromeChecker Java execution
+    await page.locator('[data-testid="new-user-file-btn"]').click();
+    await page.selectOption('#editor-language-select', 'java');
+    const fnInput = page.locator('[data-testid="file-name-input"]');
+    await fnInput.fill('Main');
+    const shortWidth = await fnInput.evaluate((el) => el.getBoundingClientRect().width);
+
+    await fnInput.fill('BinarySearchTreeExample.java');
+    const longMetrics = await fnInput.evaluate((el) => {
+      const inp = el as HTMLInputElement;
+      return {
+        width: inp.getBoundingClientRect().width,
+        clientWidth: inp.clientWidth,
+        scrollWidth: inp.scrollWidth,
+      };
+    });
+    assert.ok(
+      longMetrics.width > shortWidth + 60,
+      `Expected long filename input width (${longMetrics.width}px) to expand significantly beyond short filename width (${shortWidth}px)`
+    );
+    assert.ok(
+      longMetrics.scrollWidth <= longMetrics.clientWidth + 2,
+      `Expected zero horizontal clipping on long filename (scrollWidth=${longMetrics.scrollWidth}, clientWidth=${longMetrics.clientWidth})`
+    );
+
+    // Extensionless "PalindromeChecker" tab name + public class PalindromeChecker execution
+    await setFileAndCode(
+      page,
+      'java',
+      'PalindromeChecker',
+      `public class PalindromeChecker {\n  public static boolean isPalindrome(String str) {\n    String clean = str.replaceAll("[^a-zA-Z0-9]", "").toLowerCase();\n    String reversed = new StringBuilder(clean).reverse().toString();\n    return clean.equals(reversed);\n  }\n  public static void main(String[] args) {\n    String word = "Level";\n    System.out.println(word + " কি প্যালিনড্রোম? " + isPalindrome(word));\n  }\n}`
+    );
+    await runFastAndWait(page);
+    assert.equal(await fnInput.inputValue(), 'PalindromeChecker.java');
+    const palOut = await page.locator('[data-testid="real-output-section"]').innerText();
+    assert.ok(
+      palOut.includes('Level কি প্যালিনড্রোম? true'),
+      `Expected PalindromeChecker output, got: ${palOut}`
+    );
   } finally {
     await browser.close();
     killServerTree(serverProc);

@@ -7278,7 +7278,8 @@ function validateSourceFileName(fileName, allowedExts) {
   if (trimmed.length > 128) {
     return { valid: false, error: "Filename exceeds maximum allowed length (128 characters)." };
   }
-  const lower = trimmed.toLowerCase();
+  const candidate = !trimmed.includes(".") && allowedExts.length > 0 ? `${trimmed}${allowedExts[0]}` : trimmed;
+  const lower = candidate.toLowerCase();
   const matchedExt = allowedExts.find((ext) => lower.endsWith(ext.toLowerCase()));
   if (!matchedExt) {
     return {
@@ -7286,14 +7287,14 @@ function validateSourceFileName(fileName, allowedExts) {
       error: `Filename "${trimmed}" does not match expected extension (${allowedExts.join(", ")}).`
     };
   }
-  const stem = trimmed.slice(0, trimmed.length - matchedExt.length).trim();
+  const stem = candidate.slice(0, candidate.length - matchedExt.length).trim();
   if (!stem || stem === "." || stem.startsWith(".")) {
     return {
       valid: false,
       error: `Filename "${trimmed}" must have a valid name before the extension.`
     };
   }
-  const sanitized = WINDOWS_RESERVED_BASENAMES.test(stem) ? `_${stem}${matchedExt}` : trimmed;
+  const sanitized = WINDOWS_RESERVED_BASENAMES.test(stem) ? `_${stem}${matchedExt}` : candidate;
   return { valid: true, sanitized };
 }
 function sanitizeSourceFileName(fileName, defaultName, allowedExts) {
@@ -7301,15 +7302,16 @@ function sanitizeSourceFileName(fileName, defaultName, allowedExts) {
   const normalized = fileName.replace(/\\/g, "/").split("/").pop() || "";
   const cleaned = normalized.replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, "").replace(/\.{2,}/g, ".").trim().replace(/^\.+|\.+$/g, "").trim();
   if (!cleaned || cleaned.length > 128) return defaultName;
-  const lower = cleaned.toLowerCase();
+  const withExt = !cleaned.includes(".") && allowedExts.length > 0 ? `${cleaned}${allowedExts[0]}` : cleaned;
+  const lower = withExt.toLowerCase();
   const matchedExt = allowedExts.find((ext) => lower.endsWith(ext.toLowerCase()));
   if (!matchedExt) return defaultName;
-  const stem = cleaned.slice(0, cleaned.length - matchedExt.length).trim();
+  const stem = withExt.slice(0, withExt.length - matchedExt.length).trim();
   if (!stem || stem === ".") return defaultName;
   if (WINDOWS_RESERVED_BASENAMES.test(stem)) {
     return `_${stem}${matchedExt}`;
   }
-  return cleaned;
+  return withExt;
 }
 var SANDBOX_BASE_DIR = path.resolve(path.join(os.tmpdir(), "logic-lab-sandbox"));
 async function createSandboxWorkspace() {
@@ -7646,12 +7648,36 @@ async function runPiston(baseUrl, language, code, stdin, timeoutMs, fileName) {
     clearTimeout(timer);
   }
 }
-async function runJudge0(baseUrl, language, code, stdin, timeoutMs) {
+function adaptJavaCodeForJudge0(code, fileName) {
+  const pubMatch = code.match(/\bpublic\s+((?:final\s+|abstract\s+)?class\s+)([A-Za-z_$][\w$]*)\b/);
+  if (!pubMatch || !pubMatch[2] || pubMatch[2] === "Main") {
+    return code;
+  }
+  const className = pubMatch[2];
+  const trimmedFile = (fileName || "").trim();
+  const stem = trimmedFile.replace(/\.java$/i, "");
+  const isDefaultOrMatching = !stem || /^main\d*$/i.test(stem) || stem === className;
+  if (!isDefaultOrMatching) {
+    return code;
+  }
+  const demoted = code.replace(
+    /\bpublic\s+((?:final\s+|abstract\s+)?class\s+)([A-Za-z_$][\w$]*)\b/,
+    "$1$2"
+  );
+  if (/\bclass\s+Main\b/.test(demoted)) {
+    return demoted;
+  }
+  return `${demoted}
+public class Main { public static void main(String[] args) throws Exception { ${className}.main(args); } }
+`;
+}
+async function runJudge0(baseUrl, language, code, stdin, timeoutMs, fileName) {
   const endpoint = `${baseUrl.replace(/\/+$/, "")}/submissions?base64_encoded=false&wait=true`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(timeoutMs + 8e3, 12e3));
   const startedAt = Date.now();
   const cpuLimitSec = Math.max(1, Math.min(10, Math.ceil(timeoutMs / 1e3)));
+  const sourceCode = language === "java" ? adaptJavaCodeForJudge0(code, fileName) : code;
   try {
     const res = await fetch(endpoint, {
       method: "POST",
@@ -7659,7 +7685,7 @@ async function runJudge0(baseUrl, language, code, stdin, timeoutMs) {
       signal: controller.signal,
       body: JSON.stringify({
         language_id: JUDGE0_LANGUAGE_IDS[language],
-        source_code: code,
+        source_code: sourceCode,
         stdin: normalizeStdin(stdin),
         cpu_time_limit: cpuLimitSec,
         wall_time_limit: cpuLimitSec + 2
@@ -7734,7 +7760,7 @@ async function executeViaRemoteSandbox(language, code, stdin = "", timeoutMs = 4
     if (pistonRes?.ok) return pistonRes;
   }
   const judge0Url = process.env.JUDGE0_API_URL?.trim() || DEFAULT_JUDGE0_URL;
-  return await runJudge0(judge0Url, language, code, stdin, timeoutMs);
+  return await runJudge0(judge0Url, language, code, stdin, timeoutMs, fileName);
 }
 
 // server/src/services/toolchains/javaToolchain.ts
@@ -7752,11 +7778,16 @@ function extractJavaPackageName(code) {
   }
   return null;
 }
-function extractJavaClassName(code, fallbackFileName = "Main.java") {
+function extractJavaPublicClassName(code) {
   const clean = stripJavaCommentsAndStrings(code);
   const pubMatch = clean.match(/\bpublic\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
-  if (pubMatch && pubMatch[1]) {
-    return pubMatch[1];
+  return pubMatch && pubMatch[1] ? pubMatch[1] : null;
+}
+function extractJavaClassName(code, fallbackFileName = "Main.java") {
+  const clean = stripJavaCommentsAndStrings(code);
+  const pubClass = extractJavaPublicClassName(code);
+  if (pubClass) {
+    return pubClass;
   }
   const classHeaderRegex = /\bclass\s+([A-Za-z_$][\w$]*)\b[^{]*\{/g;
   const classMatches = [...clean.matchAll(classHeaderRegex)];
@@ -7809,10 +7840,14 @@ ${stdout}`;
 }
 async function compileJava(code, fileName = "Main.java") {
   const workspaceDir = await createSandboxWorkspace();
+  const publicClassName = extractJavaPublicClassName(code);
   const simpleClassName = extractJavaClassName(code, fileName);
   const pkgName = extractJavaPackageName(code);
   const fullyQualifiedMainClass = pkgName ? `${pkgName}.${simpleClassName}` : simpleClassName;
-  const sourceFileName = sanitizeSourceFileName(fileName, `${simpleClassName}.java`, [".java"]);
+  const trimmedInputName = (fileName || "").trim();
+  const isDefaultPlaceholderName = !trimmedInputName || /^main\d*(?:\.[a-z0-9]+)?$/i.test(trimmedInputName);
+  const effectiveInputFileName = isDefaultPlaceholderName && publicClassName ? `${publicClassName}.java` : fileName;
+  const sourceFileName = sanitizeSourceFileName(effectiveInputFileName, `${simpleClassName}.java`, [".java"]);
   const sourceFilePath = path2.join(workspaceDir, sourceFileName);
   await fs2.writeFile(sourceFilePath, code, "utf8");
   const javacPath = await resolveExecutable("javac");
@@ -7921,7 +7956,7 @@ async function executeJava(code, stdin = "", timeoutMs = 4e3, fileName = "Main.j
     const mainClass = compileRes.mainClass || "Main";
     const javaPath = await resolveExecutable("java");
     if (!javaPath) {
-      const remote = await executeViaRemoteSandbox("java", code, stdin, timeoutMs);
+      const remote = await executeViaRemoteSandbox("java", code, stdin, timeoutMs, compileRes.sourceFileName);
       if (remote) {
         return buildRemoteToolchainResult(remote, compileRes.diagnostics);
       }
@@ -7958,7 +7993,7 @@ async function executeJava(code, stdin = "", timeoutMs = 4e3, fileName = "Main.j
       timeoutMs
     });
     if (runRes.exitCode !== 0 && isLocalExecutionBlockedError(runRes.stderr)) {
-      const remote = await executeViaRemoteSandbox("java", code, stdin, timeoutMs);
+      const remote = await executeViaRemoteSandbox("java", code, stdin, timeoutMs, compileRes.sourceFileName);
       if (remote) {
         return buildRemoteToolchainResult(remote, compileRes.diagnostics);
       }
@@ -10231,7 +10266,13 @@ function startStepTimer(session) {
 async function runRemoteReplayStep(session) {
   const inputs = session.collectedInputs || [];
   const stdinStr = inputs.join("\n");
-  const remote = await executeViaRemoteSandbox(session.language, session.code, stdinStr, 5e3);
+  const remote = await executeViaRemoteSandbox(
+    session.language,
+    session.code,
+    stdinStr,
+    5e3,
+    session.fileName
+  );
   if (!remote) {
     session.exited = true;
     const msg = "Local compiler is unavailable and remote sandbox is unreachable.";
@@ -10419,7 +10460,14 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
         const firstErr = mappedJavaDiags.find((d) => d.severity === "error");
         const errMsg = compileRes.compilerError || compileRes.stderr.trim() || firstErr?.message || "Java compilation failed.";
         if ((compileRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) && process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+          return createRemoteReplaySession(
+            rawCode,
+            language,
+            compileRes.sourceFileName || fileName,
+            isInteractive,
+            prep.diagnostics,
+            initialStdin
+          );
         }
         return {
           ok: false,
@@ -10433,7 +10481,14 @@ async function startInteractiveSession(rawCode, language, fileName, initialStdin
       if (!javaPath) {
         await cleanupSandboxWorkspace(workspaceDir);
         if (process.env.REMOTE_SANDBOX_FALLBACK !== "false") {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+          return createRemoteReplaySession(
+            rawCode,
+            language,
+            compileRes.sourceFileName || fileName,
+            isInteractive,
+            prep.diagnostics,
+            initialStdin
+          );
         }
         const cfgErr = "Java runtime (java) not found. Ensure a JDK/JRE is installed and 'java' is in PATH, or set JAVA_HOME / JAVA_PATH.";
         return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };

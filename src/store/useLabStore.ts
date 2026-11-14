@@ -18,6 +18,7 @@ import {
   classifyErrorCategory,
   detectInputCalls,
   generateSampleStdin,
+  isMissingStdinEofError,
   tokenizeStdin,
 } from '../../shared/stdinHelper';
 import {
@@ -284,6 +285,8 @@ interface LabState {
   currentInputValue: string;
   terminalExecState: TerminalExecState;
   activeSessionId: string | null;
+  isRemoteInteractive: boolean;
+  remoteStdoutPrefix: string;
   recentExecutions: CodeExecutionRecord[];
   hasExecuted: boolean;
   activeResultTab: WorkspaceResultTab;
@@ -573,6 +576,8 @@ function getFreshTabReset(fileId?: string): Partial<LabState> {
     terminalCollectedInputs: [],
     lastTerminalSnapshot: null,
     activeSessionId: null,
+    isRemoteInteractive: false,
+    remoteStdoutPrefix: '',
     apiError: null,
     apiNotice: null,
     stdin: '',
@@ -584,6 +589,21 @@ function getFreshTabReset(fileId?: string): Partial<LabState> {
 
 function makeTerminalLineId(): string {
   return `tline-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function splitStdoutForTerminalPrompt(chunk: string): {
+  lines: TerminalLine[];
+  prompt: string;
+} {
+  const normalized = chunk.replace(/\r\n/g, '\n');
+  const parts = normalized.split('\n');
+  const lines: TerminalLine[] = parts.slice(0, -1).map((text) => ({
+    id: makeTerminalLineId(),
+    type: 'output',
+    text,
+  }));
+  const prompt = parts[parts.length - 1] ?? '';
+  return { lines, prompt };
 }
 
 interface ClientCachedTrace {
@@ -712,6 +732,8 @@ export const useLabStore = create<LabState>((set, get) => ({
   currentInputValue: '',
   terminalExecState: 'IDLE',
   activeSessionId: null,
+  isRemoteInteractive: false,
+  remoteStdoutPrefix: '',
   recentExecutions: [],
   hasExecuted: false,
   activeResultTab: 'explanation',
@@ -1543,6 +1565,8 @@ export const useLabStore = create<LabState>((set, get) => ({
       currentInputValue: '',
       terminalExecState: 'COMPILING',
       activeSessionId: null,
+      isRemoteInteractive: false,
+      remoteStdoutPrefix: '',
       diagnostics: [],
       executionStatus: 'idle',
     });
@@ -1650,6 +1674,33 @@ export const useLabStore = create<LabState>((set, get) => ({
           timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
           diagnostics: fbDiags,
         };
+
+        const initialCollected = stdin.trim()
+          ? stdin.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
+          : [];
+
+        if (
+          fastRes.executionBackend === 'remote' &&
+          !success &&
+          isMissingStdinEofError(stderr)
+        ) {
+          const { lines: promptLines, prompt } = splitStdoutForTerminalPrompt(stdout);
+          set({
+            isFastRunning: false,
+            activeSessionId: null,
+            isRemoteInteractive: true,
+            remoteStdoutPrefix: stdout,
+            terminalCollectedInputs: initialCollected,
+            currentPrompt: prompt,
+            currentInputValue: '',
+            terminalExecState: 'WAITING_FOR_INPUT',
+            terminalHistory: promptLines,
+            fastRunResult: { ...fastRes, errorCategory: null },
+            diagnostics: fbDiags,
+            executionStatus: 'idle',
+          });
+          return;
+        }
 
         const lines: TerminalLine[] = [];
         if (stdout) {
@@ -1965,6 +2016,32 @@ export const useLabStore = create<LabState>((set, get) => ({
             diagnostics: exitDiags,
           };
 
+          if (
+            executionBackend === 'remote' &&
+            !success &&
+            isMissingStdinEofError(stderr)
+          ) {
+            const initialCollected = stdin.trim()
+              ? stdin.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
+              : [];
+            const { lines: promptLines, prompt } = splitStdoutForTerminalPrompt(stdout);
+            set({
+              isFastRunning: false,
+              activeSessionId: null,
+              isRemoteInteractive: true,
+              remoteStdoutPrefix: stdout,
+              terminalCollectedInputs: initialCollected,
+              currentPrompt: prompt,
+              currentInputValue: '',
+              terminalExecState: 'WAITING_FOR_INPUT',
+              terminalHistory: promptLines,
+              fastRunResult: { ...fastRes, errorCategory: null },
+              diagnostics: exitDiags,
+              executionStatus: 'idle',
+            });
+            return;
+          }
+
           const fastHasError = !success || exitDiags.some((d) => d.severity === 'error');
           const fastHasWarning = !fastHasError && exitDiags.some((d) => d.severity === 'warning');
           const fastExecStatus: ExecutionStatus = fastHasError
@@ -2082,47 +2159,233 @@ export const useLabStore = create<LabState>((set, get) => ({
   },
 
   submitTerminalInput: async () => {
-    const { activeSessionId, terminalExecState, currentPrompt, currentInputValue } = get();
-    if (!activeSessionId || terminalExecState !== 'WAITING_FOR_INPUT') return;
+    const {
+      activeSessionId,
+      isRemoteInteractive,
+      terminalExecState,
+      currentPrompt,
+      currentInputValue,
+      remoteStdoutPrefix,
+      code,
+      language,
+      fileName,
+      user,
+      activeFileId,
+    } = get();
+    if ((!activeSessionId && !isRemoteInteractive) || terminalExecState !== 'WAITING_FOR_INPUT') {
+      return;
+    }
 
     const answer = currentInputValue;
-    set((s) => {
-      const nextCollected = [...s.terminalCollectedInputs, answer];
-      const nextStdin = nextCollected.join('\n');
-      return {
-        terminalHistory: [
-          ...s.terminalHistory,
-          {
-            id: makeTerminalLineId(),
-            type: 'prompt-answered',
-            text: `${currentPrompt}${answer}`,
-            prompt: currentPrompt,
-            answer,
-          },
-        ],
-        terminalCollectedInputs: nextCollected,
-        lastTerminalSnapshot: { code: s.code, stdin: nextStdin },
+    const nextCollected = [...get().terminalCollectedInputs, answer];
+    const nextStdin = nextCollected.join('\n');
+
+    set((s) => ({
+      terminalHistory: [
+        ...s.terminalHistory,
+        {
+          id: makeTerminalLineId(),
+          type: 'prompt-answered',
+          text: `${currentPrompt}${answer}`,
+          prompt: currentPrompt,
+          answer,
+        },
+      ],
+      terminalCollectedInputs: nextCollected,
+      lastTerminalSnapshot: { code: s.code, stdin: nextStdin },
+      currentPrompt: '',
+      currentInputValue: '',
+      terminalExecState: 'RUNNING',
+      isFastRunning: true,
+    }));
+
+    if (activeSessionId) {
+      try {
+        await fetch('/api/execute/input', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: activeSessionId, input: answer }),
+        });
+      } catch {
+        // Errors will surface through the SSE stream or exit handler
+      }
+      return;
+    }
+
+    // Remote/serverless replay-based interactive input
+    const myFastSeq = ++fastRequestSeq;
+    const controller = new AbortController();
+    fastAbortController = controller;
+    const requestFileId = activeFileId;
+    const isStaleReplay = () =>
+      myFastSeq !== fastRequestSeq ||
+      controller.signal.aborted ||
+      get().activeFileId !== requestFileId;
+
+    const startedAt = Date.now();
+    try {
+      const res = await fetch('/api/execute', {
+        method: 'POST',
+        signal: controller.signal,
+        cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-uid': user?.uid || 'guest-local',
+        },
+        body: JSON.stringify({ code, language, stdin: nextStdin, fileName }),
+      });
+      const raw = await res.text();
+      let data: any = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        data = null;
+      }
+      if (isStaleReplay()) return;
+      if (!data) throw new Error('Execution server returned non-JSON response.');
+
+      const executionTimeMs =
+        typeof data.executionTimeMs === 'number'
+          ? data.executionTimeMs
+          : Math.max(1, Date.now() - startedAt);
+      const success = Boolean(
+        data.success ?? (res.ok && data.status !== 'error' && data.canRun !== false)
+      );
+      const stdout: string = typeof data.stdout === 'string' ? data.stdout : String(data.output || '');
+      const stderr: string =
+        typeof data.stderr === 'string' && data.stderr
+          ? data.stderr
+          : !success
+          ? String(data.runtimeError || data.output || data.error?.message_en || 'Execution error')
+          : '';
+      const exitCode = typeof data.exitCode === 'number' ? data.exitCode : success ? 0 : 1;
+      const diags: ExecutionDiagnostic[] = Array.isArray(data.diagnostics) ? data.diagnostics : [];
+      const errCategory = !success
+        ? data.errorCategory ||
+          classifyErrorCategory(
+            stderr,
+            !data.runtimeError && diags.some((d) => d.severity === 'error')
+          )
+        : null;
+
+      const fastRes: FastExecutionResult = {
+        success,
+        stdout,
+        stderr,
+        exitCode,
+        executionTimeMs,
+        timedOut: Boolean(data.timedOut),
+        errorCategory: errCategory,
+        executionBackend: data.executionBackend || 'remote',
+        interactiveSupported: false,
+        language,
+        stdinUsed: nextStdin,
+        timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        diagnostics: diags,
+      };
+
+      const newChunk =
+        remoteStdoutPrefix && stdout.startsWith(remoteStdoutPrefix)
+          ? stdout.slice(remoteStdoutPrefix.length)
+          : stdout;
+      const madeOutputProgress = stdout.length > remoteStdoutPrefix.length;
+
+      if (!success && isMissingStdinEofError(stderr) && madeOutputProgress) {
+        const { lines: newLines, prompt } = splitStdoutForTerminalPrompt(newChunk);
+        set((s) => ({
+          isFastRunning: false,
+          isRemoteInteractive: true,
+          remoteStdoutPrefix: stdout,
+          currentPrompt: prompt,
+          currentInputValue: '',
+          terminalExecState: 'WAITING_FOR_INPUT',
+          terminalHistory: newLines.length > 0 ? [...s.terminalHistory, ...newLines] : s.terminalHistory,
+          fastRunResult: { ...fastRes, errorCategory: null },
+          diagnostics: diags,
+          executionStatus: 'idle',
+        }));
+        return;
+      }
+
+      const { lines: tailLines, prompt: tailPrompt } = splitStdoutForTerminalPrompt(newChunk);
+      const finalOutLines = [...tailLines];
+      if (tailPrompt.length > 0) {
+        finalOutLines.push({ id: makeTerminalLineId(), type: 'output', text: tailPrompt });
+      }
+      const errLines: TerminalLine[] =
+        !success && stderr
+          ? stderr
+              .replace(/\r\n/g, '\n')
+              .split('\n')
+              .filter((l, idx, arr) => idx < arr.length - 1 || l.length > 0)
+              .map((text) => ({ id: makeTerminalLineId(), type: 'error', text }))
+          : [];
+
+      const fastHasError = !success || diags.some((d) => d.severity === 'error');
+      const fastHasWarning = !fastHasError && diags.some((d) => d.severity === 'warning');
+      const fastExecStatus: ExecutionStatus = fastHasError
+        ? 'error'
+        : fastHasWarning
+        ? 'warning'
+        : 'success';
+
+      set((s) => ({
+        isFastRunning: false,
+        isRemoteInteractive: false,
+        remoteStdoutPrefix: '',
         currentPrompt: '',
         currentInputValue: '',
-        terminalExecState: 'RUNNING',
-        isFastRunning: true,
-      };
-    });
-
-    try {
-      await fetch('/api/execute/input', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: activeSessionId, input: answer }),
-      });
-    } catch {
-      // Errors will surface through the SSE stream or exit handler
+        terminalExecState: success ? 'COMPLETED' : 'ERROR',
+        terminalHistory: [...s.terminalHistory, ...finalOutLines, ...errLines],
+        fastRunResult: fastRes,
+        diagnostics: diags,
+        executionStatus: fastExecStatus,
+        lastTerminalSnapshot: { code, stdin: nextStdin },
+      }));
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || controller.signal.aborted || isStaleReplay()) return;
+      set((s) => ({
+        isFastRunning: false,
+        isRemoteInteractive: false,
+        remoteStdoutPrefix: '',
+        terminalExecState: 'ERROR',
+        executionStatus: 'error',
+        terminalHistory: [
+          ...s.terminalHistory,
+          { id: makeTerminalLineId(), type: 'error', text: err?.message || 'Execution failed.' },
+        ],
+      }));
     }
   },
 
   endTerminalInput: async () => {
-    const { activeSessionId, terminalExecState, currentPrompt } = get();
-    if (!activeSessionId || terminalExecState !== 'WAITING_FOR_INPUT') return;
+    const { activeSessionId, isRemoteInteractive, terminalExecState, currentPrompt } = get();
+    if ((!activeSessionId && !isRemoteInteractive) || terminalExecState !== 'WAITING_FOR_INPUT') {
+      return;
+    }
+
+    if (!activeSessionId && isRemoteInteractive) {
+      set((s) => {
+        const nextHistory = [...s.terminalHistory];
+        if (currentPrompt.length > 0) {
+          nextHistory.push({
+            id: makeTerminalLineId(),
+            type: 'output',
+            text: currentPrompt,
+          });
+        }
+        return {
+          terminalHistory: nextHistory,
+          isRemoteInteractive: false,
+          remoteStdoutPrefix: '',
+          currentPrompt: '',
+          currentInputValue: '',
+          terminalExecState: 'COMPLETED',
+          isFastRunning: false,
+        };
+      });
+      return;
+    }
 
     set((s) => {
       const nextHistory = [...s.terminalHistory];

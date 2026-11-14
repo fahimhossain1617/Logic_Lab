@@ -144,9 +144,8 @@ test('Browser E2E Regression Suite across Java, JavaScript, C++, Python, STDIN, 
       'grader.py',
       `name = input()\nprint(f"E2E_PY:{name}")`
     );
-    await page.locator('[data-testid="tab-stdin"]').click();
-    await page.locator('[data-testid="console-stdin-input"]').fill('বাংলা_User');
     await page.locator('[data-testid="tab-program-output"]').click();
+    await page.locator('[data-testid="console-stdin-input"]').fill('বাংলা_User');
     await runFastAndWait(page);
     const pyOut = await page.locator('[data-testid="real-output-section"]').innerText();
     assert.ok(pyOut.includes('E2E_PY:বাংলা_User'), `Expected Python STDIN Unicode output, got: ${pyOut}`);

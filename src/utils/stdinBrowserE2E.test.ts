@@ -139,9 +139,8 @@ test('Browser E2E: Batch STDIN across 4 languages, BankManagementSystem (batch +
 
     // 1. BankManagementSystem Batch Test: 1 -> 1000 -> 3 -> 4
     await setFileAndCode(page, 'java', 'BankManagementSystem.java', BANK_MANAGEMENT_JAVA);
-    await page.locator('[data-testid="tab-stdin"]').click();
-    await page.locator('[data-testid="console-stdin-input"]').fill('1\n1000\n3\n4');
     await page.locator('[data-testid="tab-program-output"]').click();
+    await page.locator('[data-testid="console-stdin-input"]').fill('1\n1000\n3\n4');
     await runFastAndWaitFinish(page);
 
     const depositOut = await page.locator('[data-testid="real-output-section"]').innerText();
@@ -149,9 +148,7 @@ test('Browser E2E: Batch STDIN across 4 languages, BankManagementSystem (batch +
     assert.equal(await page.locator('[data-testid="console-status-badge"]').innerText(), 'Success');
 
     // 2. Partial Batch STDIN ("3") -> Input Error (NOT Compile Error) and "Enter your choice:" BEFORE NoSuchElementException
-    await page.locator('[data-testid="tab-stdin"]').click();
     await page.locator('[data-testid="console-stdin-input"]').fill('3');
-    await page.locator('[data-testid="tab-program-output"]').click();
     await runFastAndWaitFinish(page);
 
     const partialOut = await page.locator('[data-testid="real-output-section"]').innerText();
@@ -163,9 +160,7 @@ test('Browser E2E: Batch STDIN across 4 languages, BankManagementSystem (batch +
     assert.ok(choiceIdx >= 0 && exIdx > choiceIdx, `Prompt must appear BEFORE exception! Output:\n${partialOut}`);
 
     // 3. Interactive Mode (empty STDIN -> inline terminal prompts: 3, 4)
-    await page.locator('[data-testid="tab-stdin"]').click();
     await page.locator('[data-testid="console-stdin-input"]').fill('');
-    await page.locator('[data-testid="tab-program-output"]').click();
     await page.locator('[data-testid="fast-run-btn"]').click();
 
     await page.waitForSelector('[data-testid="terminal-inline-input"]', { timeout: 10000 });
@@ -184,7 +179,6 @@ test('Browser E2E: Batch STDIN across 4 languages, BankManagementSystem (batch +
     assert.ok(interOut.includes('Balance: 5000'));
     assert.ok(interOut.includes('Exiting...'));
     // Must not leak previous interactive inputs into STDIN textarea
-    await page.locator('[data-testid="tab-stdin"]').click();
     assert.equal(await page.locator('[data-testid="console-stdin-input"]').inputValue(), '');
 
     // 4. JavaScript fs.readFileSync(0, "utf8") Batch STDIN

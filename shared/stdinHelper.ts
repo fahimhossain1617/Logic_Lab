@@ -439,6 +439,17 @@ export function tokenizeStdin(stdin: string): string[] {
 }
 
 /**
+ * Returns true when an error message specifically indicates STDIN reached EOF
+ * (i.e. program requested more input than provided), excluding bad-format/type errors
+ * like InputMismatchException.
+ */
+export function isMissingStdinEofError(message: string): boolean {
+  return /NoSuchElementException|EOFError|EOF when reading a line|insufficient input|missing stdin|end of file|unexpected eof|NumberFormatException:\s*For input string:\s*""/i.test(
+    message
+  );
+}
+
+/**
  * Distinguishes true compilation/syntax errors from runtime/input errors.
  */
 export function classifyErrorCategory(
@@ -446,11 +457,7 @@ export function classifyErrorCategory(
   hasCompileFailure: boolean
 ): 'compile_error' | 'runtime_error' | 'input_error' {
   if (hasCompileFailure) return 'compile_error';
-  if (
-    /NoSuchElementException|EOFError|InputMismatchException|EOF when reading a line|insufficient input|missing stdin|end of file|unexpected eof|NumberFormatException:\s*For input string:\s*""/i.test(
-      message
-    )
-  ) {
+  if (isMissingStdinEofError(message) || /InputMismatchException/i.test(message)) {
     return 'input_error';
   }
   return 'runtime_error';

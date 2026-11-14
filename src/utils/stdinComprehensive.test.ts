@@ -588,3 +588,104 @@ test('Part 5 & Frontend Store: Preserves STDIN across languages, prevents cross-
     server.close();
   }
 });
+
+test('Remote/Serverless Replay Interactive Mode: handles NoSuchElementException as WAITING_FOR_INPUT and completes on submitTerminalInput', async () => {
+  const origFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/execute/start')) {
+        return new Response(JSON.stringify({ ok: false, error: 'fallback' }), { status: 500 });
+      }
+      if (url.includes('/api/execute')) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const stdinStr = String(body.stdin || '');
+        if (!stdinStr) {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              status: 'error',
+              canRun: false,
+              stdout: 'Enter your choice: ',
+              stderr: 'Exception in thread "main" java.util.NoSuchElementException',
+              exitCode: 1,
+              executionBackend: 'remote',
+              interactiveSupported: false,
+              errorCategory: 'input_error',
+              diagnostics: [],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (stdinStr === '3') {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              status: 'error',
+              canRun: false,
+              stdout: 'Enter your choice: Balance: 5000\nEnter your choice: ',
+              stderr: 'Exception in thread "main" java.util.NoSuchElementException',
+              exitCode: 1,
+              executionBackend: 'remote',
+              interactiveSupported: false,
+              errorCategory: 'input_error',
+              diagnostics: [],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            success: true,
+            status: 'success',
+            canRun: true,
+            stdout: 'Enter your choice: Balance: 5000\nEnter your choice: Exiting...\n',
+            stderr: '',
+            exitCode: 0,
+            executionBackend: 'remote',
+            interactiveSupported: false,
+            diagnostics: [],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+
+    useLabStore.setState({
+      language: 'java',
+      fileName: 'BankAccount.java',
+      code: BANK_MANAGEMENT_JAVA,
+      stdin: '',
+    });
+
+    await useLabStore.getState().runFast(BANK_MANAGEMENT_JAVA, '');
+    let st = useLabStore.getState();
+    assert.equal(st.terminalExecState, 'WAITING_FOR_INPUT');
+    assert.equal(st.isRemoteInteractive, true);
+    assert.equal(st.executionStatus, 'idle');
+    assert.equal(st.currentPrompt, 'Enter your choice: ');
+    assert.equal(
+      st.terminalHistory.some((l) => l.type === 'error'),
+      false,
+      'Must NOT show red NoSuchElementException error while waiting for input'
+    );
+
+    useLabStore.getState().setCurrentInputValue('3');
+    await useLabStore.getState().submitTerminalInput();
+    st = useLabStore.getState();
+    assert.equal(st.terminalExecState, 'WAITING_FOR_INPUT');
+    assert.equal(st.currentPrompt, 'Enter your choice: ');
+    assert.ok(st.terminalHistory.some((l) => l.text.includes('Balance: 5000')));
+
+    useLabStore.getState().setCurrentInputValue('4');
+    await useLabStore.getState().submitTerminalInput();
+    st = useLabStore.getState();
+    assert.equal(st.terminalExecState, 'COMPLETED');
+    assert.equal(st.executionStatus, 'success');
+    assert.equal(st.isRemoteInteractive, false);
+    assert.ok(st.terminalHistory.some((l) => l.text.includes('Exiting...')));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, Eraser } from 'lucide-react';
+import { ChevronDown, ChevronUp, Eraser, Play } from 'lucide-react';
 import { ExecutionDiagnostic } from '../../../shared/types';
 import { classifyErrorCategory } from '../../../shared/stdinHelper';
 import { useLabStore } from '../../store/useLabStore';
@@ -37,6 +37,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
     executionStatus,
     autoInjectedStdinNotice,
     setStdin,
+    runFast,
     setCurrentInputValue,
     submitTerminalInput,
     endTerminalInput,
@@ -44,7 +45,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
     clearConsoleOutput,
   } = useLabStore();
 
-  const [activeTab, setActiveTab] = useState<'output' | 'problems' | 'stdin'>('output');
+  const [activeTab, setActiveTab] = useState<'output' | 'problems'>('output');
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const inlineInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -182,25 +183,6 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
             )}
           </button>
 
-          <button
-            type="button"
-            onClick={() => {
-              setActiveTab('stdin');
-              if (!consoleOpen) toggleConsoleOpen();
-            }}
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
-              activeTab === 'stdin'
-                ? 'bg-[var(--code-pill-bg)] text-[var(--text-accent)] border border-[var(--border-active)]/35'
-                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
-            data-testid="tab-stdin"
-          >
-            <span>{explainLanguage === 'bn' ? 'ইনপুট (STDIN)' : 'Input (stdin)'}</span>
-            {stdin.trim().length > 0 && (
-              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-            )}
-          </button>
-
           {isWaitingInput && (
             <span className="inline-flex items-center gap-1.5 text-[11px] font-mono font-semibold px-2 py-0.5 rounded-md bg-cyan-500/15 text-cyan-300">
               <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
@@ -310,62 +292,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
             }`}
             data-testid="terminal-output-view"
           >
-            {activeTab === 'stdin' ? (
-              <div className="p-1 space-y-2 select-text" onClick={(e) => e.stopPropagation()}>
-                {autoInjectedStdinNotice && (
-                  <div
-                    className="px-2.5 py-1.5 rounded-lg bg-[#10B981]/10 border border-[#10B981]/35 text-[11px] font-mono text-[#34D399] flex flex-wrap items-center justify-between gap-2"
-                    data-testid="auto-stdin-notice"
-                  >
-                    <span>
-                      {explainLanguage === 'bn'
-                        ? autoInjectedStdinNotice.isAutoSample
-                          ? `অটো স্যাম্পল ইনপুট যুক্ত হয়েছে: [${autoInjectedStdinNotice.tokens.join(', ')}] — চাইলে পরিবর্তন করতে পারেন।`
-                          : `STDIN ইনপুট যুক্ত হয়েছে: [${autoInjectedStdinNotice.tokens.join(', ')}]`
-                        : autoInjectedStdinNotice.isAutoSample
-                        ? `Auto-sample STDIN injected: [${autoInjectedStdinNotice.tokens.join(', ')}]`
-                        : `STDIN applied: [${autoInjectedStdinNotice.tokens.join(', ')}]`}
-                    </span>
-                  </div>
-                )}
-                <div className="flex items-center justify-between text-xs font-mono text-slate-400">
-                  <span>
-                    {explainLanguage === 'bn'
-                      ? 'কোড রান করার আগে ইনপুট দিতে চাইলে নিচে লিখুন (প্রতি লাইনে একটি ইনপুট):'
-                      : 'Provide inputs line by line before running (or leave blank to type interactively):'}
-                  </span>
-                  {stdin.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setStdin('')}
-                      className="text-xs text-rose-400 hover:text-rose-300 font-mono cursor-pointer"
-                    >
-                      {explainLanguage === 'bn' ? 'মুছুন' : 'Clear'}
-                    </button>
-                  )}
-                </div>
-                <textarea
-                  value={stdin}
-                  onChange={(e) => setStdin(e.target.value)}
-                  placeholder={
-                    explainLanguage === 'bn'
-                      ? 'এখানে ইনপুট লিখুন (যেমন:\n15.5\n24.5\n...খালি রাখলে লোকাল মোডে কোড চলাকালীন টার্মিনালেই সরাসরি টাইপ করতে পারবেন)'
-                      : 'Enter inputs line by line (e.g.:\n15.5\n24.5\n...or leave empty locally to type interactively in the terminal)'
-                  }
-                  rows={4}
-                  spellCheck={false}
-                  data-testid="console-stdin-input"
-                  className="w-full rounded-lg bg-[#070C1D] border border-slate-800 focus:border-cyan-500/60 focus:outline-none p-3 font-mono text-xs sm:text-sm text-slate-100 placeholder:text-slate-600 resize-y"
-                />
-                {fastRunResult?.interactiveSupported === false && (
-                  <p className="text-[11px] font-mono text-amber-300/90 m-0" data-testid="remote-stdin-limitation-note">
-                    {explainLanguage === 'bn'
-                      ? 'নোট: বর্তমান রিমোট/সার্ভারলেস রানটাইম শুধুমাত্র Batch STDIN সাপোর্ট করে (লাইভ ইন্টার‍্যাক্টিভ টার্মিনাল ইনপুট নয়)। রান করার আগে উপরের বক্সে সব ইনপুট দিন।'
-                      : 'Note: The current remote/serverless runtime supports Batch STDIN only (live mid-run interactive input is unavailable). Enter all required inputs above before clicking Run.'}
-                  </p>
-                )}
-              </div>
-            ) : activeTab === 'problems' ? (
+            {activeTab === 'problems' ? (
               displayDiagnostics.length === 0 ? (
                 <div className="py-2 text-slate-500 select-none text-xs">
                   //{' '}
@@ -637,13 +564,9 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                     className="mt-2 pt-2 border-t border-rose-500/25 text-xs font-mono text-amber-300/95"
                     data-testid="input-error-diagnostic"
                   >
-                    {fastRunResult?.interactiveSupported === false
-                      ? explainLanguage === 'bn'
-                        ? 'ইনপুট (STDIN) পর্যাপ্ত নয় বা খালি আছে। এই রিমোট/সার্ভারলেস রানটাইম শুধুমাত্র Batch STDIN সাপোর্ট করে — রান করার আগে "ইনপুট (STDIN)" ট্যাবে সব ইনপুট দিন।'
-                        : 'Missing or insufficient STDIN (EOF reached). This remote/serverless runtime supports Batch STDIN only — provide all required inputs line by line in the "Input (stdin)" tab before clicking Run.'
-                      : explainLanguage === 'bn'
-                      ? 'প্রোগ্রামটি প্রদত্ত ইনপুটের চেয়ে বেশি STDIN চেয়েছে বা EOF-এ পৌঁছেছে। "ইনপুট (STDIN)" ট্যাবে সব প্রয়োজনীয় ইনপুট লিখুন অথবা খালি রেখে টার্মিনালে উত্তর দিন।'
-                      : 'Program requested more STDIN than provided or reached end of input (EOF). Enter all required inputs in the "Input (stdin)" tab before running.'}
+                    {explainLanguage === 'bn'
+                      ? 'প্রোগ্রামটি প্রদত্ত ইনপুটের চেয়ে বেশি STDIN চেয়েছে বা ইনপুট ফরম্যাট সঠিক নয়। নিচের STDIN বক্সে প্রয়োজনীয় ইনপুট লিখে আবার রান করুন।'
+                      : 'Program requested more STDIN than provided or encountered an input mismatch. Enter the required inputs in the STDIN box below and run again.'}
                   </div>
                 )}
 
@@ -679,6 +602,79 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
               </div>
             )}
           </div>
+
+          {/* Merged Inline STDIN Bar inside Program Output */}
+          {activeTab === 'output' && (
+            <div
+              className="px-3 sm:px-5 py-2.5 bg-[#070B19]/95 space-y-2 select-text"
+              data-testid="merged-stdin-panel"
+            >
+              {autoInjectedStdinNotice && (
+                <div
+                  className="px-2.5 py-1 rounded-md bg-[#10B981]/10 border border-[#10B981]/35 text-[11px] font-mono text-[#34D399]"
+                  data-testid="auto-stdin-notice"
+                >
+                  {explainLanguage === 'bn'
+                    ? autoInjectedStdinNotice.isAutoSample
+                      ? `অটো স্যাম্পল ইনপুট যুক্ত হয়েছে: [${autoInjectedStdinNotice.tokens.join(', ')}]`
+                      : `STDIN ইনপুট যুক্ত হয়েছে: [${autoInjectedStdinNotice.tokens.join(', ')}]`
+                    : autoInjectedStdinNotice.isAutoSample
+                    ? `Auto-sample STDIN injected: [${autoInjectedStdinNotice.tokens.join(', ')}]`
+                    : `STDIN applied: [${autoInjectedStdinNotice.tokens.join(', ')}]`}
+                </div>
+              )}
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                <div className="flex items-center justify-between sm:justify-start gap-2 shrink-0">
+                  <label
+                    htmlFor="merged-stdin-textarea"
+                    className="text-[11px] font-mono font-semibold text-cyan-300/90 uppercase tracking-wider"
+                  >
+                    {explainLanguage === 'bn' ? 'ইনপুট (STDIN)' : 'STDIN'}
+                  </label>
+                  {stdin.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setStdin('')}
+                      className="text-[11px] text-rose-400 hover:text-rose-300 font-mono cursor-pointer"
+                    >
+                      {explainLanguage === 'bn' ? 'মুছুন' : 'Clear'}
+                    </button>
+                  )}
+                </div>
+                <textarea
+                  id="merged-stdin-textarea"
+                  value={stdin}
+                  onChange={(e) => setStdin(e.target.value)}
+                  onKeyDown={(e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                      e.preventDefault();
+                      void runFast(undefined, stdin);
+                    }
+                  }}
+                  placeholder={
+                    explainLanguage === 'bn'
+                      ? 'প্রোগ্রামের ইনপুট এখানে লিখুন (প্রতি লাইনে একটি) — অথবা খালি রেখে রান করে সরাসরি আউটপুটে উত্তর দিন'
+                      : 'Enter STDIN inputs line by line — or leave blank and answer directly in output'
+                  }
+                  rows={2}
+                  spellCheck={false}
+                  data-testid="console-stdin-input"
+                  className="flex-1 min-w-0 rounded-md bg-[#040711] border border-slate-800 focus:border-cyan-500/60 focus:outline-none px-2.5 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-600 resize-y"
+                />
+                <button
+                  type="button"
+                  onClick={() => void runFast(undefined, stdin)}
+                  disabled={isBusy}
+                  data-testid="stdin-run-btn"
+                  title={explainLanguage === 'bn' ? 'ইনপুটসহ রান করুন (Ctrl+Enter)' : 'Run with STDIN (Ctrl+Enter)'}
+                  className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/40 text-cyan-300 text-xs font-mono font-semibold transition-colors cursor-pointer disabled:opacity-50 shrink-0"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  <span>{explainLanguage === 'bn' ? 'ইনপুটসহ রান' : 'Run with Input'}</span>
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Minimal Hallmark Footer */}
           <div className="flex items-center justify-end px-3 sm:px-5 py-1.5 bg-[#050814] text-[11px] font-mono">

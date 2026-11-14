@@ -1453,11 +1453,14 @@ function tokenizeStdin(stdin) {
   if (!stdin) return [];
   return stdin.trim().split(/\s+/).filter((t) => t.length > 0);
 }
+function isMissingStdinEofError(message) {
+  return /NoSuchElementException|EOFError|EOF when reading a line|insufficient input|missing stdin|end of file|unexpected eof|NumberFormatException:\s*For input string:\s*""/i.test(
+    message
+  );
+}
 function classifyErrorCategory(message, hasCompileFailure) {
   if (hasCompileFailure) return "compile_error";
-  if (/NoSuchElementException|EOFError|InputMismatchException|EOF when reading a line|insufficient input|missing stdin|end of file|unexpected eof|NumberFormatException:\s*For input string:\s*""/i.test(
-    message
-  )) {
+  if (isMissingStdinEofError(message) || /InputMismatchException/i.test(message)) {
     return "input_error";
   }
   return "runtime_error";

@@ -14,6 +14,7 @@ import {
 } from './remoteSandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
+import { classifyErrorCategory } from '../../../../shared/stdinHelper';
 
 /**
  * Parses compiler output from g++ (both errors and warnings)
@@ -177,6 +178,8 @@ export async function executeCpp(
         timedOut: false,
         runtimeError: errorMsg,
         runtimeErrorLine: firstError?.line || 1,
+        errorCategory: 'compile_error',
+        executionBackend: 'local',
         executionTimeMs: 0,
         diagnostics: compileRes.diagnostics,
       };
@@ -217,16 +220,23 @@ export async function executeCpp(
     let runtimeError: string | null = null;
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
-    } else if (runRes.exitCode !== 0 && runRes.exitCode !== null) {
-      runtimeError = runRes.stderr.trim() || `Process exited with error code ${runRes.exitCode}.`;
+    } else if (runRes.exitCode !== 0) {
+      runtimeError =
+        runRes.stderr.trim() ||
+        (runRes.exitCode === null
+          ? 'Process terminated abnormally by signal.'
+          : `Process exited with error code ${runRes.exitCode}.`);
     }
 
-    const status: 'success' | 'warning' | 'error' =
-      runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
-        ? 'error'
-        : hasWarnings
-        ? 'warning'
-        : 'success';
+    const isFailure = runRes.timedOut || runRes.exitCode !== 0;
+    const status: 'success' | 'warning' | 'error' = isFailure
+      ? 'error'
+      : hasWarnings
+      ? 'warning'
+      : 'success';
+    const errorCategory = isFailure
+      ? classifyErrorCategory(runRes.stderr || runtimeError || '', false)
+      : undefined;
 
     const output = runtimeError
       ? runRes.stdout ? `${runRes.stdout}\n${runtimeError}` : runtimeError
@@ -241,6 +251,8 @@ export async function executeCpp(
       exitCode: runRes.exitCode,
       timedOut: runRes.timedOut,
       runtimeError,
+      ...(errorCategory ? { errorCategory } : {}),
+      executionBackend: 'local',
       executionTimeMs: runRes.executionTimeMs,
       diagnostics: compileRes.diagnostics,
     };

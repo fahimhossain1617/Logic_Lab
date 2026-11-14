@@ -9,6 +9,32 @@ import {
 } from './sandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
+import { classifyErrorCategory } from '../../../../shared/stdinHelper';
+
+export const NODE_PRELOAD_CJS = `
+const fs = require('fs');
+globalThis.prompt = function(message) {
+  if (message !== undefined && message !== null) {
+    process.stdout.write(String(message));
+  }
+  const buf = Buffer.alloc(1);
+  const bytes = [];
+  while (true) {
+    let bytesRead = 0;
+    try {
+      bytesRead = fs.readSync(0, buf, 0, 1, null);
+    } catch (err) {
+      if (err && (err.code === 'EAGAIN' || err.code === 'EINTR')) continue;
+      break;
+    }
+    if (bytesRead === 0) break;
+    const b = buf[0];
+    if (b === 10) break;
+    if (b !== 13) bytes.push(b);
+  }
+  return Buffer.from(bytes).toString('utf8');
+};
+`.trim();
 
 /**
  * Parses Node.js syntax check output (from node --check)
@@ -131,6 +157,8 @@ export async function executeJs(
         timedOut: false,
         runtimeError: errorMsg,
         runtimeErrorLine: firstError?.line || 1,
+        errorCategory: 'compile_error',
+        executionBackend: 'local',
         executionTimeMs: 0,
         diagnostics: syntaxRes.diagnostics,
       };
@@ -138,10 +166,11 @@ export async function executeJs(
 
     const sourceFileName = sanitizeSourceFileName(fileName, 'script.js', ['.js', '.mjs', '.cjs']);
     const nodePath = (await resolveExecutable('node')) || process.execPath;
+    await fs.writeFile(path.join(syntaxRes.workspaceDir, '_preload.cjs'), NODE_PRELOAD_CJS, 'utf8');
 
     const runRes = await runSandboxedProcess({
       cmd: nodePath,
-      args: [sourceFileName],
+      args: ['--require', './_preload.cjs', sourceFileName],
       cwd: syntaxRes.workspaceDir,
       stdin,
       timeoutMs,
@@ -152,9 +181,12 @@ export async function executeJs(
 
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
-    } else if (runRes.exitCode !== 0 && runRes.exitCode !== null) {
+    } else if (runRes.exitCode !== 0) {
       runtimeError =
-        runRes.stderr.trim() || `Node.js process exited with error code ${runRes.exitCode}.`;
+        runRes.stderr.trim() ||
+        (runRes.exitCode === null
+          ? 'Node.js process terminated abnormally by signal.'
+          : `Node.js process exited with error code ${runRes.exitCode}.`);
       const escapedFile = sourceFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const fileMatch = runRes.stderr.match(new RegExp(`${escapedFile}:(\\d+)`, 'm'));
       const genericMatch = runRes.stderr.match(/([^\\/:(\r\n]+\.(?:js|mjs|cjs)):(\d+)/m);
@@ -166,12 +198,15 @@ export async function executeJs(
     }
 
     const hasWarnings = syntaxRes.diagnostics.some((d) => d.severity === 'warning');
-    const status: 'success' | 'warning' | 'error' =
-      runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
-        ? 'error'
-        : hasWarnings
-        ? 'warning'
-        : 'success';
+    const isFailure = runRes.timedOut || runRes.exitCode !== 0;
+    const status: 'success' | 'warning' | 'error' = isFailure
+      ? 'error'
+      : hasWarnings
+      ? 'warning'
+      : 'success';
+    const errorCategory = isFailure
+      ? classifyErrorCategory(runRes.stderr || runtimeError || '', false)
+      : undefined;
 
     const output = runtimeError
       ? runRes.stdout ? `${runRes.stdout}\n${runtimeError}` : runtimeError
@@ -187,6 +222,8 @@ export async function executeJs(
       timedOut: runRes.timedOut,
       runtimeError,
       runtimeErrorLine,
+      ...(errorCategory ? { errorCategory } : {}),
+      executionBackend: 'local',
       executionTimeMs: runRes.executionTimeMs,
       diagnostics: syntaxRes.diagnostics,
     };

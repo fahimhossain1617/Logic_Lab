@@ -26,9 +26,11 @@ import {
 import {
   sendSessionInput,
   startInteractiveSession,
+  StdinMode,
   stopInteractiveSession,
   subscribeToSession,
 } from '../services/interactiveRunner';
+import { classifyErrorCategory } from '../../../shared/stdinHelper';
 import {
   CodeExecutionRecord,
   ExecutionDiagnostic,
@@ -61,6 +63,12 @@ interface InvalidExecutionRequest {
   ok: false;
   code: string;
   message: string;
+}
+
+function isInvalidExecutionRequest(
+  result: ValidatedExecutionRequest | InvalidExecutionRequest
+): result is InvalidExecutionRequest {
+  return !result.ok;
 }
 
 function validateExecutionPayload(
@@ -515,7 +523,7 @@ apiRouter.post('/cache/clear', (_req: Request, res: Response) => {
 // Real-time Code Analysis Endpoint (/api/analyze)
 apiRouter.post('/analyze', traceRateLimiter, async (req: Request, res: Response) => {
   const validation = validateExecutionPayload(req.body, { allowEmptyCode: true });
-  if (!validation.ok) {
+  if (isInvalidExecutionRequest(validation)) {
     return res.status(400).json({
       canCompile: false,
       diagnostics: [
@@ -563,7 +571,7 @@ apiRouter.post('/analyze', traceRateLimiter, async (req: Request, res: Response)
 apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response) => {
   const execStartedAt = Date.now();
   const validation = validateExecutionPayload(req.body, { allowEmptyCode: false });
-  if (!validation.ok) {
+  if (isInvalidExecutionRequest(validation)) {
     return res.status(400).json({
       success: false,
       stdout: '',
@@ -619,7 +627,7 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
   const success =
     canRun &&
     !toolchainRes.timedOut &&
-    (toolchainRes.exitCode === 0 || toolchainRes.exitCode === null);
+    toolchainRes.exitCode === 0;
 
   const stdout = typeof toolchainRes.stdout === 'string' ? toolchainRes.stdout : '';
   const output = toolchainRes.output || stdout;
@@ -627,6 +635,14 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
     toolchainRes.stderr ||
     toolchainRes.runtimeError ||
     (!canRun ? output : '');
+  const errorCategory = hasErrors
+    ? toolchainRes.errorCategory ||
+      classifyErrorCategory(
+        stderr || toolchainRes.runtimeError || '',
+        remappedToolchainDiagnostics.some((d) => d.severity === 'error')
+      )
+    : null;
+  const executionBackend = toolchainRes.executionBackend || 'local';
   const executionTimeMs = Math.max(
     1,
     toolchainRes.executionTimeMs > 0
@@ -646,6 +662,9 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
     executionTimeMs,
     timedOut: toolchainRes.timedOut,
     runtimeError: toolchainRes.runtimeError,
+    errorCategory,
+    executionBackend,
+    interactiveSupported: executionBackend === 'local',
     ...(remappedRuntimeErrorLine !== undefined ? { runtimeErrorLine: remappedRuntimeErrorLine } : {}),
     diagnostics: combinedDiagnostics,
     visualizerData: canRun ? simResult : null,
@@ -658,12 +677,13 @@ apiRouter.post('/execute', traceRateLimiter, async (req: Request, res: Response)
 // Interactive Terminal Execution Endpoints (/api/execute/start, /stream/:sessionId, /input, /stop)
 apiRouter.post('/execute/start', traceRateLimiter, async (req: Request, res: Response) => {
   const validation = validateExecutionPayload(req.body, { allowEmptyCode: false });
-  if (!validation.ok) {
+  if (isInvalidExecutionRequest(validation)) {
     return res.status(400).json({
       ok: false,
       diagnostics: [],
       stderr: validation.message,
       runtimeError: validation.message,
+      errorCategory: 'compile_error',
       error: {
         code: validation.code,
         message_en: validation.message,
@@ -672,7 +692,10 @@ apiRouter.post('/execute/start', traceRateLimiter, async (req: Request, res: Res
   }
 
   const { code, language, fileName, stdin } = validation;
-  const result = await startInteractiveSession(code, language, fileName, stdin);
+  const rawMode = req.body?.stdinMode;
+  const stdinMode: StdinMode =
+    rawMode === 'batch' || rawMode === 'interactive' ? rawMode : 'auto';
+  const result = await startInteractiveSession(code, language, fileName, stdin, stdinMode);
   if (!result.ok) {
     return res.status(200).json(result);
   }
@@ -718,12 +741,13 @@ apiRouter.get('/execute/stream/:sessionId', (req: Request, res: Response) => {
 apiRouter.post('/execute/input', (req: Request, res: Response) => {
   const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
   const input = typeof req.body?.input === 'string' ? req.body.input : '';
+  const eof = Boolean(req.body?.eof);
 
   if (!sessionId) {
     return res.status(400).json({ ok: false, error: 'Missing sessionId' });
   }
 
-  const ok = sendSessionInput(sessionId, input);
+  const ok = sendSessionInput(sessionId, input, eof);
   return res.json({ ok });
 });
 

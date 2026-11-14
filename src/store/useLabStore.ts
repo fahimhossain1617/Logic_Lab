@@ -15,6 +15,7 @@ import { SAMPLE_PROGRAMS, resolveTraceForCode } from '../data/sampleTraces';
 import { PROBLEM_LIBRARY } from '../data/problemLibrary';
 import { clampStepIndex, findFirstStepForLine } from '../utils/playerLogic';
 import {
+  classifyErrorCategory,
   detectInputCalls,
   generateSampleStdin,
   tokenizeStdin,
@@ -366,6 +367,7 @@ interface LabState {
   clearAutoInjectedStdinNotice: () => void;
   setCurrentInputValue: (val: string) => void;
   submitTerminalInput: () => Promise<void>;
+  endTerminalInput: () => Promise<void>;
   stopTerminalSession: () => void;
   setConsoleOpen: (open: boolean) => void;
   toggleConsoleOpen: () => void;
@@ -1499,7 +1501,6 @@ export const useLabStore = create<LabState>((set, get) => ({
     let {
       code,
       stdin,
-      stdinSource,
       language,
       fileName,
       user,
@@ -1526,17 +1527,6 @@ export const useLabStore = create<LabState>((set, get) => ({
         stdinSource: stdin.trim() ? 'manual' : 'none',
         terminalCollectedInputs: [],
         lastTerminalSnapshot: null,
-      });
-    } else if (stdinSource !== 'manual') {
-      // Fresh interactive run: clear previous terminal/auto-sample inputs so user enters live inputs
-      stdin = '';
-      set({
-        stdin: '',
-        stdinDraft: '',
-        stdinSource: 'none',
-        terminalCollectedInputs: [],
-        lastTerminalSnapshot: null,
-        autoInjectedStdinNotice: null,
       });
     } else {
       set({ terminalCollectedInputs: [], lastTerminalSnapshot: null });
@@ -1630,9 +1620,17 @@ export const useLabStore = create<LabState>((set, get) => ({
             ? String(fbData.runtimeError || fbData.output || fbData.error?.message_en || 'Execution error')
             : '';
         const exitCode = typeof fbData.exitCode === 'number' ? fbData.exitCode : success ? 0 : 1;
-        const fbDiags: ExecutionDiagnostic[] = Array.isArray(fbData.diagnostics)
+        const fastDiags: ExecutionDiagnostic[] = Array.isArray(fbData.diagnostics)
           ? fbData.diagnostics
           : [];
+        const fbDiags = fastDiags;
+        const fbErrorCategory = !success
+          ? fbData.errorCategory ||
+            classifyErrorCategory(
+              stderr,
+              !fbData.runtimeError && fbDiags.some((d) => d.severity === 'error')
+            )
+          : null;
 
         const fastRes: FastExecutionResult = {
           success,
@@ -1641,6 +1639,12 @@ export const useLabStore = create<LabState>((set, get) => ({
           exitCode,
           executionTimeMs,
           timedOut: Boolean(fbData.timedOut),
+          errorCategory: fbErrorCategory,
+          executionBackend: fbData.executionBackend || 'local',
+          interactiveSupported:
+            typeof fbData.interactiveSupported === 'boolean'
+              ? fbData.interactiveSupported
+              : (fbData.executionBackend || 'local') === 'local',
           language,
           stdinUsed: stdin,
           timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
@@ -1763,6 +1767,9 @@ export const useLabStore = create<LabState>((set, get) => ({
 
       if (!data.ok || !data.sessionId) {
         const stderr = String(data.stderr || data.runtimeError || 'Compilation or syntax error.');
+        const errCategory =
+          data.errorCategory ||
+          classifyErrorCategory(stderr, diagnostics.some((d) => d.severity === 'error'));
         const errorLines: TerminalLine[] = stderr
           .replace(/\r\n/g, '\n')
           .split('\n')
@@ -1781,8 +1788,12 @@ export const useLabStore = create<LabState>((set, get) => ({
             stderr,
             exitCode: 1,
             executionTimeMs: Math.max(1, Date.now() - startedAt),
+            errorCategory: errCategory,
+            executionBackend: data.executionBackend || 'local',
+            interactiveSupported:
+              typeof data.interactiveSupported === 'boolean' ? data.interactiveSupported : true,
             language,
-            stdinUsed: '',
+            stdinUsed: stdin,
             timestamp: new Date().toLocaleTimeString('en-US', {
               hour: '2-digit',
               minute: '2-digit',
@@ -1827,6 +1838,9 @@ export const useLabStore = create<LabState>((set, get) => ({
             return {
               terminalHistory: newLines.length > 0 ? [...s.terminalHistory, ...newLines] : s.terminalHistory,
               currentPrompt: nextPrompt,
+              ...(s.terminalExecState === 'WAITING_FOR_INPUT'
+                ? { terminalExecState: 'RUNNING' as const, isFastRunning: true }
+                : {}),
             };
           });
         } catch {
@@ -1845,16 +1859,27 @@ export const useLabStore = create<LabState>((set, get) => ({
           if (lines[lines.length - 1] === '') lines.pop();
           if (lines.length === 0) return;
 
-          set((s) => ({
-            terminalHistory: [
-              ...s.terminalHistory,
-              ...lines.map((text) => ({
+          set((s) => {
+            const nextHistory = [...s.terminalHistory];
+            if (s.currentPrompt.length > 0) {
+              nextHistory.push({
                 id: makeTerminalLineId(),
-                type: 'error' as const,
-                text,
-              })),
-            ],
-          }));
+                type: 'output',
+                text: s.currentPrompt,
+              });
+            }
+            return {
+              currentPrompt: '',
+              terminalHistory: [
+                ...nextHistory,
+                ...lines.map((text) => ({
+                  id: makeTerminalLineId(),
+                  type: 'error' as const,
+                  text,
+                })),
+              ],
+            };
+          });
         } catch {
           // Ignore malformed event
         }
@@ -1877,6 +1902,9 @@ export const useLabStore = create<LabState>((set, get) => ({
             timedOut?: boolean;
             executionTimeMs?: number;
             success?: boolean;
+            errorCategory?: 'compile_error' | 'runtime_error' | 'input_error' | null;
+            executionBackend?: 'local' | 'remote';
+            interactiveSupported?: boolean;
             stdout?: string;
             stderr?: string;
             stdinUsed?: string;
@@ -1884,7 +1912,12 @@ export const useLabStore = create<LabState>((set, get) => ({
           };
 
           if (isStaleFastRun()) return;
-        const executionTimeMs =
+          if (payload.stderr === 'Execution session not found or expired.') {
+            void runStaticFallback();
+            return;
+          }
+
+          const executionTimeMs =
             typeof payload.executionTimeMs === 'number'
               ? payload.executionTimeMs
               : Math.max(1, Date.now() - startedAt);
@@ -1901,6 +1934,17 @@ export const useLabStore = create<LabState>((set, get) => ({
           const exitDiags: ExecutionDiagnostic[] = Array.isArray(payload.diagnostics)
             ? payload.diagnostics
             : diagnostics;
+          const errCategory = !success
+            ? payload.errorCategory ||
+              classifyErrorCategory(stderr, exitDiags.some((d) => d.severity === 'error'))
+            : null;
+          const executionBackend = payload.executionBackend || data.executionBackend || 'local';
+          const interactiveSupported =
+            typeof payload.interactiveSupported === 'boolean'
+              ? payload.interactiveSupported
+              : typeof data.interactiveSupported === 'boolean'
+              ? data.interactiveSupported
+              : executionBackend === 'local';
 
           const fastRes: FastExecutionResult = {
             success,
@@ -1909,8 +1953,11 @@ export const useLabStore = create<LabState>((set, get) => ({
             exitCode,
             executionTimeMs,
             timedOut,
+            errorCategory: errCategory,
+            executionBackend,
+            interactiveSupported,
             language,
-            stdinUsed: payload.stdinUsed || '',
+            stdinUsed: payload.stdinUsed ?? stdin,
             timestamp: new Date().toLocaleTimeString('en-US', {
               hour: '2-digit',
               minute: '2-digit',
@@ -1948,10 +1995,6 @@ export const useLabStore = create<LabState>((set, get) => ({
             const usedStdinNormalized = String(payload.stdinUsed || '')
               .replace(/\r\n/g, '\n')
               .replace(/\n$/, '');
-            const shouldSyncTerminalStdin =
-              s.terminalCollectedInputs.length > 0 ||
-              (s.stdinSource !== 'manual' && usedStdinNormalized.length > 0);
-            const nextStdin = shouldSyncTerminalStdin ? usedStdinNormalized : s.stdin;
             return {
               isFastRunning: false,
               activeSessionId: null,
@@ -1962,15 +2005,7 @@ export const useLabStore = create<LabState>((set, get) => ({
               fastRunResult: fastRes,
               diagnostics: exitDiags,
               executionStatus: fastExecStatus,
-              ...(shouldSyncTerminalStdin
-                ? {
-                    stdin: nextStdin,
-                    stdinDraft: nextStdin,
-                    stdinSource: nextStdin.trim() ? 'terminal' : 'none',
-                    autoInjectedStdinNotice: null,
-                  }
-                : {}),
-              lastTerminalSnapshot: { code, stdin: nextStdin },
+              lastTerminalSnapshot: { code, stdin: usedStdinNormalized || s.stdin },
             };
           });
 
@@ -2021,7 +2056,23 @@ export const useLabStore = create<LabState>((set, get) => ({
         set((s) => ({
           isFastRunning: false,
           activeSessionId: null,
-          terminalExecState: s.terminalHistory.length > 0 ? 'COMPLETED' : 'ERROR',
+          terminalExecState: s.terminalExecState === 'COMPLETED' ? 'COMPLETED' : 'ERROR',
+          executionStatus: s.terminalExecState === 'COMPLETED' ? s.executionStatus : 'error',
+          fastRunResult: s.fastRunResult || {
+            success: false,
+            stdout: '',
+            stderr: 'Execution stream disconnected unexpectedly.',
+            exitCode: 1,
+            executionTimeMs: Math.max(1, Date.now() - startedAt),
+            errorCategory: 'runtime_error',
+            language,
+            stdinUsed: stdin,
+            timestamp: new Date().toLocaleTimeString('en-US', {
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            diagnostics,
+          },
         }));
       };
     } catch (err: any) {
@@ -2050,10 +2101,6 @@ export const useLabStore = create<LabState>((set, get) => ({
           },
         ],
         terminalCollectedInputs: nextCollected,
-        stdin: nextStdin,
-        stdinDraft: nextStdin,
-        stdinSource: 'terminal',
-        autoInjectedStdinNotice: null,
         lastTerminalSnapshot: { code: s.code, stdin: nextStdin },
         currentPrompt: '',
         currentInputValue: '',
@@ -2067,6 +2114,39 @@ export const useLabStore = create<LabState>((set, get) => ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId: activeSessionId, input: answer }),
+      });
+    } catch {
+      // Errors will surface through the SSE stream or exit handler
+    }
+  },
+
+  endTerminalInput: async () => {
+    const { activeSessionId, terminalExecState, currentPrompt } = get();
+    if (!activeSessionId || terminalExecState !== 'WAITING_FOR_INPUT') return;
+
+    set((s) => {
+      const nextHistory = [...s.terminalHistory];
+      if (currentPrompt.length > 0) {
+        nextHistory.push({
+          id: makeTerminalLineId(),
+          type: 'output',
+          text: currentPrompt,
+        });
+      }
+      return {
+        terminalHistory: nextHistory,
+        currentPrompt: '',
+        currentInputValue: '',
+        terminalExecState: 'RUNNING',
+        isFastRunning: true,
+      };
+    });
+
+    try {
+      await fetch('/api/execute/input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: activeSessionId, input: '', eof: true }),
       });
     } catch {
       // Errors will surface through the SSE stream or exit handler

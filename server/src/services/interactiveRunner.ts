@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { spawn, ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { ExecutionDiagnostic, SupportedLanguage } from '../../../shared/types';
+import { classifyErrorCategory } from '../../../shared/stdinHelper';
 import { preprocessCode, remapDiagnosticsToOriginal } from './codePreprocessor';
 import {
   cleanupSandboxWorkspace,
@@ -18,7 +19,7 @@ import {
 import { parseGppDiagnostics } from './toolchains/cppToolchain';
 import { compileJava } from './toolchains/javaToolchain';
 import { checkPythonSyntax } from './toolchains/pythonToolchain';
-import { checkJsSyntax } from './toolchains/nodeToolchain';
+import { checkJsSyntax, NODE_PRELOAD_CJS } from './toolchains/nodeToolchain';
 import { executeViaRemoteSandbox, isLocalExecutionBlockedError } from './toolchains/remoteSandbox';
 
 export type InteractiveEventType = 'stdout' | 'stderr' | 'prompt' | 'exit';
@@ -54,13 +55,18 @@ interface InteractiveSession {
   idleTimeoutTimer: NodeJS.Timeout | null;
 }
 
+export type StdinMode = 'auto' | 'batch' | 'interactive';
+
 export interface StartInteractiveResult {
   ok: boolean;
   sessionId?: string;
   diagnostics: ExecutionDiagnostic[];
   stderr?: string;
   runtimeError?: string;
+  errorCategory?: 'compile_error' | 'runtime_error' | 'input_error' | null;
   isInteractive?: boolean;
+  executionBackend?: 'local' | 'remote';
+  interactiveSupported?: boolean;
 }
 
 const sessions = new Map<string, InteractiveSession>();
@@ -68,7 +74,8 @@ const MAX_ACTIVE_SESSIONS = 16;
 const MAX_OUTPUT_BYTES = 128 * 1024;
 const STEP_TIMEOUT_MS = 12000;
 const IDLE_TIMEOUT_MS = 120_000;
-const PROMPT_SETTLE_MS = 85;
+const INITIAL_PROMPT_SETTLE_MS = 450;
+const PROMPT_SETTLE_MS = 120;
 
 const UNBUF_C_CODE = `
 #include <stdio.h>
@@ -119,31 +126,6 @@ public class _LogicLabRunner {
 }
 `.trim();
 
-const NODE_PRELOAD_CJS = `
-const fs = require('fs');
-globalThis.prompt = function(message) {
-  if (message !== undefined && message !== null) {
-    process.stdout.write(String(message));
-  }
-  const buf = Buffer.alloc(1);
-  const bytes = [];
-  while (true) {
-    let bytesRead = 0;
-    try {
-      bytesRead = fs.readSync(0, buf, 0, 1, null);
-    } catch (err) {
-      if (err && (err.code === 'EAGAIN' || err.code === 'EINTR')) continue;
-      break;
-    }
-    if (bytesRead === 0) break;
-    const b = buf[0];
-    if (b === 10) break; // '\\n'
-    if (b !== 13) bytes.push(b); // skip '\\r'
-  }
-  return Buffer.from(bytes).toString('utf8');
-};
-`.trim();
-
 function stripCommentsForInputDetection(code: string, language: SupportedLanguage): string {
   if (language === 'python') {
     return code.replace(/#.*$/gm, '');
@@ -151,6 +133,25 @@ function stripCommentsForInputDetection(code: string, language: SupportedLanguag
   return code
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/.*$/gm, '');
+}
+
+/**
+ * Returns true when code reads STDIN purely via whole-stream EOF APIs (e.g. fs.readFileSync(0),
+ * sys.stdin.read()) without line-by-line interactive prompt APIs, so stdin must be closed immediately.
+ */
+function isWholeStreamEofOnly(code: string, language: SupportedLanguage): boolean {
+  const clean = stripCommentsForInputDetection(code, language);
+  if (language === 'javascript') {
+    const usesWholeStream = /\bfs\.(?:readFileSync|readSync)\s*\(\s*(?:0|['"]\/dev\/stdin['"])/.test(clean);
+    const usesLinePrompt = /\b(?:prompt|readline)\s*\(/.test(clean);
+    return usesWholeStream && !usesLinePrompt;
+  }
+  if (language === 'python') {
+    const usesWholeStream = /\bsys\.stdin\.(?:read|readlines)\s*\(/.test(clean);
+    const usesLinePrompt = /\binput\s*\(/.test(clean);
+    return usesWholeStream && !usesLinePrompt;
+  }
+  return false;
 }
 
 /**
@@ -232,9 +233,8 @@ function startStepTimer(session: InteractiveSession): void {
   }, STEP_TIMEOUT_MS);
 }
 
-async function runRemoteReplayStep(session: InteractiveSession): Promise<void> {
-  const inputs = session.collectedInputs || [];
-  const stdinStr = inputs.join('\n');
+async function runRemoteBatchExecution(session: InteractiveSession): Promise<void> {
+  const stdinStr = session.stdinAll;
   const remote = await executeViaRemoteSandbox(
     session.language,
     session.code,
@@ -246,6 +246,7 @@ async function runRemoteReplayStep(session: InteractiveSession): Promise<void> {
   if (!remote) {
     session.exited = true;
     const msg = 'Local compiler is unavailable and remote sandbox is unreachable.';
+    session.stderrAll = msg;
     emitSessionEvent(session, { type: 'stderr', data: { text: msg } });
     emitSessionEvent(session, {
       type: 'exit',
@@ -254,6 +255,9 @@ async function runRemoteReplayStep(session: InteractiveSession): Promise<void> {
         timedOut: false,
         executionTimeMs: Math.max(1, Date.now() - session.startedAt),
         success: false,
+        errorCategory: 'runtime_error',
+        executionBackend: 'remote',
+        interactiveSupported: false,
         stdout: session.stdoutAll,
         stderr: msg,
         stdinUsed: stdinStr,
@@ -263,10 +267,11 @@ async function runRemoteReplayStep(session: InteractiveSession): Promise<void> {
     return;
   }
 
-  if (remote.compileOutput && remote.exitCode !== 0 && !remote.stdout) {
+  if (remote.compileFailed) {
     session.exited = true;
-    session.stderrAll = remote.compileOutput;
-    emitSessionEvent(session, { type: 'stderr', data: { text: remote.compileOutput } });
+    const compileText = remote.compileOutput || remote.stderr || 'Compilation failed.';
+    session.stderrAll = compileText;
+    emitSessionEvent(session, { type: 'stderr', data: { text: compileText } });
     emitSessionEvent(session, {
       type: 'exit',
       data: {
@@ -274,8 +279,11 @@ async function runRemoteReplayStep(session: InteractiveSession): Promise<void> {
         timedOut: false,
         executionTimeMs: remote.executionTimeMs,
         success: false,
+        errorCategory: 'compile_error',
+        executionBackend: 'remote',
+        interactiveSupported: false,
         stdout: '',
-        stderr: remote.compileOutput,
+        stderr: compileText,
         stdinUsed: stdinStr,
         diagnostics: session.diagnostics,
       },
@@ -283,57 +291,48 @@ async function runRemoteReplayStep(session: InteractiveSession): Promise<void> {
     return;
   }
 
-  const prevLen = session.stdoutAll.length;
-  const fullStdout = remote.stdout || '';
-  const delta = fullStdout.slice(prevLen);
-  if (delta) {
-    session.stdoutAll = fullStdout;
-    emitSessionEvent(session, { type: 'stdout', data: { text: delta } });
-  }
-
-  // If the program requires input and we haven't provided all inputs yet, prompt again if stderr indicates EOF/input wait or if we have more inputs to collect
-  const hitEof =
-    session.isInteractive &&
-    (remote.stderr?.toLowerCase().includes('eof') ||
-      remote.runtimeError?.toLowerCase().includes('eof') ||
-      (inputs.length === 0 && !remote.stderr));
-
-  if (hitEof && inputs.length < 20) {
-    session.waitingForInput = true;
-    emitSessionEvent(session, { type: 'prompt', data: {} });
-    return;
+  if (remote.stdout) {
+    session.stdoutAll = remote.stdout;
+    emitSessionEvent(session, { type: 'stdout', data: { text: remote.stdout } });
   }
 
   session.exited = true;
   if (remote.stderr) {
-    session.stderrAll += remote.stderr;
+    session.stderrAll = remote.stderr;
     emitSessionEvent(session, { type: 'stderr', data: { text: remote.stderr } });
   }
+
+  const success = !remote.timedOut && remote.exitCode === 0;
+  const errorCategory = success
+    ? null
+    : classifyErrorCategory(remote.stderr || remote.runtimeError || (remote.timedOut ? 'timed out' : ''), false);
+
   emitSessionEvent(session, {
     type: 'exit',
     data: {
-      exitCode: remote.exitCode ?? 0,
+      exitCode: remote.exitCode ?? (success ? 0 : 1),
       timedOut: remote.timedOut,
       executionTimeMs: remote.executionTimeMs,
-      success: !remote.timedOut && (remote.exitCode === 0 || remote.exitCode === null),
+      success,
+      errorCategory,
+      executionBackend: 'remote',
+      interactiveSupported: false,
       stdout: session.stdoutAll,
-      stderr: session.stderrAll,
+      stderr: session.stderrAll || remote.runtimeError || '',
       stdinUsed: stdinStr,
       diagnostics: session.diagnostics,
     },
   });
 }
 
-function createRemoteReplaySession(
+function createRemoteBatchSession(
   rawCode: string,
   language: SupportedLanguage,
   fileName: string | undefined,
-  isInteractive: boolean,
   diagnostics: ExecutionDiagnostic[],
   initialStdin = ''
 ): StartInteractiveResult {
   const sessionId = `exec-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  const initialInputs = initialStdin ? initialStdin.replace(/\r\n/g, '\n').split('\n') : [];
   const session: InteractiveSession = {
     id: sessionId,
     language,
@@ -342,8 +341,8 @@ function createRemoteReplaySession(
     workspaceDir: '',
     child: null,
     isRemoteReplay: true,
-    collectedInputs: initialInputs,
-    isInteractive,
+    collectedInputs: [],
+    isInteractive: false,
     startedAt: Date.now(),
     stdoutAll: '',
     stderrAll: '',
@@ -360,23 +359,26 @@ function createRemoteReplaySession(
     idleTimeoutTimer: null,
   };
   sessions.set(sessionId, session);
-  void runRemoteReplayStep(session);
+  void runRemoteBatchExecution(session);
   return {
     ok: true,
     sessionId,
     diagnostics,
-    isInteractive,
+    isInteractive: false,
+    executionBackend: 'remote',
+    interactiveSupported: false,
   };
 }
 
 /**
- * Compiles (if needed) and starts an interactive child-process session.
+ * Compiles (if needed) and starts a local interactive or batch child-process session.
  */
 export async function startInteractiveSession(
   rawCode: string,
   language: SupportedLanguage,
   fileName?: string,
-  initialStdin = ''
+  initialStdin = '',
+  stdinMode: StdinMode = 'auto'
 ): Promise<StartInteractiveResult> {
   // Evict already-exited sessions before checking live session capacity
   for (const [id, existing] of sessions.entries()) {
@@ -392,7 +394,15 @@ export async function startInteractiveSession(
 
   const prep = preprocessCode(rawCode, language);
   const code = prep.code;
-  const isInteractive = hasInputPattern(code, language);
+  const detectedInput = hasInputPattern(code, language);
+  const wholeStreamEofOnly = isWholeStreamEofOnly(code, language);
+  const hasPreSuppliedStdin = initialStdin.length > 0;
+  const isInteractive =
+    stdinMode === 'interactive'
+      ? detectedInput && !wholeStreamEofOnly
+      : stdinMode === 'batch'
+      ? false
+      : detectedInput && !hasPreSuppliedStdin && !wholeStreamEofOnly;
 
   let workspaceDir = '';
   let cmd = '';
@@ -419,10 +429,10 @@ export async function startInteractiveSession(
       if (!gppPath) {
         await cleanupSandboxWorkspace(workspaceDir);
         if (process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+          return createRemoteBatchSession(rawCode, language, fileName, prep.diagnostics, initialStdin);
         }
         const cfgErr = "C++ compiler (g++) not found. Ensure g++ is installed and in PATH, or set GPP_PATH.";
-        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };
+        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr, errorCategory: 'compile_error' };
       }
 
       const compileArgs = isC
@@ -450,13 +460,16 @@ export async function startInteractiveSession(
         const errMsg =
           compileRes.stderr.trim() || firstErr?.message || 'C/C++ compilation failed.';
         if (isLocalExecutionBlockedError(errMsg) && process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+          return createRemoteBatchSession(rawCode, language, fileName, prep.diagnostics, initialStdin);
         }
         return {
           ok: false,
           diagnostics,
           stderr: errMsg,
           runtimeError: errMsg,
+          errorCategory: 'compile_error',
+          executionBackend: 'local',
+          interactiveSupported: true,
         };
       }
 
@@ -480,11 +493,10 @@ export async function startInteractiveSession(
           (compileRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) &&
           process.env.REMOTE_SANDBOX_FALLBACK !== 'false'
         ) {
-          return createRemoteReplaySession(
+          return createRemoteBatchSession(
             rawCode,
             language,
             compileRes.sourceFileName || fileName,
-            isInteractive,
             prep.diagnostics,
             initialStdin
           );
@@ -494,6 +506,9 @@ export async function startInteractiveSession(
           diagnostics: compileRes.compilerUnavailable ? [] : diagnostics,
           stderr: errMsg,
           runtimeError: errMsg,
+          errorCategory: 'compile_error',
+          executionBackend: 'local',
+          interactiveSupported: true,
         };
       }
 
@@ -502,18 +517,17 @@ export async function startInteractiveSession(
       if (!javaPath) {
         await cleanupSandboxWorkspace(workspaceDir);
         if (process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
-          return createRemoteReplaySession(
+          return createRemoteBatchSession(
             rawCode,
             language,
             compileRes.sourceFileName || fileName,
-            isInteractive,
             prep.diagnostics,
             initialStdin
           );
         }
         const cfgErr =
           "Java runtime (java) not found. Ensure a JDK/JRE is installed and 'java' is in PATH, or set JAVA_HOME / JAVA_PATH.";
-        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr };
+        return { ok: false, diagnostics: [], stderr: cfgErr, runtimeError: cfgErr, errorCategory: 'compile_error' };
       }
 
       const mainClass = compileRes.mainClass || 'Main';
@@ -557,13 +571,16 @@ export async function startInteractiveSession(
           (syntaxRes.compilerUnavailable || isLocalExecutionBlockedError(errMsg)) &&
           process.env.REMOTE_SANDBOX_FALLBACK !== 'false'
         ) {
-          return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+          return createRemoteBatchSession(rawCode, language, fileName, prep.diagnostics, initialStdin);
         }
         return {
           ok: false,
           diagnostics: syntaxRes.compilerUnavailable ? [] : diagnostics,
           stderr: errMsg,
           runtimeError: errMsg,
+          errorCategory: 'compile_error',
+          executionBackend: 'local',
+          interactiveSupported: true,
         };
       }
 
@@ -586,6 +603,9 @@ export async function startInteractiveSession(
           diagnostics,
           stderr: errMsg,
           runtimeError: errMsg,
+          errorCategory: 'compile_error',
+          executionBackend: 'local',
+          interactiveSupported: true,
         };
       }
 
@@ -650,7 +670,7 @@ export async function startInteractiveSession(
     sessions.set(sessionId, session);
     startStepTimer(session);
     if (isInteractive) {
-      schedulePromptCheck(session, PROMPT_SETTLE_MS);
+      schedulePromptCheck(session, INITIAL_PROMPT_SETTLE_MS);
     }
 
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -679,18 +699,19 @@ export async function startInteractiveSession(
       const msg = `Failed to start process: ${err.message}`;
       if (isLocalExecutionBlockedError(msg) && process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
         session.isRemoteReplay = true;
+        session.isInteractive = false;
         session.child = null;
-        session.collectedInputs = initialStdin ? initialStdin.replace(/\r\n/g, '\n').split('\n') : [];
+        session.collectedInputs = [];
         clearSessionTimers(session);
         void cleanupSandboxWorkspace(session.workspaceDir);
-        void runRemoteReplayStep(session);
+        void runRemoteBatchExecution(session);
         return;
       }
       session.stderrAll += msg;
       emitSessionEvent(session, { type: 'stderr', data: { text: msg } });
     });
 
-    child.on('close', (exitCode: number | null) => {
+    child.on('close', (exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (session.exited || session.isRemoteReplay) return;
       const tailOut = stdoutDecoder.end();
       if (tailOut) {
@@ -708,15 +729,25 @@ export async function startInteractiveSession(
       clearSessionTimers(session);
 
       const executionTimeMs = Math.max(1, Date.now() - session.startedAt);
-      const success = !session.timedOut && (exitCode === 0 || exitCode === null);
+      const success = !session.timedOut && exitCode === 0 && !signal;
+      const errorCategory = success
+        ? null
+        : classifyErrorCategory(
+            session.stderrAll || (session.timedOut ? 'timed out' : signal || ''),
+            false
+          );
 
       emitSessionEvent(session, {
         type: 'exit',
         data: {
           exitCode,
+          signal,
           timedOut: session.timedOut,
           executionTimeMs,
           success,
+          errorCategory,
+          executionBackend: 'local',
+          interactiveSupported: true,
           stdout: session.stdoutAll,
           stderr: session.stderrAll,
           stdinUsed: session.stdinAll,
@@ -725,9 +756,10 @@ export async function startInteractiveSession(
       });
 
       void cleanupSandboxWorkspace(session.workspaceDir);
-      setTimeout(() => {
+      const cleanupTimer = setTimeout(() => {
         sessions.delete(sessionId);
       }, 30_000);
+      cleanupTimer.unref?.();
     });
 
     return {
@@ -735,6 +767,8 @@ export async function startInteractiveSession(
       sessionId,
       diagnostics,
       isInteractive,
+      executionBackend: 'local',
+      interactiveSupported: true,
     };
   } catch (err: any) {
     if (workspaceDir) {
@@ -742,13 +776,14 @@ export async function startInteractiveSession(
     }
     const msg = err?.message || 'Execution failed to start.';
     if (isLocalExecutionBlockedError(msg) && process.env.REMOTE_SANDBOX_FALLBACK !== 'false') {
-      return createRemoteReplaySession(rawCode, language, fileName, isInteractive, prep.diagnostics, initialStdin);
+      return createRemoteBatchSession(rawCode, language, fileName, prep.diagnostics, initialStdin);
     }
     return {
       ok: false,
       diagnostics,
       stderr: msg,
       runtimeError: msg,
+      errorCategory: 'compile_error',
     };
   }
 }
@@ -777,20 +812,12 @@ export function subscribeToSession(
 }
 
 /**
- * Sends a single line of stdin to an active interactive session.
+ * Sends a single line of stdin (or signals EOF) to an active local interactive session.
  */
-export function sendSessionInput(sessionId: string, inputLine: string): boolean {
+export function sendSessionInput(sessionId: string, inputLine: string, eof = false): boolean {
   const session = sessions.get(sessionId);
-  if (!session || session.exited) {
+  if (!session || session.exited || session.isRemoteReplay || !session.isInteractive) {
     return false;
-  }
-
-  if (session.isRemoteReplay) {
-    session.waitingForInput = false;
-    session.stdinAll += `${inputLine}\n`;
-    session.collectedInputs = [...(session.collectedInputs || []), inputLine];
-    void runRemoteReplayStep(session);
-    return true;
   }
 
   if (!session.child || !session.child.stdin) {
@@ -807,10 +834,20 @@ export function sendSessionInput(sessionId: string, inputLine: string): boolean 
   }
 
   session.waitingForInput = false;
+  startStepTimer(session);
+
+  if (eof) {
+    try {
+      session.child.stdin.end();
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
   const line = `${inputLine}\n`;
   session.stdinAll += line;
 
-  startStepTimer(session);
   try {
     session.child.stdin.write(line, 'utf8');
   } catch {
@@ -818,7 +855,7 @@ export function sendSessionInput(sessionId: string, inputLine: string): boolean 
   }
 
   if (session.isInteractive) {
-    schedulePromptCheck(session, 110);
+    schedulePromptCheck(session, PROMPT_SETTLE_MS);
   }
   return true;
 }

@@ -339,6 +339,18 @@ export function detectInputCalls(
         hintType: inferHintTypeFromContext(targetVar, explicitType, cleaned),
         rawCall: jsMatch[0],
       });
+      return;
+    }
+
+    const fsStdinMatch = line.match(
+      /\bfs\.(?:readFileSync|readSync)\s*\(\s*(?:0|['"]\/dev\/stdin['"])/
+    );
+    if (fsStdinMatch || /\bprocess\.stdin\b/.test(line)) {
+      calls.push({
+        line: idx + 1,
+        hintType: 'string',
+        rawCall: fsStdinMatch ? fsStdinMatch[0] : 'process.stdin',
+      });
     }
   });
   return calls;
@@ -435,7 +447,7 @@ export function classifyErrorCategory(
 ): 'compile_error' | 'runtime_error' | 'input_error' {
   if (hasCompileFailure) return 'compile_error';
   if (
-    /NoSuchElementException|EOFError|InputMismatchException|EOF when reading a line|insufficient input|missing stdin/i.test(
+    /NoSuchElementException|EOFError|InputMismatchException|EOF when reading a line|insufficient input|missing stdin|end of file|unexpected eof|NumberFormatException:\s*For input string:\s*""/i.test(
       message
     )
   ) {

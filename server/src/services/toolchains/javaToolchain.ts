@@ -14,6 +14,7 @@ import {
 } from './remoteSandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
+import { classifyErrorCategory } from '../../../../shared/stdinHelper';
 
 /**
  * Strips comments and string/char literals from Java source so package and class declarations
@@ -278,6 +279,8 @@ export async function executeJava(
         timedOut: false,
         runtimeError: errorMsg,
         runtimeErrorLine: firstError?.line || 1,
+        errorCategory: 'compile_error',
+        executionBackend: 'local',
         executionTimeMs: 0,
         diagnostics: compileRes.diagnostics,
       };
@@ -339,9 +342,12 @@ export async function executeJava(
 
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
-    } else if (runRes.exitCode !== 0 && runRes.exitCode !== null) {
+    } else if (runRes.exitCode !== 0) {
       runtimeError =
-        runRes.stderr.trim() || `Java process exited with error code ${runRes.exitCode}.`;
+        runRes.stderr.trim() ||
+        (runRes.exitCode === null
+          ? 'Java process terminated abnormally by signal.'
+          : `Java process exited with error code ${runRes.exitCode}.`);
       const escapedFile = compileRes.sourceFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const fileFrameMatch = runRes.stderr.match(
         new RegExp(`at\\s+[^(]+\\(${escapedFile}:(\\d+)\\)`)
@@ -354,12 +360,15 @@ export async function executeJava(
     }
 
     const hasWarnings = compileRes.diagnostics.some((d) => d.severity === 'warning');
-    const status: 'success' | 'warning' | 'error' =
-      runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
-        ? 'error'
-        : hasWarnings
-        ? 'warning'
-        : 'success';
+    const isFailure = runRes.timedOut || runRes.exitCode !== 0;
+    const status: 'success' | 'warning' | 'error' = isFailure
+      ? 'error'
+      : hasWarnings
+      ? 'warning'
+      : 'success';
+    const errorCategory = isFailure
+      ? classifyErrorCategory(runRes.stderr || runtimeError || '', false)
+      : undefined;
 
     const output = runtimeError
       ? runRes.stdout ? `${runRes.stdout}\n${runtimeError}` : runtimeError
@@ -375,6 +384,8 @@ export async function executeJava(
       timedOut: runRes.timedOut,
       runtimeError,
       runtimeErrorLine,
+      ...(errorCategory ? { errorCategory } : {}),
+      executionBackend: 'local',
       executionTimeMs: runRes.executionTimeMs,
       diagnostics: compileRes.diagnostics,
     };

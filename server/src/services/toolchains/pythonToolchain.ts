@@ -14,6 +14,7 @@ import {
 } from './remoteSandbox';
 import { ToolchainCompileResult, ToolchainExecutionResult } from './types';
 import { ExecutionDiagnostic } from '../../../../shared/types';
+import { classifyErrorCategory } from '../../../../shared/stdinHelper';
 
 /**
  * Checks Python syntax without executing user code
@@ -168,6 +169,8 @@ export async function executePython(
         timedOut: false,
         runtimeError: errorMsg,
         runtimeErrorLine: firstError?.line || 1,
+        errorCategory: 'compile_error',
+        executionBackend: 'local',
         executionTimeMs: 0,
         diagnostics: syntaxRes.diagnostics,
       };
@@ -198,9 +201,12 @@ export async function executePython(
 
     if (runRes.timedOut) {
       runtimeError = `Execution timed out (${timeoutMs}ms). Possible infinite loop.`;
-    } else if (runRes.exitCode !== 0 && runRes.exitCode !== null) {
+    } else if (runRes.exitCode !== 0) {
       runtimeError =
-        runRes.stderr.trim() || `Python process exited with error code ${runRes.exitCode}.`;
+        runRes.stderr.trim() ||
+        (runRes.exitCode === null
+          ? 'Python process terminated abnormally by signal.'
+          : `Python process exited with error code ${runRes.exitCode}.`);
       const escapedFile = sourceFileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const fileMatches = [
         ...runRes.stderr.matchAll(new RegExp(`File\\s+["'][^"']*${escapedFile}["'],\\s+line\\s+(\\d+)`, 'g')),
@@ -215,12 +221,15 @@ export async function executePython(
     }
 
     const hasWarnings = syntaxRes.diagnostics.some((d) => d.severity === 'warning');
-    const status: 'success' | 'warning' | 'error' =
-      runRes.timedOut || (runRes.exitCode !== 0 && runRes.exitCode !== null)
-        ? 'error'
-        : hasWarnings
-        ? 'warning'
-        : 'success';
+    const isFailure = runRes.timedOut || runRes.exitCode !== 0;
+    const status: 'success' | 'warning' | 'error' = isFailure
+      ? 'error'
+      : hasWarnings
+      ? 'warning'
+      : 'success';
+    const errorCategory = isFailure
+      ? classifyErrorCategory(runRes.stderr || runtimeError || '', false)
+      : undefined;
 
     const output = runtimeError
       ? runRes.stdout ? `${runRes.stdout}\n${runtimeError}` : runtimeError
@@ -236,6 +245,8 @@ export async function executePython(
       timedOut: runRes.timedOut,
       runtimeError,
       runtimeErrorLine,
+      ...(errorCategory ? { errorCategory } : {}),
+      executionBackend: 'local',
       executionTimeMs: runRes.executionTimeMs,
       diagnostics: syntaxRes.diagnostics,
     };

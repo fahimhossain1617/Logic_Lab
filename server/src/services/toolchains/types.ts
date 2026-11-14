@@ -23,6 +23,8 @@ export interface ToolchainExecutionResult {
   timedOut: boolean;
   runtimeError: string | null;
   runtimeErrorLine?: number;
+  errorCategory?: 'compile_error' | 'runtime_error' | 'input_error';
+  executionBackend?: 'local' | 'remote';
   executionTimeMs: number;
   diagnostics: ExecutionDiagnostic[];
 }

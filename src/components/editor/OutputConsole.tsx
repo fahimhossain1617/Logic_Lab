@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, Eraser } from 'lucide-react';
 import { ExecutionDiagnostic } from '../../../shared/types';
+import { classifyErrorCategory } from '../../../shared/stdinHelper';
 import { useLabStore } from '../../store/useLabStore';
 
 interface OutputConsoleProps {
@@ -38,6 +39,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
     setStdin,
     setCurrentInputValue,
     submitTerminalInput,
+    endTerminalInput,
     toggleConsoleOpen,
     clearConsoleOutput,
   } = useLabStore();
@@ -68,26 +70,36 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
 
   const isFastError =
     executionMode === 'fast' &&
-    (terminalExecState === 'ERROR' || (fastRunResult !== null && !fastRunResult.success));
+    (terminalExecState === 'ERROR' ||
+      (fastRunResult !== null && !fastRunResult.success) ||
+      (!isBusy && !isWaitingInput && executionStatus === 'error'));
 
-  const isCompileError =
-    executionMode === 'fast'
-      ? isFastError || executionStatus === 'error'
-      : hasExecuted &&
-        (executionStatus === 'error' ||
-          Boolean(apiError) ||
-          trace.verdict.status === 'compile_error');
+  const fastErrorCategory = isFastError
+    ? fastRunResult?.errorCategory ||
+      classifyErrorCategory(
+        fastRunResult?.stderr || '',
+        diagnostics.some((d) => d.severity === 'error')
+      )
+    : null;
+
+  const isExplainError =
+    hasExecuted &&
+    (executionStatus === 'error' ||
+      Boolean(apiError) ||
+      trace.verdict.status === 'compile_error');
+
+  const isAnyError = executionMode === 'fast' ? isFastError : isExplainError;
 
   const hasWarnings =
     hasAnyOutput &&
-    !isCompileError &&
+    !isAnyError &&
     (executionStatus === 'warning' || diagnostics.some((d) => d.severity === 'warning'));
 
   const stdoutText = trace.finalOutput;
   const hasSyncedTerminalSession =
     executionMode === 'explain' &&
     hasExecuted &&
-    !isCompileError &&
+    !isAnyError &&
     Boolean(lastTerminalSnapshot) &&
     lastTerminalSnapshot!.code === code &&
     lastTerminalSnapshot!.stdin === stdin &&
@@ -199,7 +211,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
           {hasAnyOutput && !isBusy && !isWaitingInput && (
             <span
               className={`text-[11px] font-mono font-semibold px-2 py-0.5 rounded-md ${
-                isCompileError
+                isAnyError
                   ? 'bg-[#EF4444]/15 text-[var(--text-danger)]'
                   : hasWarnings
                   ? 'bg-[#F59E0B]/15 text-[var(--text-warning)]'
@@ -207,8 +219,24 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
               }`}
               data-testid="console-status-badge"
             >
-              {isCompileError
-                ? trace.verdict.status === 'runtime_error' || trace.verdict.status === 'infinite_loop'
+              {isAnyError
+                ? executionMode === 'fast'
+                  ? fastRunResult?.timedOut
+                    ? explainLanguage === 'bn'
+                      ? 'সময়সীমা অতিক্রম'
+                      : 'Timeout Error'
+                    : fastErrorCategory === 'input_error'
+                    ? explainLanguage === 'bn'
+                      ? 'ইনপুট ত্রুটি'
+                      : 'Input Error'
+                    : fastErrorCategory === 'runtime_error'
+                    ? explainLanguage === 'bn'
+                      ? 'রানটাইম ত্রুটি'
+                      : 'Runtime Error'
+                    : explainLanguage === 'bn'
+                    ? 'কম্পাইল ত্রুটি'
+                    : 'Compile Error'
+                  : trace.verdict.status === 'runtime_error' || trace.verdict.status === 'infinite_loop'
                   ? explainLanguage === 'bn'
                     ? trace.errorCategory === 'input_error'
                       ? 'ইনপুট ত্রুটি'
@@ -321,14 +349,21 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                   onChange={(e) => setStdin(e.target.value)}
                   placeholder={
                     explainLanguage === 'bn'
-                      ? 'এখানে ইনপুট লিখুন (যেমন:\n15.5\n24.5\n...খালি রাখলে কোড চলাকালীন টার্মিনালেই সরাসরি টাইপ করতে পারবেন)'
-                      : 'Enter inputs line by line (e.g.:\n15.5\n24.5\n...or leave empty to type interactively in the terminal)'
+                      ? 'এখানে ইনপুট লিখুন (যেমন:\n15.5\n24.5\n...খালি রাখলে লোকাল মোডে কোড চলাকালীন টার্মিনালেই সরাসরি টাইপ করতে পারবেন)'
+                      : 'Enter inputs line by line (e.g.:\n15.5\n24.5\n...or leave empty locally to type interactively in the terminal)'
                   }
                   rows={4}
                   spellCheck={false}
                   data-testid="console-stdin-input"
                   className="w-full rounded-lg bg-[#070C1D] border border-slate-800 focus:border-cyan-500/60 focus:outline-none p-3 font-mono text-xs sm:text-sm text-slate-100 placeholder:text-slate-600 resize-y"
                 />
+                {fastRunResult?.interactiveSupported === false && (
+                  <p className="text-[11px] font-mono text-amber-300/90 m-0" data-testid="remote-stdin-limitation-note">
+                    {explainLanguage === 'bn'
+                      ? 'নোট: বর্তমান রিমোট/সার্ভারলেস রানটাইম শুধুমাত্র Batch STDIN সাপোর্ট করে (লাইভ ইন্টার‍্যাক্টিভ টার্মিনাল ইনপুট নয়)। রান করার আগে উপরের বক্সে সব ইনপুট দিন।'
+                      : 'Note: The current remote/serverless runtime supports Batch STDIN only (live mid-run interactive input is unavailable). Enter all required inputs above before clicking Run.'}
+                  </p>
+                )}
               </div>
             ) : activeTab === 'problems' ? (
               displayDiagnostics.length === 0 ? (
@@ -388,7 +423,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                     ? 'কোড রান করলে আউটপুট এখানে দেখাবে'
                     : 'Program output will appear here'}
                 </div>
-              ) : isCompileError ? (
+              ) : isExplainError ? (
                 <div className="space-y-2" role="alert" data-testid="output-error-state">
                   {stdoutText && (
                     <pre className="m-0 pb-2 border-b border-[var(--border-subtle)] whitespace-pre-wrap break-words text-xs font-mono text-slate-300">
@@ -493,7 +528,9 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
               <div
                 className="space-y-0.5"
                 data-testid={
-                  terminalExecState === 'ERROR' ? 'output-error-state' : 'output-success-state'
+                  isFastError || terminalExecState === 'ERROR'
+                    ? 'output-error-state'
+                    : 'output-success-state'
                 }
               >
                 {hasWarnings && (
@@ -553,7 +590,7 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                 })}
 
                 {isWaitingInput && (
-                  <div className="flex items-center leading-relaxed">
+                  <div className="flex items-center gap-2 leading-relaxed">
                     {currentPrompt && (
                       <span className="whitespace-pre text-emerald-300 font-semibold shrink-0">
                         {currentPrompt}
@@ -568,6 +605,9 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                         if (e.key === 'Enter') {
                           e.preventDefault();
                           void submitTerminalInput();
+                        } else if (e.ctrlKey && e.key.toLowerCase() === 'd') {
+                          e.preventDefault();
+                          void endTerminalInput();
                         }
                       }}
                       spellCheck={false}
@@ -577,6 +617,33 @@ export const OutputConsole: React.FC<OutputConsoleProps> = ({
                       data-testid="terminal-inline-input"
                       className="flex-1 min-w-[60px] bg-transparent border-none outline-none text-cyan-300 font-semibold font-mono p-0 m-0 caret-cyan-400"
                     />
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void endTerminalInput();
+                      }}
+                      data-testid="terminal-eof-btn"
+                      title="Send EOF (Ctrl+D)"
+                      className="px-1.5 py-0.5 rounded text-[10px] font-mono text-slate-400 hover:text-cyan-300 border border-slate-700/80 hover:border-cyan-500/50 transition-colors cursor-pointer shrink-0"
+                    >
+                      EOF
+                    </button>
+                  </div>
+                )}
+
+                {isFastError && fastErrorCategory === 'input_error' && !isBusy && (
+                  <div
+                    className="mt-2 pt-2 border-t border-rose-500/25 text-xs font-mono text-amber-300/95"
+                    data-testid="input-error-diagnostic"
+                  >
+                    {fastRunResult?.interactiveSupported === false
+                      ? explainLanguage === 'bn'
+                        ? 'ইনপুট (STDIN) পর্যাপ্ত নয় বা খালি আছে। এই রিমোট/সার্ভারলেস রানটাইম শুধুমাত্র Batch STDIN সাপোর্ট করে — রান করার আগে "ইনপুট (STDIN)" ট্যাবে সব ইনপুট দিন।'
+                        : 'Missing or insufficient STDIN (EOF reached). This remote/serverless runtime supports Batch STDIN only — provide all required inputs line by line in the "Input (stdin)" tab before clicking Run.'
+                      : explainLanguage === 'bn'
+                      ? 'প্রোগ্রামটি প্রদত্ত ইনপুটের চেয়ে বেশি STDIN চেয়েছে বা EOF-এ পৌঁছেছে। "ইনপুট (STDIN)" ট্যাবে সব প্রয়োজনীয় ইনপুট লিখুন অথবা খালি রেখে টার্মিনালে উত্তর দিন।'
+                      : 'Program requested more STDIN than provided or reached end of input (EOF). Enter all required inputs in the "Input (stdin)" tab before running.'}
                   </div>
                 )}
 

@@ -1,4 +1,5 @@
 import { ExecutionDiagnostic, SupportedLanguage } from '../../../../shared/types';
+import { classifyErrorCategory } from '../../../../shared/stdinHelper';
 import { ToolchainExecutionResult } from './types';
 
 export interface RemoteSandboxResult {
@@ -7,6 +8,7 @@ export interface RemoteSandboxResult {
   stdout: string;
   stderr: string;
   compileOutput: string;
+  compileFailed?: boolean;
   exitCode: number | null;
   timedOut: boolean;
   runtimeError: string | null;
@@ -95,6 +97,7 @@ async function runPiston(
         stdout: '',
         stderr: compileStderr,
         compileOutput: compileStderr,
+        compileFailed: true,
         exitCode: data.compile.code ?? 1,
         timedOut: false,
         runtimeError: compileStderr,
@@ -137,9 +140,11 @@ async function runPiston(
  * and invokes `<ClassName>.main(args)` without throwing a `Main.java` filename error.
  */
 function adaptJavaCodeForJudge0(code: string, fileName?: string): string {
-  const pubMatch = code.match(/\bpublic\s+((?:final\s+|abstract\s+)?class\s+)([A-Za-z_$][\w$]*)\b/);
+  // Judge0 runs a single flat Main.java in the default package; blank any package line preserving line numbers
+  const strippedPkg = code.replace(/^\s*package\s+[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*;/m, '');
+  const pubMatch = strippedPkg.match(/\bpublic\s+((?:final\s+|abstract\s+)?class\s+)([A-Za-z_$][\w$]*)\b/);
   if (!pubMatch || !pubMatch[2] || pubMatch[2] === 'Main') {
-    return code;
+    return strippedPkg;
   }
   const className = pubMatch[2];
   const trimmedFile = (fileName || '').trim();
@@ -147,9 +152,9 @@ function adaptJavaCodeForJudge0(code: string, fileName?: string): string {
   const isDefaultOrMatching =
     !stem || /^main\d*$/i.test(stem) || stem === className;
   if (!isDefaultOrMatching) {
-    return code;
+    return strippedPkg;
   }
-  const demoted = code.replace(
+  const demoted = strippedPkg.replace(
     /\bpublic\s+((?:final\s+|abstract\s+)?class\s+)([A-Za-z_$][\w$]*)\b/,
     '$1$2'
   );
@@ -217,6 +222,7 @@ async function runJudge0(
         stdout: '',
         stderr: compileOutput || rawStderr || 'Compilation error.',
         compileOutput,
+        compileFailed: true,
         exitCode: 1,
         timedOut: false,
         runtimeError: compileOutput || rawStderr || 'Compilation error.',
@@ -260,12 +266,18 @@ export function buildRemoteToolchainResult(
   diagnostics: ExecutionDiagnostic[],
   runtimeErrorLine?: number
 ): ToolchainExecutionResult {
-  const status: 'success' | 'warning' | 'error' =
-    remote.timedOut || (remote.exitCode !== 0 && remote.exitCode !== null)
-      ? 'error'
-      : diagnostics.some((d) => d.severity === 'warning')
-      ? 'warning'
-      : 'success';
+  const isFailure = Boolean(remote.compileFailed || remote.timedOut || (remote.exitCode !== 0 && remote.exitCode !== null));
+  const status: 'success' | 'warning' | 'error' = isFailure
+    ? 'error'
+    : diagnostics.some((d) => d.severity === 'warning')
+    ? 'warning'
+    : 'success';
+  const errorCategory = isFailure
+    ? classifyErrorCategory(
+        remote.stderr || remote.runtimeError || remote.compileOutput || '',
+        Boolean(remote.compileFailed)
+      )
+    : undefined;
   const output = remote.runtimeError
     ? remote.stdout
       ? `${remote.stdout}\n${remote.runtimeError}`
@@ -281,6 +293,8 @@ export function buildRemoteToolchainResult(
     timedOut: remote.timedOut,
     runtimeError: remote.runtimeError,
     ...(runtimeErrorLine !== undefined ? { runtimeErrorLine } : {}),
+    ...(errorCategory ? { errorCategory } : {}),
+    executionBackend: 'remote',
     executionTimeMs: remote.executionTimeMs,
     diagnostics,
   };

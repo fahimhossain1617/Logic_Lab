@@ -341,6 +341,9 @@ export interface FastExecutionResult {
   exitCode: number | null;
   executionTimeMs: number;
   timedOut?: boolean;
+  errorCategory?: 'compile_error' | 'runtime_error' | 'input_error' | null;
+  executionBackend?: 'local' | 'remote';
+  interactiveSupported?: boolean;
   language: SupportedLanguage;
   stdinUsed: string;
   timestamp: string;

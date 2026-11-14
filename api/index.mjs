@@ -8602,6 +8602,96 @@ ${runtimeError}` : runtimeError : runRes.stdout;
 }
 
 // server/src/services/toolchains/toolchainManager.ts
+function parseRemoteAnalysisDiagnostics(language, compileOutput, stderr) {
+  if (language === "java" || language === "cpp") {
+    const parser = language === "java" ? parseJavacDiagnostics : parseGppDiagnostics;
+    const diagnostics = compileOutput ? parser(compileOutput, "") : [];
+    if (diagnostics.length === 0) {
+      diagnostics.push({
+        line: 1,
+        severity: "error",
+        message: (compileOutput || stderr || "Compilation failed.").trim(),
+        source: language
+      });
+    }
+    return { canCompile: false, diagnostics };
+  }
+  if (language === "python") {
+    const syntaxMatch = stderr.match(/\b(SyntaxError|IndentationError|TabError):\s*(.+)/);
+    if (!syntaxMatch) {
+      return { canCompile: true, diagnostics: [] };
+    }
+    const lineMatch = stderr.match(/,\s*line\s+(\d+)/);
+    return {
+      canCompile: false,
+      diagnostics: [
+        {
+          line: lineMatch ? parseInt(lineMatch[1], 10) || 1 : 1,
+          severity: "error",
+          message: `${syntaxMatch[1]}: ${syntaxMatch[2].trim()}`,
+          source: "python"
+        }
+      ]
+    };
+  }
+  return null;
+}
+async function finalizeAnalysis(code, language, res, fileName) {
+  try {
+    if (!res.success && (res.compilerUnavailable || isLocalExecutionBlockedError(res.stderr))) {
+      const remote = await executeViaRemoteSandbox(
+        language,
+        code,
+        "",
+        4e3,
+        res.sourceFileName || fileName
+      );
+      if (remote) {
+        if (language === "java" || language === "cpp") {
+          if (!remote.compileFailed) {
+            return { canCompile: true, diagnostics: [], language };
+          }
+          const parsed = parseRemoteAnalysisDiagnostics(
+            language,
+            remote.compileOutput,
+            remote.stderr
+          );
+          if (parsed) {
+            return { ...parsed, language };
+          }
+        } else if (language === "python") {
+          if (remote.exitCode === 0) {
+            return { canCompile: true, diagnostics: [], language };
+          }
+          const parsed = parseRemoteAnalysisDiagnostics(
+            language,
+            remote.compileOutput,
+            remote.stderr
+          );
+          if (parsed) {
+            return { ...parsed, language };
+          }
+        }
+      }
+    }
+    const diagnostics = [...res.diagnostics];
+    if (!res.success && !diagnostics.some((d) => d.severity === "error")) {
+      diagnostics.push({
+        line: 1,
+        severity: "error",
+        message: res.compilerError || res.stderr.trim() || res.stdout.trim() || "Compilation failed.",
+        source: language
+      });
+    }
+    return {
+      canCompile: res.success,
+      diagnostics,
+      language
+    };
+  } finally {
+    await cleanupSandboxWorkspace(res.workspaceDir);
+  }
+}
 async function analyzeCode(code, language, fileName) {
   if (!code.trim()) {
     return {
@@ -8613,40 +8703,20 @@ async function analyzeCode(code, language, fileName) {
   switch (language) {
     case "java": {
       const res = await compileJava(code, fileName);
-      await cleanupSandboxWorkspace(res.workspaceDir);
-      return {
-        canCompile: res.success,
-        diagnostics: res.diagnostics,
-        language
-      };
+      return finalizeAnalysis(code, language, res, fileName);
     }
     case "cpp": {
       const res = await compileCpp(code, fileName);
-      await cleanupSandboxWorkspace(res.workspaceDir);
-      return {
-        canCompile: res.success,
-        diagnostics: res.diagnostics,
-        language
-      };
+      return finalizeAnalysis(code, language, res, fileName);
     }
     case "python": {
       const res = await checkPythonSyntax(code, fileName);
-      await cleanupSandboxWorkspace(res.workspaceDir);
-      return {
-        canCompile: res.success,
-        diagnostics: res.diagnostics,
-        language
-      };
+      return finalizeAnalysis(code, language, res, fileName);
     }
     case "javascript":
     default: {
       const res = await checkJsSyntax(code, fileName);
-      await cleanupSandboxWorkspace(res.workspaceDir);
-      return {
-        canCompile: res.success,
-        diagnostics: res.diagnostics,
-        language
-      };
+      return finalizeAnalysis(code, language, res, fileName);
     }
   }
 }
@@ -9703,6 +9773,7 @@ async function generateExecutionTrace(params) {
   if (!toolchainAnalysis.canCompile) {
     const firstErr = adjustedToolchainDiagnostics.find((d) => d.severity === "error");
     const errLine = firstErr?.line || 1;
+    const errMsg = firstErr?.message || "Compilation failed.";
     const errTrace = buildFallbackTrace({ ...params, code: params.code });
     errTrace.hasError = true;
     errTrace.verdict.status = "compile_error";
@@ -9711,8 +9782,8 @@ async function generateExecutionTrace(params) {
       errorType: "COMPILATION_ERROR",
       lineNumber: errLine,
       line: errLine,
-      message: firstErr?.message || "Compilation failed.",
-      messageBn: params.explainLanguage === "bn" ? `\u0995\u09AE\u09CD\u09AA\u09BE\u0987\u09B2 \u09A4\u09CD\u09B0\u09C1\u099F\u09BF (\u09B2\u09BE\u0987\u09A8 ${errLine}): ${firstErr?.message}` : void 0
+      message: errMsg,
+      messageBn: params.explainLanguage === "bn" ? `\u0995\u09AE\u09CD\u09AA\u09BE\u0987\u09B2 \u09A4\u09CD\u09B0\u09C1\u099F\u09BF (\u09B2\u09BE\u0987\u09A8 ${errLine}): ${errMsg}` : void 0
     };
     return formatResult(errTrace, false, [
       ...initialDiagnostics,

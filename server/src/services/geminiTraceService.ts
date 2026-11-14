@@ -1486,6 +1486,7 @@ export async function generateExecutionTrace(params: {
   if (!toolchainAnalysis.canCompile) {
     const firstErr = adjustedToolchainDiagnostics.find((d) => d.severity === 'error');
     const errLine = firstErr?.line || 1;
+    const errMsg = firstErr?.message || 'Compilation failed.';
     const errTrace = buildFallbackTrace({ ...params, code: params.code });
     errTrace.hasError = true;
     errTrace.verdict.status = 'compile_error';
@@ -1494,10 +1495,10 @@ export async function generateExecutionTrace(params: {
       errorType: 'COMPILATION_ERROR',
       lineNumber: errLine,
       line: errLine,
-      message: firstErr?.message || 'Compilation failed.',
+      message: errMsg,
       messageBn:
         params.explainLanguage === 'bn'
-          ? `কম্পাইল ত্রুটি (লাইন ${errLine}): ${firstErr?.message}`
+          ? `কম্পাইল ত্রুটি (লাইন ${errLine}): ${errMsg}`
           : undefined,
     };
     return formatResult(errTrace, false, [

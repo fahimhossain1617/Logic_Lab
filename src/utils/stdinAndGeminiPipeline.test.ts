@@ -182,7 +182,7 @@ test('POST /api/trace passes exact STDIN values to execution + Gemini trace for 
   }
 });
 
-test('Store requestVisualize prompts on missing STDIN and runs visualization with auto-sample', async () => {
+test('Store requestVisualize requires terminal run first on input code, then uses terminal STDIN for visualization', async () => {
   const app = createCoreExpressApp();
   const server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -207,21 +207,30 @@ test('Store requestVisualize prompts on missing STDIN and runs visualization wit
       stdinDraft: '',
       pendingVisualizeCode: null,
       autoInjectedStdinNotice: null,
+      lastTerminalSnapshot: null,
+      terminalExecState: 'IDLE',
+      apiNotice: null,
       speed: 1,
     });
 
-    // 1. Clicking Explain & Animate with empty STDIN opens STDIN prompt pre-filled with sample
+    // 1. Clicking Explain & Animate before running in terminal asks user to Run first (no STDIN modal)
     await useLabStore.getState().requestVisualize(SIMPLE_CALCULATOR_JAVA);
     let state = useLabStore.getState();
-    assert.equal(state.stdinPromptOpen, true);
-    assert.equal(state.stdinDraft, '25\n*\n5');
+    assert.equal(state.stdinPromptOpen, false);
+    assert.equal(state.consoleOpen, true);
+    assert.equal(state.apiNotice?.code, 'RUN_FIRST_FOR_INPUT');
 
-    // 2. Auto-Sample & Animate injects STDIN, sets notice, and executes full visualization
-    await useLabStore.getState().autoFillSampleAndVisualize();
+    // 2. Simulate completed terminal run with inputs from the unified terminal
+    useLabStore.setState({
+      lastTerminalSnapshot: { code: SIMPLE_CALCULATOR_JAVA, stdin: '25\n*\n5' },
+      terminalExecState: 'COMPLETED',
+    });
+
+    // 3. Clicking Explain & Animate now uses the terminal's STDIN and executes full visualization
+    await useLabStore.getState().requestVisualize(SIMPLE_CALCULATOR_JAVA);
     state = useLabStore.getState();
     assert.equal(state.stdinPromptOpen, false);
     assert.equal(state.stdin, '25\n*\n5');
-    assert.ok(state.autoInjectedStdinNotice?.isAutoSample);
     assert.equal(state.hasExecuted, true);
     assert.equal(state.canRun, true);
     assert.ok(state.trace.finalOutput.includes('125.0'));

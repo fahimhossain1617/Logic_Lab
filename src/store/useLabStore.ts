@@ -1344,17 +1344,34 @@ export const useLabStore = create<LabState>((set, get) => ({
     const detectedInputs = targetCode.trim()
       ? detectInputCalls(targetCode, effectiveLang)
       : [];
-    if (detectedInputs.length > 0 && !state.stdin.trim()) {
-      const sample = generateSampleStdin(targetCode, effectiveLang);
-      set({
-        stdinPromptOpen: true,
-        stdinDraft: sample,
-        pendingVisualizeCode: targetCode,
-        consoleOpen: true,
-      });
+    if (detectedInputs.length > 0) {
+      const hasCompletedTerminalRun =
+        Boolean(state.lastTerminalSnapshot) &&
+        state.lastTerminalSnapshot!.code === targetCode &&
+        state.terminalExecState === 'COMPLETED';
+      if (!hasCompletedTerminalRun) {
+        set({
+          consoleOpen: true,
+          stdinPromptOpen: false,
+          pendingVisualizeCode: null,
+          apiNotice: {
+            code: 'RUN_FIRST_FOR_INPUT',
+            message_bn:
+              'আপনার কোডে ইউজার ইনপুট রয়েছে। ব্যাখ্যা ও অ্যানিমেট দেখার আগে অনুগ্রহ করে "রান" বাটনে ক্লিক করে টার্মিনালে ইনপুট দিয়ে কোডটি চালান, তারপর "ব্যাখ্যা ও অ্যানিমেট" চাপুন।',
+            message_en:
+              'Your code requires user input. Please click "Run" first, enter your inputs in the terminal, and then click "Explain & Animate".',
+          },
+        });
+        return;
+      }
+      const terminalStdin =
+        state.lastTerminalSnapshot?.stdin ??
+        state.terminalCollectedInputs.join('\n') ??
+        '';
+      await get().runVisualize(targetCode, terminalStdin);
       return;
     }
-    await get().runVisualize(targetCode, state.stdin);
+    await get().runVisualize(targetCode, '');
   },
   confirmStdinPromptAndVisualize: async () => {
     const { stdinDraft, pendingVisualizeCode, code } = get();
@@ -1551,7 +1568,13 @@ export const useLabStore = create<LabState>((set, get) => ({
         lastTerminalSnapshot: null,
       });
     } else {
-      set({ terminalCollectedInputs: [], lastTerminalSnapshot: null });
+      stdin = '';
+      set({
+        stdin: '',
+        stdinSource: 'none',
+        terminalCollectedInputs: [],
+        lastTerminalSnapshot: null,
+      });
     }
 
     set({
@@ -1559,6 +1582,7 @@ export const useLabStore = create<LabState>((set, get) => ({
       isFastRunning: true,
       executionMode: 'fast',
       apiError: null,
+      apiNotice: null,
       fastRunResult: null,
       terminalHistory: [],
       currentPrompt: '',
@@ -1738,6 +1762,9 @@ export const useLabStore = create<LabState>((set, get) => ({
           fastRunResult: fastRes,
           diagnostics: fbDiags,
           executionStatus: fastExecStatus,
+          lastTerminalSnapshot: success
+            ? { code, stdin: stdin.replace(/\r\n/g, '\n').replace(/\n$/, '') }
+            : null,
         });
 
         const currentUser = get().user;

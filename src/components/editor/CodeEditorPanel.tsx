@@ -11,15 +11,12 @@ import {
   AlignLeft,
   Clock,
   Cpu,
-  Keyboard,
-  Sparkles,
 } from 'lucide-react';
 import { registerMonacoLanguageProviders } from './monacoProviders';
 import { registerIntelliSense } from '../../lib/monaco/intellisense/registerIntelliSense';
 import { DisposableHandle } from '../../lib/monaco/intellisense/types';
 import { StageCanvas } from '../stage/StageCanvas';
 import { OutputConsole } from './OutputConsole';
-import { detectInputCalls } from '../../../shared/stdinHelper';
 
 export const CodeEditorPanel: React.FC = () => {
   const {
@@ -51,13 +48,6 @@ export const CodeEditorPanel: React.FC = () => {
     runFast,
     runVisualize,
     requestVisualize,
-    stdinPromptOpen,
-    stdinDraft,
-    pendingVisualizeCode,
-    setStdinDraft,
-    confirmStdinPromptAndVisualize,
-    autoFillSampleAndVisualize,
-    cancelStdinPrompt,
     toggleBreakpoint,
     jumpToLine,
     setHoveredLine,
@@ -68,6 +58,30 @@ export const CodeEditorPanel: React.FC = () => {
   const monacoRef = useRef<any>(null);
   const decorationsRef = useRef<string[]>([]);
   const intelliSenseDisposableRef = useRef<DisposableHandle | null>(null);
+  const [pasteFallbackOpen, setPasteFallbackOpen] = useState(false);
+  const pasteFallbackRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const insertTextIntoEditor = useCallback((text: string) => {
+    const editor = editorRef.current;
+    if (!editor || !text) return;
+    editor.focus();
+    const selections = editor.getSelections();
+    const ranges =
+      selections && selections.length > 0
+        ? selections
+        : [editor.getSelection()].filter(Boolean);
+    if (ranges.length === 0) return;
+    editor.pushUndoStop();
+    editor.executeEdits(
+      'clipboard-paste',
+      ranges.map((range: any) => ({
+        range,
+        text,
+        forceMoveMarkers: true,
+      }))
+    );
+    editor.pushUndoStop();
+  }, []);
   const providersDisposableRef = useRef<DisposableHandle | null>(null);
   const [monacoReady, setMonacoReady] = useState(false);
   const [contentLeft, setContentLeft] = useState(46);
@@ -171,7 +185,59 @@ export const CodeEditorPanel: React.FC = () => {
       intelliSenseDisposableRef.current = registerIntelliSense(monaco);
     }
 
+    // Reliable paste support for mobile long-press and right-click context-menu Paste
+    const editorDomNode = editor.getDomNode();
+    const handleCapturePaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.classList.contains('inputarea') || target.tagName === 'TEXTAREA' || target.tagName === 'INPUT')) {
+        return;
+      }
+      const pastedText = e.clipboardData?.getData('text/plain');
+      if (pastedText) {
+        e.preventDefault();
+        e.stopPropagation();
+        insertTextIntoEditor(pastedText);
+      }
+    };
+    editorDomNode?.addEventListener('paste', handleCapturePaste, true);
+
+    const handleContextMenuPasteClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      const actionItem = target?.closest('.monaco-menu .action-item') as HTMLElement | null;
+      if (!actionItem) return;
+      const labelEl = actionItem.querySelector('.action-label');
+      const ariaLabel = (labelEl?.getAttribute('aria-label') || labelEl?.textContent || '').trim().toLowerCase();
+      if (ariaLabel !== 'paste' && !ariaLabel.startsWith('paste ') && ariaLabel !== 'পেস্ট') {
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      editor.focus();
+      if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+        navigator.clipboard
+          .readText()
+          .then((clipText) => {
+            if (clipText) {
+              insertTextIntoEditor(clipText);
+            } else {
+              setPasteFallbackOpen(true);
+              setTimeout(() => pasteFallbackRef.current?.focus(), 30);
+            }
+          })
+          .catch(() => {
+            setPasteFallbackOpen(true);
+            setTimeout(() => pasteFallbackRef.current?.focus(), 30);
+          });
+      } else {
+        setPasteFallbackOpen(true);
+        setTimeout(() => pasteFallbackRef.current?.focus(), 30);
+      }
+    };
+    document.addEventListener('click', handleContextMenuPasteClick, true);
+
     editor.onDidDispose(() => {
+      editorDomNode?.removeEventListener('paste', handleCapturePaste, true);
+      document.removeEventListener('click', handleContextMenuPasteClick, true);
       intelliSenseDisposableRef.current?.dispose();
       intelliSenseDisposableRef.current = null;
       providersDisposableRef.current?.dispose();
@@ -784,6 +850,7 @@ export const CodeEditorPanel: React.FC = () => {
                 insertSpaces: true,
                 formatOnPaste: true,
                 formatOnType: true,
+                editContext: false,
                 suggestOnTriggerCharacters: true,
                 acceptSuggestionOnEnter: 'on',
                 tabCompletion: 'on',
@@ -912,107 +979,60 @@ export const CodeEditorPanel: React.FC = () => {
         onJumpToDiagnostic={handleJumpToDiagnostic}
       />
 
-      {/* 4. Interactive STDIN Prompt Modal when input statements exist & STDIN tab is empty */}
-      {stdinPromptOpen && (() => {
-        const detectedCalls = detectInputCalls(pendingVisualizeCode || code, language);
-        return (
+      {/* 4. Clipboard Paste Fallback when browser blocks navigator.clipboard.readText() */}
+      {pasteFallbackOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          data-testid="paste-fallback-modal"
+          onClick={() => setPasteFallbackOpen(false)}
+        >
           <div
-            className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4"
-            role="dialog"
-            aria-modal="true"
-            data-testid="stdin-prompt-modal"
+            className="ll-panel w-full max-w-md rounded-2xl border border-[#60A5FA]/40 bg-[var(--bg-panel)] p-4 shadow-2xl space-y-3"
+            onClick={(e) => e.stopPropagation()}
           >
-            <div className="ll-panel w-full max-w-lg rounded-2xl border border-[#60A5FA]/40 bg-[var(--bg-panel)] p-5 shadow-2xl space-y-4">
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-center gap-2.5">
-                  <span className="w-9 h-9 rounded-xl bg-[#2563EB]/20 border border-[#60A5FA]/40 flex items-center justify-center text-[#60A5FA]">
-                    <Keyboard className="w-5 h-5" />
-                  </span>
-                  <div>
-                    <h3 className="text-sm font-bold text-[var(--text-primary)] m-0" lang={explainLanguage}>
-                      {explainLanguage === 'bn'
-                        ? 'প্রোগ্রামের জন্য ইনপুট (STDIN) প্রয়োজন'
-                        : 'Program Requires STDIN Input'}
-                    </h3>
-                    <p className="text-xs text-[var(--text-secondary)] m-0 mt-0.5" lang={explainLanguage}>
-                      {explainLanguage === 'bn'
-                        ? 'আপনার কোডে ইউজার ইনপুট (`Scanner` / `input()` / `cin`) আছে। স্যাম্পল মান দিন অথবা অটো-স্যাম্পল দিয়ে অ্যানিমেট করুন।'
-                        : 'Your code reads user input. Enter values line by line or use auto-generated sample values.'}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {detectedCalls.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 text-[11px] font-mono">
-                  {detectedCalls.map((c, idx) => (
-                    <span
-                      key={`${c.line}-${idx}`}
-                      className="px-2 py-0.5 rounded-md bg-[var(--bg-gutter)] border border-[var(--border-subtle)] text-[var(--text-accent)]"
-                    >
-                      Ln {c.line}: {c.targetVar || `input #${idx + 1}`} ({c.hintType})
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              <div className="space-y-1.5">
-                <label
-                  htmlFor="stdin-prompt-textarea"
-                  className="block text-xs font-semibold text-[var(--text-secondary)]"
-                >
-                  {explainLanguage === 'bn'
-                    ? 'ইনপুট (প্রতি লাইনে একটি মান লিখুন):'
-                    : 'Input values (one per line):'}
-                </label>
-                <textarea
-                  id="stdin-prompt-textarea"
-                  rows={4}
-                  value={stdinDraft}
-                  onChange={(e) => setStdinDraft(e.target.value)}
-                  data-testid="stdin-prompt-textarea"
-                  className="w-full rounded-xl bg-[#070C1D] border border-slate-700 focus:border-[#60A5FA] focus:outline-none p-3 font-mono text-xs sm:text-sm text-slate-100"
-                  placeholder={'25\n*\n5'}
-                />
-              </div>
-
-              <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={cancelStdinPrompt}
-                  className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
-                  data-testid="stdin-prompt-cancel"
-                >
-                  {explainLanguage === 'bn' ? 'বাতিল' : 'Cancel'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void autoFillSampleAndVisualize()}
-                  className="px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 border border-[#10B981]/40 bg-[#10B981]/15 text-[#34D399] hover:bg-[#10B981]/25 cursor-pointer"
-                  data-testid="stdin-prompt-auto-btn"
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>
-                    {explainLanguage === 'bn'
-                      ? 'অটো স্যাম্পল দিয়ে অ্যানিমেট করুন'
-                      : 'Auto-Sample & Animate'}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void confirmStdinPromptAndVisualize()}
-                  className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-[#2563EB] hover:bg-[#3B82F6] text-white cursor-pointer"
-                  data-testid="stdin-prompt-confirm-btn"
-                >
-                  {explainLanguage === 'bn'
-                    ? 'এই ইনপুট দিয়ে অ্যানিমেট করুন'
-                    : 'Run & Animate'}
-                </button>
-              </div>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-[var(--text-primary)] m-0" lang={explainLanguage}>
+                {explainLanguage === 'bn' ? 'এখানে কোড পেস্ট করুন' : 'Paste Code Here'}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setPasteFallbackOpen(false)}
+                className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+              >
+                {explainLanguage === 'bn' ? 'বন্ধ করুন' : 'Close'}
+              </button>
             </div>
+            <textarea
+              ref={pasteFallbackRef}
+              rows={4}
+              autoFocus
+              placeholder={
+                explainLanguage === 'bn'
+                  ? 'এখানে চাপ দিয়ে ধরে Paste করুন অথবা Ctrl+V চাপুন...'
+                  : 'Long-press -> Paste or press Ctrl+V here...'
+              }
+              onPaste={(e) => {
+                const text = e.clipboardData?.getData('text/plain');
+                if (text) {
+                  e.preventDefault();
+                  insertTextIntoEditor(text);
+                  setPasteFallbackOpen(false);
+                }
+              }}
+              onChange={(e) => {
+                if (e.target.value) {
+                  insertTextIntoEditor(e.target.value);
+                  setPasteFallbackOpen(false);
+                }
+              }}
+              data-testid="paste-fallback-textarea"
+              className="w-full rounded-xl bg-[#070C1D] border border-slate-700 focus:border-[#60A5FA] focus:outline-none p-3 font-mono text-xs text-slate-100"
+            />
           </div>
-        );
-      })()}
+        </div>
+      )}
     </section>
   );
 };
